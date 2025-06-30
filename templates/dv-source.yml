@@ -1,0 +1,17 @@
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: dv-source
+spec:
+  source:
+    http:
+        ## source image url:
+        url: "{{.url}}"
+  pvc:
+    accessModes:
+      - ReadWriteMany
+    resources:
+      requests:
+        storage: {{.storage}}
+    volumeMode: {{.volumemode}}
+    storageClassName: {{.storageclass}}

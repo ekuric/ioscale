@@ -1,0 +1,110 @@
+disks=none
+mountpoint=none
+
+usage()
+{
+  echo "Usage:
+        ./Hammerdb-postgres-install-script [-h] [-d disk name] [-m mount point] 
+
+        Usage:
+        -h help
+        -d <disk device name>
+        -m <mount point>
+
+
+       Examples:
+        ./Hammerdb-postgres-install-script -d '/dev/sdb' 
+        ./Hammerdb-postgres-install-script -d '/perf1' 
+  "
+}
+if [ $# -eq 0 ]
+then
+    usage;
+    exit;
+fi
+
+while [ $# -gt 0 ]
+do
+case $1 in
+        -h) usage;
+            exit;
+            ;;
+        -d) disks=$2
+            shift 2
+            ;;
+        -m) mountpoint=$2
+            shift 2
+            ;;
+         *) usage;
+            exit;
+            ;;
+esac
+done
+
+setenforce 0
+
+### Shutdown any running databases
+systemctl stop mssql-server
+systemctl stop postgresql
+systemctl stop mariadb
+
+cd /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/
+tar xf hammerdb-tpcc.tar
+cd /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/Hammerdb
+unset DISPLAY
+echo "y" > input
+echo "/usr/local/HammerDB" >> input
+./HammerDB-3.2-Linux-x86-64-Install < input
+
+# Installing Postgres Server and tools
+dnf -y install postgresql.x86_64 postgresql-contrib.x86_64 postgresql-server.x86_64 glibc-langpack-en libpq
+
+
+cd /usr/local/HammerDB
+cp -R /tmp/hammerdb-tpcc/postgres/* .
+
+if [[ $mountpoint == *"none"* ]]; then
+  echo "using disk option"
+  umount /perf1
+  mkfs.xfs -f ${disks}
+  mkdir -p /perf1
+  mount ${disks} /perf1
+  mountpoint="/perf1"
+else
+  echo "using mountpoint option"
+  echo ${mountpoint}
+fi
+
+rm -rf /var/lib/pgsql/data
+rm -rf ${mountpoint}/postgres_data
+
+mkdir -p ${mountpoint}/postgres_data
+ln -sf ${mountpoint}/postgres_data /var/lib/pgsql/data
+chmod 700 ${mountpoint}/postgres_data
+chown -R postgres:postgres ${mountpoint}/postgres_data
+
+postgresql-setup --initdb --unit postgresql
+
+sleep 20 
+
+totmem=`cat /proc/meminfo |grep "MemTotal:" | awk '{print $2}'`
+
+# Change shared_buffer size based on available memory
+totmem_MB=`expr $totmem / 1024`
+totmem_BP=`expr $totmem_MB / 2`   # Buffer pool is half of physical memory
+## IF total memory is more than 128G then bufferpool is set to 64G else set to half of physical memory
+if [ ${totmem_BP} -lt 64000 ]
+then
+   sed -i "s/^shared_buffers =.*/shared_buffers = ${totmem_BP}MB/" /root/hammerdb-tpcc-wrapper-scripts/templates/postgresql/postgresqlsetup/postgresql.conf
+else
+   sed -i "s/^shared_buffers =.*/shared_buffers = 64000MB/" /root/hammerdb-tpcc-wrapper-scripts/templates/postgresql/postgresqlsetup/postgresql.conf
+fi
+
+/usr/bin/cp -f /root/hammerdb-tpcc-wrapper-scripts/templates/postgresql/postgresqlsetup/pg_hba.conf /var/lib/pgsql/data
+/usr/bin/cp -f /root/hammerdb-tpcc-wrapper-scripts/templates/postgresql/postgresqlsetup/postgresql.conf /var/lib/pgsql/data
+systemctl restart postgresql
+echo "alter role postgres password 'postgres'" > input
+
+psql -U postgres -d postgres < input
+sleep 30
+systemctl restart postgresql.service

@@ -1,0 +1,153 @@
+1) Make sure you have MariaDB already installed. Use the version that ships with RHEL  
+
+In RHEL8 you will need the rhel8-Buildroot repo
+
+In RHEL7 you will need the 
+
+yum -y install mariadb.x86_64 mariadb-common.x86_64 mariadb-config.x86_64 \
+mariadb-devel.x86_64 mariadb-errmsg.x86_64 mariadb-libs.x86_64 mariadb-server.x86_64 mariadb-server-utils.x86_64 
+
+2) Install the dev tools and the dependencies 
+
+yum -y install gcc gcc-c++ autoconf automake make libtool \
+zlib zlib-devel openssl-devel nfs-utils
+
+mkdir /shak
+mount perf1:/shak /shak
+cd /shak/HammerDB/
+./HammerDB-3.2-Linux-x86-64-Install 
+
+
+cd /usr/local/HammerDB-3.0/
+cp /shak/HammerDB/tpcc/mariadb/* .
+cp /shak/HammerDB/tpcc/mariadb/my.cnf /etc/my.cnf
+
+Create directories that are defined in the file 
+datadir=/perf1/mysql/data
+
+In this case, it is /perf1/mysql/data
+If you want to use a storage device, create the file system.
+
+mkfs -t ext4 /dev/vda
+mkdir /perf1
+mount /dev/vda /perf1
+
+#Create directory and change permissions
+
+mkdir -p /perf1/mysql/data
+chmod 777 /perf1/mysql/data
+
+With this version of MariaDB, you need to setup a password for root user
+and use the password during the runs
+
+# Start instance. This will create base tables
+### IMPORTANT - This will take some time because the updated my.cnf file creates a bunch of log files so wait for 
+### a couple of minutes
+
+mysqld_safe --user=root --basedir=/usr --skip-grant-tables &
+
+### Wait for 2 minutes atleast depending on the time of the storage or just tail the err file to see if the db is up
+
+tail -f /perf1/mysql/data/`hostname`.err 
+
+Look for this line - 181130 11:50:04 [Note] /usr/libexec/mysqld: ready for connections.
+
+
+# Shutdown database
+mysqladmin -f -uroot -pdbpassword shutdown
+
+
+# Configure stored procedures ### Important step
+mysql_install_db --defaults-file=/etc/my.cnf
+
+# Change ownership of the directory to mysql user
+chown -R mysql:mysql /perf1/mysql
+
+# Restart the database using this command This will run it as mysql user
+
+mysqld_safe --user=root --basedir=/usr --skip-grant-tables &
+
+# This command will set up password for root user
+
+/usr/bin/mysqladmin -u root password 'dbpassword'
+
+Copy the required mysql library file libmysqlclient.so.20 to /lib64/mysql directory
+
+cp /shak/HammerDB/tpcc/mariadb/libmysqlclient.so.20 /lib64/mysql/
+
+If the /lib64/mysql directory is missing, create it and copy the file
+
+# Make sure these lines are in the build_and_run_mariadb.sh script
+
+LD_LIBRARY_PATH=/lib64/mysql:$LD_LIBRARY_PATH:
+export LD_LIBRARY_PATH
+
+### Install Hammerdb kit
+cd /shak/HammerDB/
+
+### Check and install the latest Hammerdb version. There maybe a newer version than the one in the command below
+./HammerDB-3.2-Linux-x86-64-Install
+
+
+
+# Copy the mariadb kit and run files
+cd /usr/local/HammerDB-3.2/
+
+cp /shak/HammerDB/tpcc/mariadb/* .
+
+## A new module has helped improve the performance of the tests and it's been added to these new files. But if you decide to
+## test with the new code, you have to collect new baselines. Do the following steps to use the new tcl files for testing
+
+cp new_build_mariadb.tcl build_mariadb.tcl
+cp new_runtest_mariadb.tcl runtest_mariadb.tcl
+
+
+## IMPORTANT - This workload needs the IP address of the host where the database is running. Even
+# for local host, it won't take 127.0.0.1. So please update both the .tcl files 
+
+-  build_mariadb.tcl
+-  runtest_mariadb.tcl
+
+# Edit this file for user and warehouse count and run it. It will build the schema and run the workload
+
+./build_and_run_mariadb.sh
+
+
+
+Below are some of the setting and commands to do the build
+
+##  Create database with the following command (drop if it's a re-run)
+mysqladmin -f -uroot -pdbpassword drop tpcc
+mysqladmin -uroot -pdbpassword create tpcc
+
+
+./hammerdbcli
+dbset db mysql
+diset connection mysql_host 10.16.29.121
+diset connection mysql_port 3306
+diset tpcc mysql_count_ware 800
+diset tpcc mysql_partition true
+diset tpcc mysql_num_vu 64
+diset tpcc mysql_storage_engine innodb
+print dict
+buildschema
+
+
+dbset db mysql
+diset connection mysql_host 10.16.29.121
+diset connection mysql_port 3306
+diset tpcc mysql_driver timed
+diset tpcc mysql_rampup 2
+diset tpcc mysql_duration 5
+vuset logtotemp 1
+loadscript
+vuset vu 10
+vucreate
+vurun
+
+
+DB size
+100WH - 8G
+200WH - 17G
+500WH - 50G
+800WH - 70G

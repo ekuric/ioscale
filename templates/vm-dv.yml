@@ -1,0 +1,80 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  labels:
+    kubevirt-vm: vm-{{.name}}-{{.Replica}}
+  name: {{.name}}-{{.Replica}}
+spec:
+  ## controls if the VM boots up on creation:
+  running: {{.VMIrunning}}
+  template:
+    metadata:
+      labels:
+        kubevirt-vm: vm-{{.name}}-{{.Replica}}
+        kubevirt.io/os: {{.OS}}
+    spec:
+      nodeSelector:
+        scale.spectrum.ibm.com/role: storage
+      domain:
+        ## vcpus:
+        cpu:
+          cores: {{.cpuCores}}
+       ## VM disks (rootdisk clone, cloudinit, blank)
+        devices:
+          disks:
+          - disk:
+              bus: virtio
+            name: rootdisk
+          - disk:
+              bus: virtio
+            name: cloudinitdisk
+          ## default network interface:
+          interfaces:
+          - masquerade: {}
+            model: virtio
+            name: default
+          networkInterfaceMultiqueue: true
+          rng: {}
+        ## VM memory size:
+        resources:
+          requests:
+            memory: {{.memory}}
+      ## default pod network:
+      networks:
+      - name: default
+        pod: {}
+      ## volume definitions for the VM disks:
+      volumes:
+      - dataVolume:
+          name: dvclone-{{.Replica}}
+        name: rootdisk
+      - cloudInitNoCloud:
+          userData: |-
+            #cloud-config
+            password: fedora
+            chpasswd: { expire: False }
+        name: cloudinitdisk
+  ## Data Volume population of the volumes:
+  dataVolumeTemplates:
+  ## rootdisk:
+  - metadata:
+      name: dvclone-{{.Replica}}
+    spec:
+     source:
+       pvc:
+        name: dv-source
+     storage:
+       accessModes:
+        - ReadWriteMany
+       resources:
+        requests:
+          storage: {{.storage}}
+       storageClassName: {{.storageclass}}
+       volumeMode: {{.volumemode}}
+     accessCredentials:
+     - sshPublicKey:
+         propagationMethod:
+           noCloud: {}
+         source:
+           secret:
+             secretName: vmkey-elvir 

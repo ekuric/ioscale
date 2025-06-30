@@ -1,0 +1,113 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  annotations:
+  name: vm-test-db
+  namespace: default
+spec:
+  dataVolumeTemplates:
+    - metadata:
+        name: vm-test-db
+      spec:
+        pvc:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 30Gi
+          storageClassName: ibm-spectrum-scale-sample
+          volumeMode: Filesystem
+        source:
+          http:
+            url: >-
+              http://n42-h01-b06-mx750c.rdu3.labs.perfscale.redhat.com/ekuric/rhel9/CentOS-Stream-GenericCloud-10-20241118.0.x86_64.qcow2
+    - metadata:
+        name: datavolumedb
+      spec:
+        pvc:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 1000Gi
+          storageClassName: ibm-spectrum-scale-sample
+          volumeMode: Filesystem
+        source:
+          blank: {}
+  runStrategy: Always 
+  template:
+    metadata:
+      annotations:
+        vm.kubevirt.io/flavor: large
+        vm.kubevirt.io/os: fedora
+        vm.kubevirt.io/workload: server
+      labels:
+        flavor.template.kubevirt.io/large: 'true'
+        kubevirt.io/domain: vm-vmroot-elvir
+        kubevirt.io/size: large
+        os.template.kubevirt.io/fedora40: 'true'
+        vm.kubevirt.io/name: vm-vmroot-elvir
+        workload.template.kubevirt.io/desktop: 'true'
+    spec:
+      nodeSelector:
+        scale.spectrum.ibm.com/role: storage
+      accessCredentials:
+        - sshPublicKey:
+            propagationMethod:
+              noCloud: {} 
+            source:
+              secret:
+                secretName: vmkeyroot
+      domain:
+        cpu:
+          cores: 64
+          sockets: 2
+          threads: 1
+        devices:
+          disks:
+            - disk:
+                bus: virtio
+              name: cloudinitdisk
+            - disk:
+                bus: virtio
+              name: vm-test-disk
+              bootOrder: 1 
+            - disk:
+                bus: virtio
+              name: vm-datavolumedb
+          inputs:
+            - bus: virtio
+              name: tablet
+              type: tablet
+          interfaces:
+            - masquerade: {}
+              model: virtio
+              name: default
+          networkInterfaceMultiqueue: true
+          rng: {}
+        resources:
+          requests:
+            memory: 200Gi
+      evictionStrategy: None
+      hostname: vm-vmroot-elvir
+      networks:
+        - name: default
+          pod: {}
+      terminationGracePeriodSeconds: 180
+      volumes:
+        - cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              user: root
+              password: fedora
+              chpasswd:
+                expire: false
+              disable_root: false
+          name: cloudinitdisk
+          disable_root: false
+        - dataVolume:
+            name: vm-test-db
+          name: vm-test-disk
+        - dataVolume:
+            name: datavolumedb
+          name: vm-datavolumedb

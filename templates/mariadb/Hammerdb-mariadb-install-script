@@ -1,0 +1,110 @@
+disks=none
+mountpoint=none
+
+usage()
+{
+  echo "Usage:
+        ./Hammerdb-mariadb-install-script [-h] [-d disk name] [-m mount point] 
+
+        Usage:
+        -h help
+        -d <disk device name>
+        -m <mount point>
+
+
+       Examples:
+        ./Hammerdb-mariadb-install-script -d '/dev/sdb' 
+        ./Hammerdb-mariadb-install-script -d '/perf1' 
+  "
+}
+if [ $# -eq 0 ]
+then
+    usage;
+    exit;
+fi
+
+while [ $# -gt 0 ]
+do
+case $1 in
+        -h) usage;
+            exit;
+            ;;
+        -d) disks=$2
+            shift 2
+            ;;
+        -m) mountpoint=$2
+            shift 2
+            ;;
+         *) usage;
+            exit;
+            ;;
+esac
+done
+
+setenforce 0
+cd /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/
+tar xf hammerdb-tpcc.tar
+cd /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/Hammerdb
+unset DISPLAY
+echo "y" > input
+echo "/usr/local/HammerDB" >> input
+./HammerDB-3.2-Linux-x86-64-Install < input
+
+### Shutdown all running instances
+systemctl stop mssql-server
+systemctl stop postgresql
+systemctl stop mariadb
+
+# Installing Mariadb Server and tools
+dnf -y install mariadb mariadb-server mariadb-server-utils mariadb-errmsg
+
+cd /usr/local/HammerDB
+cp /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/mariadbsetup/* .
+
+if [[ $mountpoint == *"none"* ]]; then
+  echo "using disk option"
+  umount /perf1
+  mkfs.xfs -f ${disks}
+  mkdir -p /perf1
+  mount ${disks} /perf1
+  mountpoint="/perf1"
+else
+  echo "using mountpoint option"
+  echo ${mountpoint}
+fi
+
+rm -rf ${mountpoint}/mysql/*
+mkdir -p ${mountpoint}/mysql/data
+chown -R mysql:mysql ${mountpoint}/mysql
+
+totmem=`cat /proc/meminfo |grep "MemTotal:" | awk '{print $2}'`
+## Updating the value of buffer_pool_size based on available memory
+## Setting bufferpool to half of physical memory if memory is less than 128G else set to 64G
+totmem_BP=`expr $totmem / 1024`
+totmem_BP=`expr $totmem_BP / 2`
+
+##Configuring the mariadb config file with mountpoint and bufferpool
+
+sed -i "s+^datadir=.*+datadir=${mountpoint}\/mysql\/data+" my.cnf
+if [ $totmem_BP -lt 64000 ]
+then
+   sed -i "s/^innodb_buffer_pool_size=.*/innodb_buffer_pool_size=${totmem_BP}M/" my.cnf
+else
+   sed -i "s/^innodb_buffer_pool_size=.*/innodb_buffer_pool_size=64000M/" my.cnf
+fi
+
+
+/usr/bin/cp my.cnf /etc/my.cnf
+
+systemctl restart mariadb.service
+
+#echo "UPDATE mysql.user SET Password=PASSWORD('dbpassword')  WHERE User='root';" > input
+echo "use mysql;" > input
+echo "SET PASSWORD FOR 'root'@localhost = PASSWORD('mysql');" > input
+echo "flush privileges;" >> input
+echo "exit" >> input
+
+mysql -u root < input
+
+sleep 30
+systemctl restart mariadb.service

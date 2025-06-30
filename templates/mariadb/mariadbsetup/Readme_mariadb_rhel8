@@ -1,0 +1,130 @@
+1) Make sure you have MariaDB already installed. Use the version that ships with RHEL  
+
+In RHEL8 you will need the rhel8-Buildroot repo
+
+dnf -y install mariadb.x86_64 mariadb-common.x86_64 mariadb-devel.x86_64 \
+mariadb-errmsg.x86_64 mariadb-server.x86_64 mariadb-server-utils.x86_64 mysql-libs.x86_64
+
+mkdir /shak
+mount perf1:/shak /shak
+
+cd /shak/HammerDB
+./HammerDB-3.2-Linux-x86-64-Install 
+
+
+cd /usr/local/HammerDB-3.2/
+cp /shak/HammerDB/tpcc/mariadb/* .
+cp /shak/HammerDB/tpcc/mariadb/my.cnf /etc/my.cnf
+
+Create directories that are defined in the file 
+datadir=/perf1/mysql/data
+
+In this case, it is /perf1/mysql/data
+If you want to use a storage device, create the file system.
+
+mkfs -t ext4 /dev/vda
+mkdir /perf1
+mount /dev/vda /perf1
+
+#Create directory and change permissions
+
+mkdir -p /perf1/mysql/data
+chown -R mysql:mysql /perf1/mysql
+
+systemctl start mariadb.service
+
+## Hammerdb uses password to connect to the database so run the following command to setup password for root
+
+echo "UPDATE mysql.user SET Password=PASSWORD('dbpassword')  WHERE User='root';" > input
+echo "flush privileges;" >> input
+echo "exit" >> input
+
+mysql -u root < input
+
+
+Copy the required mysql library file libmysqlclient.so.20 to /lib64/mariadb directory
+
+cp /shak/HammerDB/tpcc/mariadb/libmysqlclient.so.20 /lib64/mariadb/
+
+If the /lib64/mariadb directory is missing, create it and copy the file
+
+# Make sure these lines are in the build_and_run_mariadb.sh script
+
+LD_LIBRARY_PATH=/lib64/mysql:$LD_LIBRARY_PATH:
+export LD_LIBRARY_PATH
+
+
+# Edit this file for user and warehouse count and run it. It will build the schema and run the workload
+
+./build_mariadb_tpcc.sh
+
+Run the workload with run_mariadb_tpcc.sh. To see options run
+
+./run_mariadb_tpch.sh -h
+
+
+e.g
+./run_mariadb_tpcc.sh -s "nvme" -u "10 20 40 80 100"
+
+./run_mariadb_tpcc.sh -s "iscsi" -u "10"
+
+To run the scripts with Stats
+------------------------------
+./run_mariadb_tpcc_withstats.sh
+
+
+----------------------------------------------------------------------------------------------------------------------------
+Running Workload with pbench
+
+If you want to run the workload with pbench harness with a iteration list
+
+pbench-user-benchmark -C "Maridb_tuned_TP_HTon_40P_256Gmem_with_csv" --iteration-list=./run_params -- ./run_mariadb_tpcc.sh
+
+where run_params has the following entries
+10U NVME 10
+20U NVME 20
+
+If you just want to do one run without the iteration file
+
+pbench-user-benchmark -C "Maridb_tuned_TP_HTon_40P_256Gmem_with_csv"  -- ./run_mariadb_tpcc.sh nvme "10"
+
+
+
+----------------------------------------------------------------- End of Document --------------------
+Below are some of the setting and commands to do the build
+
+##  Create database with the following command (drop if it's a re-run)
+mysqladmin -f -uroot -pdbpassword drop tpcc
+mysqladmin -uroot -pdbpassword create tpcc
+
+
+./hammerdbcli
+dbset db mysql
+diset connection mysql_host 10.16.29.121
+diset connection mysql_port 3306
+diset tpcc mysql_count_ware 800
+diset tpcc mysql_partition true
+diset tpcc mysql_num_vu 64
+diset tpcc mysql_storage_engine innodb
+print dict
+buildschema
+
+
+dbset db mysql
+diset connection mysql_host 10.16.29.121
+diset connection mysql_port 3306
+diset tpcc mysql_driver timed
+diset tpcc mysql_rampup 2
+diset tpcc mysql_duration 5
+vuset logtotemp 1
+loadscript
+vuset vu 10
+vucreate
+vurun
+
+
+DB size
+100WH - 8G
+200WH - 17G
+500WH - 50G
+800WH - 70G
