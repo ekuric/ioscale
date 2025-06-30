@@ -84,7 +84,7 @@ do
    virtctl -n default ssh -t "-o StrictHostKeyChecking=no"  --local-ssh=true root@${hostnm} -c "dnf -y install git curl vim wget"
    virtctl -n default ssh -t "-o StrictHostKeyChecking=no"  --local-ssh=true root@${hostnm} -c "rm -rf /root/hammerdb-tpcc-wrapper-scripts"
    virtctl -n default ssh -t "-o StrictHostKeyChecking=no"  --local-ssh=true root@${hostnm} -c "mkdir -p /root/hammerdb-tpcc-wrapper-scripts"
-   virtctl -n default ssh -t "-o StrictHostKeyChecking=no"  --local-ssh=true root@${hostnm} -c "export GIT_SSL_NO_VERIFY=true; git clone https://gitlab.cee.redhat.com/ekuric/fusion-access.git /root/hammerdb-tpcc-wrapper-scripts" 
+   virtctl -n default ssh -t "-o StrictHostKeyChecking=no"  --local-ssh=true root@${hostnm} -c "export GIT_SSL_NO_VERIFY=true; git clone https://github.com/ekuric/fusion-access.git /root/hammerdb-tpcc-wrapper-scripts" 
    virtctl -n default ssh -t "-o StrictHostKeyChecking=no"  --local-ssh=true root@${hostnm} -c "chmod +x /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/Hammerdb-mariadb-install-script"
 
 done

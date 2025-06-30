@@ -7,7 +7,7 @@ In order to start vmscale test do below from machine where `oc` command work.
 1. get `kube-burner`  binary [kube-burner github](https://github.com/kube-burner/kube-burner/releases) and put it to `/usr/local/bin` of your bastion machine.
 2. clone repository 
 ```
-$ git clone https://gitlab.cee.redhat.com/ekuric/fusion-access.git
+$ git clone https://github.com/ekuric/fusion-access.git
 $ cd fusion-access  
 ```
 
