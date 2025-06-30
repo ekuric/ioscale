@@ -20,7 +20,7 @@ spec:
         source:
           http:
             url: >-
-              http://n42-h01-b06-mx750c.rdu3.labs.perfscale.redhat.com/ekuric/rhel9/CentOS-Stream-GenericCloud-10-20241118.0.x86_64.qcow2
+              https://dl.fedoraproject.org/pub/fedora/linux/releases/40/Cloud/x86_64/images/Fedora-Cloud-Base-Generic.x86_64-40-1.14.qcow2
     - metadata:
         name: datavolumedb
       spec:
