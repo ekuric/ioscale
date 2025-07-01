@@ -43,10 +43,10 @@ spec:
         vm.kubevirt.io/workload: server
       labels:
         flavor.template.kubevirt.io/large: 'true'
-        kubevirt.io/domain: vm-vmroot-elvir
+        kubevirt.io/domain: vm-testvm
         kubevirt.io/size: large
         os.template.kubevirt.io/fedora40: 'true'
-        vm.kubevirt.io/name: vm-vmroot-elvir
+        vm.kubevirt.io/name: vm-testvm
         workload.template.kubevirt.io/desktop: 'true'
     spec:
       nodeSelector:
@@ -89,7 +89,7 @@ spec:
           requests:
             memory: 200Gi
       evictionStrategy: None
-      hostname: vm-vmroot-elvir
+      hostname: vm-testvm
       networks:
         - name: default
           pod: {}
