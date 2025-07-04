@@ -53,7 +53,7 @@ Be aware to adapt test parameters for multiple virual machine test case. It is t
 Note: in virtual environment, first disk ( from PVC ) is `usually` presented as `/dev/vdc`. It is recommended to check is that the case for your VM. 
 
 # Database Test Results 
-Test results for database testing will be saved to `/usr/local/HammerDB/`. For MariaDB look for files with name `test_mariadb_HDB_tpcc_mariadb*` and for postgresql `test_ESX_pg_*`.
+Test results for database testing will be saved to `/usr/local/HammerDB/` on the test machine. For MariaDB look for files with name `test_mariadb_HDB_tpcc_mariadb*` and for postgresql `test_ESX_pg_*`.
 
 Results will be also visible in terminal where test script is executed. 
 
