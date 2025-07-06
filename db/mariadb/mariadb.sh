@@ -1,4 +1,3 @@
-#set -x
 mtpoint=none
 disklist=none
 dbhosts="127.0.0.1"
@@ -14,26 +13,13 @@ export Usercount
 usage()
 {
   echo " HOST NAME or IP REQUIRED!! - see usage below
-        Usage:
-        ./multi_db_mariadb.sh [-h] [-H Host names] [-d device] [-m mount point]
 
         Usage:
-        -h help
-        -H <Host names sepearted by space> - default 127.0.0.1
-        -d <device > - default none
-        -m <mount points> - default none
-        -u <user count> - default "10 20 30 40 50"
-        -c <Run comment> - default "HDB_MDB_UCount_Wcount" - append other info
-        -w <warehouse count> - default "500"
-        -s <storage type > - default "Null" - This is a comment only field
-        -t <run time> - default "15"
-
-       Examples:
-        ./multi_db_mariadb.sh -H "dhcp31-32 dhcp31-33" 
-        ./multi_db_mariadb.sh -H "10.16.31.32 10.16.31.33" 
-        ./multi_db_mariadb.sh -H "10.16.31.32 10.16.31.33" -d "/dev/vdb" -c "ThruPut"
-        ./multi_db_mariadb.sh -H "10.16.31.32 10.16.31.33" -m "/perf1" 
-        ./multi_db_mariadb.sh -H "dhcp31-32 dhcp31-33" -m "/perf1" -w 100 -u "10 20"
+        ./mariadb.sh [-h] [-H Host names] [-d device] [-m mount point]
+        ./mariadb.sh -H "vm1" -d /dev/vdc
+        ./mariadb.sh -H "vm1 vm2" -d /dev/vdc 
+        ./mariadb.sh -H "vm1" -m /perf1
+        ./mariadb.sh -H "vm1 vm2" -d /dev/vdc
   "
 }
 if [ $# -eq 0 ]

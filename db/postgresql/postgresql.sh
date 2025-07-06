@@ -10,7 +10,7 @@ usage()
 {
   echo " HOST NAME or IP REQUIRED!! - see usage below
         Usage:
-        ./multi_db_postgres.sh [-h] [-H Host names] [-d device] [-m mount point]
+        ./postgres.sh [-h] [-H Host names] [-d device] [-m mount point]
 
         Usage:
         -h help
@@ -21,11 +21,10 @@ usage()
         -w <warehouse count> - default "500"
 
        Examples:
-        ./multi_db_postgres.sh -H "dhcp31-32 dhcp31-33" 
-        ./multi_db_postgres.sh -H "10.16.31.32 10.16.31.33" 
-        ./multi_db_postgres.sh -H "10.16.31.32 10.16.31.33" -d /dev/vdb 
-        ./multi_db_postgres.sh -H "10.16.31.32 10.16.31.33" -m "/perf1" 
-        ./multi_db_postgres.sh -H "10.16.31.32 10.16.31.33" -m "/perf1" -w 100 -u "10 20"
+        ./postgres.sh -H "vm1" -d /dev/vdb
+        ./postgres.sh -H "vm1 vm2" -d /dev/vdb 
+        ./postgres.sh -H "vm1" -m /perf1  
+        ./postgres.sh -h "vm1 vm2" -m /perf1    
   "
 }
 if [ $# -eq 0 ]
