@@ -49,8 +49,6 @@ spec:
         vm.kubevirt.io/name: vm-testvm
         workload.template.kubevirt.io/desktop: 'true'
     spec:
-      nodeSelector:
-        scale.spectrum.ibm.com/role: storage
       accessCredentials:
         - sshPublicKey:
             propagationMethod:

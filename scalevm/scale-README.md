@@ -27,14 +27,14 @@ which says `VMReady` before virtual machines are in `READY` state.
 
 # Important 
 
-In `vm-dv.yml` template we have `nodeSelector` specificiation 
+In `vm-dv.yml` template we can add `nodeSelector` specificiation 
 
 ```
 spec:
       nodeSelector:
-        scale.spectrum.ibm.com/role: storage
+        scale.spectrum.ibm.com/role: test-storage
 ```
-in order to start virtual only on Fusion Access storage nodes.
+in order to start virtual only on Fusion Access storage nodes if that is important. If `nodeSelector` is used then it is necessary to label nodes with `scale.spectrum.ibm.com/role: test-storage`
 
 File `templates/vmdensity-template.yml` is main configuration file, where we can change storage class and image used by virtual machines. 
 

@@ -13,8 +13,6 @@ spec:
         kubevirt-vm: vm-{{.name}}-{{.Replica}}
         kubevirt.io/os: {{.OS}}
     spec:
-      nodeSelector:
-        scale.spectrum.ibm.com/role: storage
       domain:
         ## vcpus:
         cpu:
