@@ -1,0 +1,24 @@
+# PostgreSQL HammerDB TPCC Test Configuration
+# Example: Single host with block device
+
+# Database configuration
+database:
+  hosts: "vm1"
+  namespace: "default"
+  warehouse_count: 50
+  test_duration: 15
+
+# Storage configuration
+storage:
+  disk_list: "/dev/vdb"
+  mount_point: "none"
+
+# Test configuration
+test:
+  user_count: "1"
+  log_level: "INFO"
+
+# HammerDB configuration
+hammerdb:
+  repo: "https://github.com/ekuric/fusion-access.git"
+  path: "/root/hammerdb-tpcc-wrapper-scripts" 

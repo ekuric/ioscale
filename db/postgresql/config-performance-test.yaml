@@ -1,0 +1,24 @@
+# PostgreSQL HammerDB TPCC Test Configuration
+# Example: Multi-host performance testing
+
+# Database configuration
+database:
+  hosts: "vm1 vm2 vm3"
+  namespace: "default"
+  warehouse_count: 100
+  test_duration: 30
+
+# Storage configuration
+storage:
+  disk_list: "/dev/vdb"
+  mount_point: "none"
+
+# Test configuration - multiple user counts for scalability testing
+test:
+  user_count: "1 2 4 8 16 32"
+  log_level: "INFO"
+
+# HammerDB configuration
+hammerdb:
+  repo: "https://github.com/ekuric/fusion-access.git"
+  path: "/root/hammerdb-tpcc-wrapper-scripts" 
