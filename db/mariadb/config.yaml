@@ -1,0 +1,61 @@
+# MariaDB HammerDB TPCC Testing Configuration
+# This YAML file configures all aspects of the MariaDB performance testing script
+
+# Storage Configuration
+storage:
+  # Either mount_point or disk_list must be specified (set unused one to null)
+  mount_point: null               # Mount point to use for MariaDB data (e.g., "/perf1")
+  disk_list: "/dev/vdc"          # Block device to use for MariaDB data (e.g., "/dev/vdc")
+
+# Database Configuration
+database:
+  hosts: "vm1"                   # Space-separated list of VM hostnames
+  namespace: "default"           # Kubernetes namespace for VMs
+  warehouse_count: 50            # Number of warehouses for TPCC test
+  test_duration: 15              # Test duration in minutes
+
+# Test Configuration
+test:
+  user_count: "1"               # Space-separated list of user counts to test
+  run_name: "HDB_MDB"           # Base name for test runs
+  storage_type: "null"          # Storage type identifier for reporting
+  log_level: "INFO"             # Logging level (DEBUG, INFO, WARN, ERROR)
+
+# HammerDB Configuration
+hammerdb:
+  repo: "https://github.com/ekuric/fusion-access.git"  # Git repository URL
+  path: "/root/hammerdb-tpcc-wrapper-scripts"          # Scripts directory path
+  install_dir: "/usr/local/HammerDB"                   # HammerDB installation directory
+
+# Example configurations for different environments
+# Uncomment and modify as needed
+
+# Development Environment (smaller scale, faster tests)
+# storage:
+#   disk_list: "/dev/vdb"
+# database:
+#   hosts: "dev-vm1"
+#   warehouse_count: 10
+#   test_duration: 5
+# test:
+#   user_count: "1 2"
+
+# Production Environment (large scale, comprehensive tests)
+# storage:
+#   mount_point: "/perf1"
+# database:
+#   hosts: "prod-vm1 prod-vm2 prod-vm3"
+#   warehouse_count: 500
+#   test_duration: 60
+# test:
+#   user_count: "50 100 200"
+
+# CI/CD Environment (minimal tests for validation)
+# storage:
+#   disk_list: "/dev/vdc"
+# database:
+#   hosts: "ci-vm1"
+#   warehouse_count: 5
+#   test_duration: 2
+# test:
+#   user_count: "1" 
