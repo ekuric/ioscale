@@ -31,26 +31,20 @@ Once there is desired test virtual machine up and running. Starting tests is eas
 For MariaDB 
 
 ```
-./mariadb.sh -H "vm name from as presented `oc get vm`" -d /dev/vdc 
+./mariadb.sh -c config.yml 
 ``` 
 
 For Postgresql 
 ```
-./postgresql.sh -H "vm name from as presented `oc get vm`" -d /dev/vdc
+./postgresql.sh -c config.yml
 ``` 
 
-It is important to mention that above scripts will work for multiple virtual machines 
-For example
-```
-#./mariadb.sh -H "vm1 vm2 vm3 vm4" -d /dev/vdc
-#./postgresql.sh -H "vm1 vm2 vm3 vm4" -d /dev/vdc
-``` 
-Virtual machine names are ones we get with `oc get vm` 
+`mariadb.sh` and `postgresql.sh` support multiple virtual machines - it is only necessary to add test machines in `hosts` section in `config.yml` configuration file.
 
-Be aware to adapt test parameters for multiple virual machine test case. It is to expected to run lower number of clients / warehouses than for case when single virtual machine is tested.
+Virtual machine names used in `config.yml` are names presented in `oc get vm` output. 
 
 
-Note: in virtual environment, first disk ( from PVC ) is `usually` presented as `/dev/vdc`. It is recommended to check is that the case for your VM. 
+Note: in virtual environment, first disk ( from PVC ) is `usually` presented as `/dev/vdc`. It is recommended to check is that the case for test VM. 
 
 # Database Test Results 
 Test results for database testing will be saved to `/usr/local/HammerDB/` on the test machine. For MariaDB look for files with name `test_mariadb_HDB_tpcc_mariadb*` and for postgresql `test_ESX_pg_*`.
