@@ -1,21 +1,81 @@
 #!/bin/bash
 
-# PostgreSQL HammerDB TPCC Testing Script
+# PostgreSQL HammerDB TPCC Testing Script (YAML Configuration Version)
 # This script sets up and runs PostgreSQL performance tests using HammerDB TPCC benchmarks
+# Configuration is read from a YAML file instead of command line arguments
 
 set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
-# Default configuration values
-MOUNT_POINT="none"
-DISK_LIST="none"
-DB_HOSTS="127.0.0.1"
-WAREHOUSE_COUNT=50
-USER_COUNT="1"
-NAMESPACE="default"
-HAMMERDB_REPO="https://github.com/ekuric/fusion-access.git"
-HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts"
-TEST_DURATION=15
-LOG_LEVEL="INFO"
+# Default configuration file
+CONFIG_FILE="config.yaml"
+DRY_RUN=false
+
+# Function to check if required tools are installed
+check_dependencies() {
+    local missing_tools=()
+    
+    if ! command -v yq &> /dev/null; then
+        missing_tools+=("yq")
+    fi
+    
+    if [[ "$DRY_RUN" == "false" ]] && ! command -v virtctl &> /dev/null; then
+        missing_tools+=("virtctl")
+    fi
+    
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        echo "Error: The following required tools are missing:"
+        for tool in "${missing_tools[@]}"; do
+            case $tool in
+                yq)
+                    echo "  - yq: Install with 'sudo dnf install yq' or 'sudo apt install yq'"
+                    ;;
+                virtctl)
+                    echo "  - virtctl: Install from https://kubevirt.io/user-guide/operations/virtctl_client_tool/"
+                    echo "    Or if using kubectl: 'kubectl krew install virt'"
+                    ;;
+            esac
+        done
+        echo ""
+        echo "Install the missing tools and try again."
+        exit 1
+    fi
+}
+
+# Function to read YAML configuration
+read_config() {
+    local config_file="$1"
+    
+    if [[ ! -f "$config_file" ]]; then
+        echo "Error: Configuration file '$config_file' not found"
+        exit 1
+    fi
+    
+    # Read configuration values from YAML file
+    MOUNT_POINT=$(yq eval '.storage.mount_point' "$config_file")
+    DISK_LIST=$(yq eval '.storage.disk_list' "$config_file")
+    DB_HOSTS=$(yq eval '.database.hosts' "$config_file")
+    WAREHOUSE_COUNT=$(yq eval '.database.warehouse_count' "$config_file")
+    USER_COUNT=$(yq eval '.test.user_count' "$config_file")
+    NAMESPACE=$(yq eval '.database.namespace' "$config_file")
+    HAMMERDB_REPO=$(yq eval '.hammerdb.repo' "$config_file")
+    HAMMERDB_PATH=$(yq eval '.hammerdb.path' "$config_file")
+    TEST_DURATION=$(yq eval '.database.test_duration' "$config_file")
+    LOG_LEVEL=$(yq eval '.test.log_level' "$config_file")
+    
+    # Handle null values (convert to "none" or appropriate defaults)
+    if [[ "$MOUNT_POINT" == "null" ]]; then
+        MOUNT_POINT="none"
+    fi
+    if [[ "$DISK_LIST" == "null" ]]; then
+        DISK_LIST="none"
+    fi
+    if [[ "$NAMESPACE" == "null" ]]; then
+        NAMESPACE="default"
+    fi
+    if [[ "$LOG_LEVEL" == "null" ]]; then
+        LOG_LEVEL="INFO"
+    fi
+}
 
 # Logging function
 log() {
@@ -47,32 +107,31 @@ trap 'handle_error $LINENO' ERR
 # Usage function
 usage() {
     cat << EOF
-PostgreSQL HammerDB TPCC Testing Script
+PostgreSQL HammerDB TPCC Testing Script (YAML Configuration Version)
 
 DESCRIPTION:
     This script automates PostgreSQL performance testing using HammerDB TPCC benchmarks.
-    It sets up the database, builds test data, and runs performance tests.
+    Configuration is read from a YAML file instead of command line arguments.
 
 USAGE:
-    $0 [-h] [-H hosts] [-d device] [-m mount_point] [-u user_count] [-w warehouse_count] [-v]
+    $0 [-h] [-c config_file] [-v] [--dry-run]
 
 OPTIONS:
     -h                  Show this help message
-    -H <hosts>          Host names separated by spaces (default: 127.0.0.1)
-    -d <device>         Block device to use (default: none)
-    -m <mount_point>    Mount point to use (default: none)
-    -u <user_count>     User count for tests (default: "1")
-    -w <warehouse_count> Warehouse count (default: 50)
+    -c <config_file>    Path to YAML configuration file (default: config.yaml)
     -v                  Verbose output
+    --dry-run           Validate configuration and show what would be done without executing
 
 EXAMPLES:
-    $0 -H "vm1" -d /dev/vdb
-    $0 -H "vm1 vm2" -d /dev/vdb 
-    $0 -H "vm1" -m /perf1  
-    $0 -H "vm1 vm2" -m /perf1
+    $0                          # Use default config.yaml
+    $0 -c test-config.yaml      # Use custom configuration file
+    $0 -c config.yaml -v        # Use default config with verbose output
+
+YAML CONFIGURATION:
+    See config.yaml for configuration file format and examples.
 
 NOTES:
-    - Either device (-d) or mount point (-m) must be specified
+    - Requires 'yq' tool for YAML parsing
     - Script requires virtctl for VM access
     - All operations are performed as root on target VMs
 EOF
@@ -81,17 +140,39 @@ EOF
 # Input validation
 validate_inputs() {
     if [[ "$MOUNT_POINT" == "none" && "$DISK_LIST" == "none" ]]; then
-        log_error "Either device (-d) or mount point (-m) must be specified"
-        usage
+        log_error "Either storage.disk_list or storage.mount_point must be specified in config"
         exit 1
     fi
     
-    # Validate hosts are reachable
-    for host in $DB_HOSTS; do
-        if ! ping -c 1 -W 2 "$host" &>/dev/null; then
-            log_warn "Host $host may not be reachable"
-        fi
-    done
+    # Validate hosts are reachable (skip in dry-run mode)
+    if [[ "$DRY_RUN" == "false" ]]; then
+        for host in $DB_HOSTS; do
+            if ! ping -c 1 -W 2 "$host" &>/dev/null; then
+                log_warn "Host $host may not be reachable"
+            fi
+        done
+    else
+        log_info "Skipping host reachability check in dry-run mode"
+    fi
+}
+
+# Display configuration
+display_config() {
+    log_info "Configuration loaded from: $CONFIG_FILE"
+    log_info "Hosts: $DB_HOSTS"
+    log_info "Namespace: $NAMESPACE"
+    log_info "Warehouse count: $WAREHOUSE_COUNT"
+    log_info "User counts: $USER_COUNT"
+    log_info "Test duration: $TEST_DURATION minutes"
+    if [[ "$DISK_LIST" != "none" ]]; then
+        log_info "Disk device: $DISK_LIST"
+    fi
+    if [[ "$MOUNT_POINT" != "none" ]]; then
+        log_info "Mount point: $MOUNT_POINT"
+    fi
+    log_info "HammerDB repo: $HAMMERDB_REPO"
+    log_info "HammerDB path: $HAMMERDB_PATH"
+    log_info "Log level: $LOG_LEVEL"
 }
 
 # Execute SSH command with error handling
@@ -103,7 +184,7 @@ execute_ssh() {
     log_info "Executing on $host: $description"
     
     if ! virtctl -n "$NAMESPACE" ssh -t "-o StrictHostKeyChecking=no" \
-         --local-ssh=true "root@$host" -c "$command"; then
+         "root@vmi/$host" -c "$command"; then
         log_error "Failed to execute '$description' on $host"
         return 1
     fi
@@ -117,7 +198,7 @@ execute_ssh_background() {
     
     log_info "Starting background task on $host: $description"
     virtctl -n "$NAMESPACE" ssh -t "-o StrictHostKeyChecking=no" \
-            --local-ssh=true "root@$host" -c "$command" &
+            "root@vmi/$host" -c "$command" &
 }
 
 # Install dependencies on VMs
@@ -293,11 +374,25 @@ stop_postgresql() {
 # Main function
 main() {
     log_info "Starting PostgreSQL HammerDB TPCC testing script"
-    log_info "Hosts: $DB_HOSTS"
-    log_info "Warehouse count: $WAREHOUSE_COUNT"
-    log_info "User counts: $USER_COUNT"
     
+    check_dependencies
+    read_config "$CONFIG_FILE"
+    display_config
     validate_inputs
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN MODE: Configuration validated successfully"
+        log_info "Would execute the following steps:"
+        log_info "  1. Install dependencies on VMs"
+        log_info "  2. Deploy HammerDB scripts"
+        log_info "  3. Install PostgreSQL"
+        log_info "  4. Build TPCC database"
+        log_info "  5. Run performance tests"
+        log_info "  6. Stop PostgreSQL instances"
+        log_info "Use without --dry-run to execute the actual tests"
+        return 0
+    fi
+    
     install_dependencies
     deploy_scripts
     install_postgresql
@@ -309,40 +404,22 @@ main() {
 }
 
 # Parse command line arguments
-if [ $# -eq 0 ]; then
-    usage
-    exit 1
-fi
-
 while [ $# -gt 0 ]; do
     case $1 in
         -h|--help)
             usage
             exit 0
             ;;
-        -H|--hosts)
-            DB_HOSTS="$2"
-            shift 2
-            ;;
-        -d|--device)
-            DISK_LIST="$2"
-            shift 2
-            ;;
-        -m|--mount-point)
-            MOUNT_POINT="$2"
-            shift 2
-            ;;
-        -u|--user-count)
-            USER_COUNT="$2"
-            shift 2
-            ;;
-        -w|--warehouse-count)
-            WAREHOUSE_COUNT="$2"
+        -c|--config)
+            CONFIG_FILE="$2"
             shift 2
             ;;
         -v|--verbose)
-            LOG_LEVEL="DEBUG"
             set -x
+            shift
+            ;;
+        --dry-run)
+            DRY_RUN=true
             shift
             ;;
         *)
@@ -354,5 +431,4 @@ while [ $# -gt 0 ]; do
 done
 
 # Run main function
-main
-
+main 

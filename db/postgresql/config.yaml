@@ -1,0 +1,46 @@
+# PostgreSQL HammerDB TPCC Test Configuration
+# This YAML file contains all configurable parameters for the testing script
+
+# Database configuration
+database:
+  hosts: "127.0.0.1"  # Space-separated list of hosts (e.g., "vm1 vm2 vm3")
+  namespace: "default"
+  warehouse_count: 50
+  test_duration: 15  # Duration in minutes
+
+# Storage configuration (specify either disk_list OR mount_point, not both)
+storage:
+  disk_list: "/dev/vdb"  # Block device to use (e.g., "/dev/vdb")
+  mount_point: "none"    # Mount point to use (e.g., "/perf1")
+
+# Test configuration
+test:
+  user_count: "1"        # Can be a single value or space-separated list (e.g., "1 2 4 8")
+  log_level: "INFO"      # DEBUG, INFO, WARN, ERROR
+
+# HammerDB configuration
+hammerdb:
+  repo: "https://github.com/ekuric/fusion-access.git"
+  path: "/root/hammerdb-tpcc-wrapper-scripts"
+
+# Example configurations for different test scenarios:
+
+# Single host with block device:
+# database:
+#   hosts: "vm1"
+# storage:
+#   disk_list: "/dev/vdb"
+#   mount_point: "none"
+
+# Multiple hosts with mount point:
+# database:
+#   hosts: "vm1 vm2 vm3"
+# storage:
+#   disk_list: "none"
+#   mount_point: "/perf1"
+
+# Performance testing with multiple user counts:
+# test:
+#   user_count: "1 2 4 8 16 32"
+#   warehouse_count: 100
+#   test_duration: 30 
