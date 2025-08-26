@@ -4,19 +4,19 @@
 # Storage Configuration
 storage:
   # Either mount_point or disk_list must be specified (set unused one to null)
-  mount_point: null               # Mount point to use for MariaDB data (e.g., "/perf1")
+  mount_point: null               # Mount point to use for MariaDB data (e.g., "/perf1") - this mount point is used for data storage and must be present on the test machine.
   disk_list: "/dev/vdc"          # Block device to use for MariaDB data (e.g., "/dev/vdc")
 
 # Database Configuration
 database:
-  hosts: "vm1"                   # Space-separated list of VM hostnames
+  hosts: "vm1"                   # Space-separated list of VM hostnames - eg "vm1 vm2 vm3" as presented in `oc get vm` output
   namespace: "default"           # Kubernetes namespace for VMs
   warehouse_count: 50            # Number of warehouses for TPCC test
   test_duration: 15              # Test duration in minutes
 
 # Test Configuration
 test:
-  user_count: "1"               # Space-separated list of user counts to test
+  user_count: "1"               # Space-separated list of user counts to test, eg "1 2 4 8"
   run_name: "HDB_MDB"           # Base name for test runs
   storage_type: "null"          # Storage type identifier for reporting
   log_level: "INFO"             # Logging level (DEBUG, INFO, WARN, ERROR)

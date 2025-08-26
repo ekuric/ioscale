@@ -3,15 +3,20 @@
 
 # Database configuration
 database:
-  hosts: "127.0.0.1"  # Space-separated list of hosts (e.g., "vm1 vm2 vm3")
-  namespace: "default"
-  warehouse_count: 50
-  test_duration: 15  # Duration in minutes
+  hosts: "127.0.0.1"  # Space-separated list of hosts (e.g., "vm1 vm2 vm3" as presented in `oc get vm` output)
+  namespace: "default" # Namespace where virtual machines are running
+  warehouse_count: 50 # Number of warehouses for TPCC test 
+  test_duration: 15  # Duration in minutes - this can be long - adapt to your needs
 
 # Storage configuration (specify either disk_list OR mount_point, not both)
+# Storage can be either block device or mount point - it is recommended to use block device for performance testing. Script will 
+# format the block device if it is not already formatted. 
+# For case when mount point is used, it is recommended to use then it is necessary to point to 
+# already existing mount point where data will be stored. 
 storage:
   disk_list: "/dev/vdb"  # Block device to use (e.g., "/dev/vdb")
   mount_point: "none"    # Mount point to use (e.g., "/perf1")
+
 
 # Test configuration
 test:
