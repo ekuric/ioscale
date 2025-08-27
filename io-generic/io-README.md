@@ -37,9 +37,8 @@ cd io-generic
 
 ### Step 4: Execute Tests
 ```bash
-./fio-tests.sh
+./fio-tests.sh -c fio-config.yaml
 ```
-Without `-c fio-config.yaml` it will automatically
 
 ### Step 5: Results Collection
 Results are automatically copied to your local machine:
