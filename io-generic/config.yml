@@ -1,0 +1,67 @@
+# FIO Remote Testing Configuration
+# This YAML file configures all aspects of the FIO performance testing script
+
+# Virtual Machine Configuration
+vm:
+  hosts: "vm1"                   # Space-separated list of VM hostnames to test
+  namespace: "default"           # Kubernetes namespace for VMs
+
+# Storage Configuration
+storage:
+  device: "vdc"                  # Block device to test (without /dev/ prefix)
+  mount_point: "/root/tests/data" # Mount point for test data
+  filesystem: "xfs"              # Filesystem type (xfs, ext4, etc.)
+
+# FIO Test Configuration
+fio:
+  test_size: "5GB"               # Size of test files
+  runtime: 300                   # Test runtime in seconds
+  block_sizes: "4k 8k 128k 4096k" # Space-separated list of block sizes
+  io_patterns: "randread randwrite read write" # Space-separated list of I/O patterns
+  numjobs: 16                    # Number of parallel jobs
+  iodepth: 16                    # I/O queue depth
+  direct_io: 1                   # Use direct I/O (1=yes, 0=no)
+
+# Output Configuration
+output:
+  directory: "/root/fio-results"  # Directory for test results on VMs
+  format: "json+"                # Output format (json+, normal, terse)
+
+# Example configurations for different test scenarios
+# Uncomment and modify as needed:
+
+# Quick Development Test
+# fio:
+#   test_size: "1GB"
+#   runtime: 60
+#   block_sizes: "4k 64k"
+#   io_patterns: "randread randwrite"
+#   numjobs: 4
+#   iodepth: 8
+
+# Comprehensive Performance Test
+# fio:
+#   test_size: "20GB"
+#   runtime: 600
+#   block_sizes: "4k 8k 16k 32k 64k 128k 256k 512k 1024k"
+#   io_patterns: "randread randwrite read write randrw"
+#   numjobs: 32
+#   iodepth: 32
+
+# Multi-VM Load Test
+# vm:
+#   hosts: "vm1 vm2 vm3 vm4"
+# fio:
+#   test_size: "10GB"
+#   runtime: 1800  # 30 minutes
+#   numjobs: 8
+#   iodepth: 16
+
+# Storage Vendor Benchmark
+# fio:
+#   test_size: "50GB"
+#   runtime: 3600  # 1 hour
+#   block_sizes: "4k 8k 64k 1024k"
+#   io_patterns: "randread randwrite randrw"
+#   numjobs: 64
+#   iodepth: 64 
