@@ -1,0 +1,23 @@
+# Example host file for MariaDB testing
+# One hostname per line
+# Lines starting with # are comments and ignored
+
+# Production MariaDB cluster
+mariadb-prod-001
+mariadb-prod-002
+mariadb-prod-003
+
+# Development environments
+mariadb-dev-01
+mariadb-dev-02
+
+# Testing cluster
+mariadb-test-node-1
+mariadb-test-node-2
+mariadb-test-node-3
+mariadb-test-node-4
+
+# Performance testing VMs
+perf-db-001
+perf-db-002
+perf-db-003 

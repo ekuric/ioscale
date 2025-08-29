@@ -1,51 +1,106 @@
-# PostgreSQL HammerDB TPCC Test Configuration
-# This YAML file contains all configurable parameters for the testing script
+# PostgreSQL HammerDB TPCC Testing Configuration
+# This YAML file configures all aspects of the PostgreSQL performance testing script
 
-# Database configuration
-database:
-  hosts: "127.0.0.1"  # Space-separated list of hosts (e.g., "vm1 vm2 vm3" as presented in `oc get vm` output)
-  namespace: "default" # Namespace where virtual machines are running
-  warehouse_count: 50 # Number of warehouses for TPCC test 
-  test_duration: 15  # Duration in minutes - this can be long - adapt to your needs
-
-# Storage configuration (specify either disk_list OR mount_point, not both)
-# Storage can be either block device or mount point - it is recommended to use block device for performance testing. Script will 
-# format the block device if it is not already formatted. 
-# For case when mount point is used, it is recommended to use then it is necessary to point to 
-# already existing mount point where data will be stored. 
+# Storage Configuration
 storage:
-  disk_list: "/dev/vdb"  # Block device to use (e.g., "/dev/vdb")
-  mount_point: "none"    # Mount point to use (e.g., "/perf1")
+  # Either mount_point or disk_list must be specified (set unused one to null)
+  mount_point: null               # Mount point to use for PostgreSQL data (e.g., "/perf1") - this mount point is used for data storage and must be present on the test machine.
+  disk_list: "/dev/vdc"          # Block device to use for PostgreSQL data (e.g., "/dev/vdc")
 
+# Database Configuration
+database:
+  # Method 1: Simple list (for small numbers)
+  hosts: "vm1"                   # Space-separated list of VM hostnames - eg "vm1 vm2 vm3"
+  
+  # Method 2: Host range expansion (for large numbers)
+  # host_pattern: "pg{1..200}"     # Bash-style range expansion: pg1, pg2, ..., pg200
+  # host_pattern: "postgres-{001..050}"  # Zero-padded: postgres-001, postgres-002, ..., postgres-050
+  
+  # Method 3: Label-based selection (dynamic discovery)
+  # host_labels: "app=postgresql-test"                # Select VMs with label app=postgresql-test
+  # host_labels: "env=performance,tier=database"      # Multiple labels (AND condition)
+  
+  # Method 4: External host file
+  # host_file: "/path/to/postgresql-hosts.txt"        # File with one hostname per line
+  
+  namespace: "default"           # Kubernetes namespace for VMs
+  warehouse_count: 50            # Number of warehouses for TPCC test
+  test_duration: 15              # Test duration in minutes
 
-# Test configuration
+# Test Configuration
 test:
-  user_count: "1"        # Can be a single value or space-separated list (e.g., "1 2 4 8")
-  log_level: "INFO"      # DEBUG, INFO, WARN, ERROR
+  user_count: "1"               # Space-separated list of user counts to test, eg "1 2 4 8"
+  log_level: "INFO"             # Logging level (DEBUG, INFO, WARN, ERROR)
 
-# HammerDB configuration
+# HammerDB Configuration
 hammerdb:
-  repo: "https://github.com/ekuric/fusion-access.git"
-  path: "/root/hammerdb-tpcc-wrapper-scripts"
+  repo: "https://github.com/ekuric/fusion-access.git"  # Git repository URL
+  path: "/root/hammerdb-tpcc-wrapper-scripts"          # Scripts directory path
 
-# Example configurations for different test scenarios:
+# Example configurations for different environments
+# Uncomment and modify as needed
 
-# Single host with block device:
-# database:
-#   hosts: "vm1"
+# Development Environment (smaller scale, faster tests)
 # storage:
 #   disk_list: "/dev/vdb"
-#   mount_point: "none"
-
-# Multiple hosts with mount point:
 # database:
-#   hosts: "vm1 vm2 vm3"
-# storage:
-#   disk_list: "none"
-#   mount_point: "/perf1"
-
-# Performance testing with multiple user counts:
+#   hosts: "dev-pg1"
+#   warehouse_count: 10
+#   test_duration: 5
 # test:
-#   user_count: "1 2 4 8 16 32"
-#   warehouse_count: 100
-#   test_duration: 30 
+#   user_count: "1 2"
+
+# Production Environment (large scale, comprehensive tests)
+# storage:
+#   mount_point: "/perf1"
+# database:
+#   hosts: "prod-pg1 prod-pg2 prod-pg3"
+#   warehouse_count: 500
+#   test_duration: 60
+# test:
+#   user_count: "50 100 200"
+
+# Large Scale Examples (100+ VMs):
+
+# 200 VMs with pattern expansion
+# storage:
+#   mount_point: "/perf1"
+# database:
+#   host_pattern: "postgres-{001..200}"
+#   namespace: "database-testing"
+#   warehouse_count: 1000
+#   test_duration: 120
+# test:
+#   user_count: "100 200 500"
+
+# Dynamic selection based on labels
+# storage:
+#   disk_list: "/dev/vdc"
+# database:
+#   host_labels: "workload=postgresql-performance,env=production"
+#   namespace: "production"
+#   warehouse_count: 500
+#   test_duration: 180
+# test:
+#   user_count: "50 100 200 400"
+
+# Multi-environment testing with external host file
+# storage:
+#   mount_point: "/data"
+# database:
+#   host_file: "/etc/testing/postgresql-production-vms.txt"
+#   namespace: "multi-env"
+#   warehouse_count: 750
+#   test_duration: 240
+# test:
+#   user_count: "25 50 100 200 300"
+
+# CI/CD Environment (minimal tests for validation)
+# storage:
+#   disk_list: "/dev/vdc"
+# database:
+#   hosts: "ci-pg1"
+#   warehouse_count: 5
+#   test_duration: 2
+# test:
+#   user_count: "1" 

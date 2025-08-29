@@ -9,7 +9,20 @@ storage:
 
 # Database Configuration
 database:
-  hosts: "vm1"                   # Space-separated list of VM hostnames - eg "vm1 vm2 vm3" as presented in `oc get vm` output
+  # Method 1: Simple list (for small numbers)
+  hosts: "vm1"                   # Space-separated list of VM hostnames - eg "vm1 vm2 vm3"
+  
+  # Method 2: Host range expansion (for large numbers)
+  # host_pattern: "db{1..200}"     # Bash-style range expansion: db1, db2, ..., db200
+  # host_pattern: "mariadb-{001..050}"  # Zero-padded: mariadb-001, mariadb-002, ..., mariadb-050
+  
+  # Method 3: Label-based selection (dynamic discovery)
+  # host_labels: "app=mariadb-test"                # Select VMs with label app=mariadb-test
+  # host_labels: "env=performance,tier=database"   # Multiple labels (AND condition)
+  
+  # Method 4: External host file
+  # host_file: "/path/to/mariadb-hosts.txt"        # File with one hostname per line
+  
   namespace: "default"           # Kubernetes namespace for VMs
   warehouse_count: 50            # Number of warehouses for TPCC test
   test_duration: 15              # Test duration in minutes
@@ -49,6 +62,41 @@ hammerdb:
 #   test_duration: 60
 # test:
 #   user_count: "50 100 200"
+
+# Large Scale Examples (100+ VMs):
+
+# 200 VMs with pattern expansion
+# storage:
+#   mount_point: "/perf1"
+# database:
+#   host_pattern: "mariadb-{001..200}"
+#   namespace: "database-testing"
+#   warehouse_count: 1000
+#   test_duration: 120
+# test:
+#   user_count: "100 200 500"
+
+# Dynamic selection based on labels
+# storage:
+#   disk_list: "/dev/vdc"
+# database:
+#   host_labels: "workload=mariadb-performance,env=production"
+#   namespace: "production"
+#   warehouse_count: 500
+#   test_duration: 180
+# test:
+#   user_count: "50 100 200 400"
+
+# Multi-environment testing with external host file
+# storage:
+#   mount_point: "/data"
+# database:
+#   host_file: "/etc/testing/mariadb-production-vms.txt"
+#   namespace: "multi-env"
+#   warehouse_count: 750
+#   test_duration: 240
+# test:
+#   user_count: "25 50 100 200 300"
 
 # CI/CD Environment (minimal tests for validation)
 # storage:

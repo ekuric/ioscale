@@ -1,0 +1,27 @@
+# Example host file for PostgreSQL testing
+# One hostname per line
+# Lines starting with # are comments and ignored
+
+# Production PostgreSQL cluster
+postgres-prod-001
+postgres-prod-002
+postgres-prod-003
+
+# Development environments
+postgres-dev-01
+postgres-dev-02
+
+# Testing cluster
+postgres-test-node-1
+postgres-test-node-2
+postgres-test-node-3
+postgres-test-node-4
+
+# Performance testing VMs
+perf-pg-001
+perf-pg-002
+perf-pg-003
+
+# Staging environment
+postgres-staging-1
+postgres-staging-2 

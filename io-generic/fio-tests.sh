@@ -58,6 +58,85 @@ check_dependencies() {
     fi
 }
 
+# Smart host selection function
+get_vm_hosts() {
+    local config_file="$1"
+    local hosts=""
+    
+    # Method 1: Host pattern expansion (e.g., vm{1..200})
+    local host_pattern=$(yq eval '.vm.host_pattern' "$config_file")
+    if [[ "$host_pattern" != "null" && -n "$host_pattern" ]]; then
+        log_info "Using host pattern: $host_pattern"
+        
+        # Use bash expansion for patterns like vm{1..200}
+        # Note: This works in bash with brace expansion enabled
+        if [[ "$host_pattern" =~ \{[0-9]+\.\.[0-9]+\} ]]; then
+            # Enable brace expansion and expand the pattern
+            set +o nounset  # Temporarily disable for expansion
+            hosts=$(eval echo "$host_pattern")
+            set -o nounset  # Re-enable
+            log_info "Expanded pattern to: $(echo $hosts | wc -w) hosts"
+            echo "$hosts"
+            return 0
+        fi
+    fi
+    
+    # Method 2: Label-based selection from Kubernetes
+    local host_labels=$(yq eval '.vm.host_labels' "$config_file")
+    if [[ "$host_labels" != "null" && -n "$host_labels" ]]; then
+        log_info "Using label selector: $host_labels"
+        
+        if [[ "$DRY_RUN" == "false" ]] && command -v oc &> /dev/null; then
+            # Query OpenShift/Kubernetes for VMs with specified labels
+            hosts=$(oc get vms -n "$NAMESPACE" -l "$host_labels" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}' 2>/dev/null || true)
+            if [[ -n "$hosts" ]]; then
+                log_info "Found $(echo $hosts | wc -w) VMs matching labels: $host_labels"
+                echo "$hosts"
+                return 0
+            else
+                log_warn "No VMs found matching labels: $host_labels"
+            fi
+        else
+            log_info "Dry-run mode: Would query VMs with labels: $host_labels"
+            echo "example-vm1 example-vm2"  # Placeholder for dry-run
+            return 0
+        fi
+    fi
+    
+    # Method 3: External host file
+    local host_file=$(yq eval '.vm.host_file' "$config_file")
+    if [[ "$host_file" != "null" && -n "$host_file" ]]; then
+        log_info "Using host file: $host_file"
+        
+        if [[ -f "$host_file" ]]; then
+            # Read hosts from file, skip comments and empty lines
+            hosts=$(grep -v '^#' "$host_file" | grep -v '^[[:space:]]*$' | tr '\n' ' ' | xargs)
+            if [[ -n "$hosts" ]]; then
+                log_info "Loaded $(echo $hosts | wc -w) hosts from file: $host_file"
+                echo "$hosts"
+                return 0
+            else
+                log_warn "No valid hosts found in file: $host_file (all lines are comments or empty)"
+            fi
+        else
+            log_error "Host file not found: $host_file"
+            exit 1
+        fi
+    fi
+    
+    # Method 4: Simple host list (fallback)
+    hosts=$(yq eval '.vm.hosts' "$config_file")
+    if [[ "$hosts" != "null" && -n "$hosts" ]]; then
+        log_info "Using simple host list: $hosts"
+        echo "$hosts"
+        return 0
+    fi
+    
+    # No hosts found
+    log_error "No hosts specified in configuration. Use one of: hosts, host_pattern, host_labels, or host_file"
+    exit 1
+}
+
 # Function to read YAML configuration
 read_config() {
     local config_file="$1"
@@ -68,8 +147,10 @@ read_config() {
     fi
     
     # Read configuration values from YAML file
-    VM_HOSTS=$(yq eval '.vm.hosts' "$config_file")
     NAMESPACE=$(yq eval '.vm.namespace' "$config_file")
+    
+    # Smart host selection with multiple methods
+    VM_HOSTS=$(get_vm_hosts "$config_file")
     TEST_DEVICE=$(yq eval '.storage.device' "$config_file")
     MOUNT_POINT=$(yq eval '.storage.mount_point' "$config_file")
     FILESYSTEM=$(yq eval '.storage.filesystem' "$config_file")
@@ -149,6 +230,7 @@ OPTIONS:
     -h                  Show this help message
     -c <config_file>    Path to YAML configuration file (default: fio-config.yaml)
     -v                  Verbose output
+    --debug             Show detailed configuration parsing debug information
     --dry-run           Validate configuration and show what would be done without executing
 
 EXAMPLES:
@@ -205,6 +287,53 @@ display_config() {
     log_info "Output directory: $OUTPUT_DIR"
 }
 
+# Debug configuration parsing
+debug_config_parsing() {
+    log_info "=== CONFIGURATION PARSING DEBUG ==="
+    
+    # Show host selection method
+    log_info "Host Selection Analysis:"
+    local host_pattern=$(yq eval '.vm.host_pattern' "$CONFIG_FILE")
+    local host_labels=$(yq eval '.vm.host_labels' "$CONFIG_FILE")
+    local host_file=$(yq eval '.vm.host_file' "$CONFIG_FILE")
+    local hosts=$(yq eval '.vm.hosts' "$CONFIG_FILE")
+    
+    log_info "  host_pattern: '$host_pattern'"
+    log_info "  host_labels: '$host_labels'"
+    log_info "  host_file: '$host_file'"
+    log_info "  hosts: '$hosts'"
+    log_info "  Final VM_HOSTS: '$VM_HOSTS' ($(echo $VM_HOSTS | wc -w) hosts)"
+    
+    # Show raw FIO config values
+    log_info "Raw YAML values:"
+    if command -v yq &> /dev/null && [[ -f "$CONFIG_FILE" ]]; then
+        yq eval '.fio.block_sizes' "$CONFIG_FILE" | while read line; do
+            log_info "  block_sizes: '$line'"
+        done
+        yq eval '.fio.io_patterns' "$CONFIG_FILE" | while read line; do
+            log_info "  io_patterns: '$line'"
+        done
+    fi
+    
+    # Show how arrays are parsed
+    local test_bs_array=($BLOCK_SIZES)
+    local test_pattern_array=($IO_PATTERNS)
+    
+    log_info "Array parsing results:"
+    log_info "  Block sizes array has ${#test_bs_array[@]} elements:"
+    for i in "${!test_bs_array[@]}"; do
+        log_info "    [$i] = '${test_bs_array[$i]}'"
+    done
+    
+    log_info "  IO patterns array has ${#test_pattern_array[@]} elements:"
+    for i in "${!test_pattern_array[@]}"; do
+        log_info "    [$i] = '${test_pattern_array[$i]}'"
+    done
+    
+    log_info "Expected test matrix: ${#test_bs_array[@]} block sizes × ${#test_pattern_array[@]} patterns = $((${#test_bs_array[@]} * ${#test_pattern_array[@]})) total tests"
+    log_info "=== END DEBUG ==="
+}
+
 # Execute SSH command with error handling
 execute_ssh() {
     local host="$1"
@@ -238,13 +367,23 @@ execute_ssh_background() {
     
     log_info "Starting background task on $host: $description"
     
+    if [[ "$VERBOSE" == "true" ]]; then
+        log_info "Background command on $host: $command"
+    fi
+    
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "DRY-RUN: Would execute in background on $host: $command"
         return 0
     fi
     
-    virtctl -n "$NAMESPACE" ssh -t "-o StrictHostKeyChecking=no" \
-            "root@vmi/$host" -c "$command" &
+    # Use a subshell to prevent SSH failures from killing the main script
+    (
+        if ! virtctl -n "$NAMESPACE" ssh -t "-o StrictHostKeyChecking=no" \
+                "root@vmi/$host" -c "$command" 2>&1; then
+            log_error "Background SSH command failed on $host: $description"
+            exit 1
+        fi
+    ) &
 }
 
 # Install FIO and dependencies on VMs
@@ -301,13 +440,14 @@ prepare_storage() {
 }
 
 # Write test dataset
+# NOTE: Using --name=testfile ensures all subsequent tests operate on the same file
 write_test_data() {
     log_info "Writing initial test dataset..."
     
     for host in $VM_HOSTS; do
         execute_ssh_background "$host" \
             "cd $OUTPUT_DIR && fio \
-                --name=write_dataset \
+                --name=testfile \
                 --directory=$MOUNT_POINT \
                 --size=$TEST_SIZE \
                 --rw=randwrite \
@@ -325,24 +465,39 @@ write_test_data() {
 }
 
 # Run FIO performance tests
+# NOTE: Using --name=testfile (same as write phase) ensures tests operate on the same data
 run_fio_tests() {
     log_info "Running FIO performance tests..."
     
     local test_counter=1
     
-    # Convert space-separated strings to arrays
+    # Convert space-separated strings to arrays with debugging
+    log_info "Block sizes from config: '$BLOCK_SIZES'"
+    log_info "IO patterns from config: '$IO_PATTERNS'"
+    
     local bs_array=($BLOCK_SIZES)
     local pattern_array=($IO_PATTERNS)
     
+    log_info "Parsed block sizes: ${#bs_array[@]} items: ${bs_array[*]}"
+    log_info "Parsed IO patterns: ${#pattern_array[@]} items: ${pattern_array[*]}"
+    
     for bs in "${bs_array[@]}"; do
+        log_info "Starting block size iteration: $bs"
+        
         for pattern in "${pattern_array[@]}"; do
             log_info "Running test $test_counter: $pattern with block size $bs"
             
+            # Track background jobs for this test iteration
+            local bg_pids=()
+            
             for host in $VM_HOSTS; do
                 local test_name="fio-test-${pattern}-bs-${bs}"
+                log_info "Starting FIO test on $host: $test_name"
+                
+                # Run in background and capture PID
                 execute_ssh_background "$host" \
                     "cd $OUTPUT_DIR && fio \
-                        --name=$test_name \
+                        --name=testfile \
                         --directory=$MOUNT_POINT \
                         --size=$TEST_SIZE \
                         --rw=$pattern \
@@ -355,12 +510,41 @@ run_fio_tests() {
                         --output-format=$OUTPUT_FORMAT \
                         --output=${test_name}.json" \
                     "FIO test: $pattern, block size: $bs"
+                
+                # Store the PID of the last background job
+                if [[ "$DRY_RUN" == "false" ]]; then
+                    bg_pids+=($!)
+                fi
             done
-            wait
+            
+            # Wait for all background jobs and check their status
+            log_info "Waiting for all FIO tests to complete for $pattern with block size $bs..."
+            if [[ "$DRY_RUN" == "false" ]]; then
+                local failed_jobs=0
+                for pid in "${bg_pids[@]}"; do
+                    if wait "$pid"; then
+                        log_info "Background job $pid completed successfully"
+                    else
+                        log_error "Background job $pid failed"
+                        ((failed_jobs++))
+                    fi
+                done
+                
+                if [[ $failed_jobs -gt 0 ]]; then
+                    log_warn "$failed_jobs background jobs failed for test: $pattern with block size $bs"
+                else
+                    log_info "All background jobs completed successfully for test: $pattern with block size $bs"
+                fi
+            fi
             
             ((test_counter++))
+            log_info "Completed test $((test_counter-1)): $pattern with block size $bs"
         done
+        
+        log_info "Completed all patterns for block size: $bs"
     done
+    
+    log_info "Completed all FIO performance tests"
 }
 
 # Collect test results
@@ -445,15 +629,58 @@ collect_results() {
 cleanup_storage() {
     log_info "Cleaning up storage on VMs..."
     
+    # Use parallel execution for faster cleanup
+    local bg_pids=()
     for host in $VM_HOSTS; do
-        execute_ssh "$host" \
-            "if mountpoint -q $MOUNT_POINT; then
+        execute_ssh_background "$host" \
+            "# Unmount the test device if it's mounted
+             if mountpoint -q $MOUNT_POINT 2>/dev/null; then
                  echo 'Unmounting $MOUNT_POINT'
-                 umount $MOUNT_POINT
+                 umount $MOUNT_POINT && echo 'Successfully unmounted $MOUNT_POINT'
+             else
+                 echo 'Mount point $MOUNT_POINT is not mounted or does not exist'
              fi
-             rm -rf $OUTPUT_DIR/*.json" \
+             
+             
+             # Optional: Clean up test data directory if it's empty
+             if [[ -d $MOUNT_POINT ]] && [[ -z \"\$(ls -A $MOUNT_POINT 2>/dev/null)\" ]]; then
+                 echo 'Removing empty test directory $MOUNT_POINT'
+                 rmdir $MOUNT_POINT 2>/dev/null || true
+             fi
+             
+             # Clean up any remaining FIO processes (safety measure)
+             pkill -f 'fio.*testfile' 2>/dev/null || true
+             
+             # Additional safety: check for any processes using the mount point
+             if mountpoint -q $MOUNT_POINT 2>/dev/null; then
+                 echo 'WARNING: Mount point $MOUNT_POINT is still mounted after cleanup attempt'
+                 lsof $MOUNT_POINT 2>/dev/null | head -5 || true
+             fi" \
             "Cleaning up test environment"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            bg_pids+=($!)
+        fi
     done
+    
+    # Wait for all cleanup operations to complete
+    if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
+        log_info "Waiting for storage cleanup to complete on all VMs..."
+        local failed_jobs=0
+        for pid in "${bg_pids[@]}"; do
+            if wait "$pid" 2>/dev/null; then
+                log_info "Storage cleanup completed successfully"
+            else
+                log_warn "Storage cleanup may have encountered issues"
+                ((failed_jobs++))
+            fi
+        done
+        
+        if [[ $failed_jobs -gt 0 ]]; then
+            log_warn "$failed_jobs cleanup jobs may have failed"
+        else
+            log_info "All storage cleanup operations completed successfully"
+        fi
+    fi
 }
 
 # Main function
@@ -463,6 +690,12 @@ main() {
     check_dependencies
     read_config "$CONFIG_FILE"
     display_config
+    
+    # Show debug information if requested
+    if [[ "$DEBUG_CONFIG" == "true" ]]; then
+        debug_config_parsing
+    fi
+    
     validate_inputs
     
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -473,7 +706,7 @@ main() {
         log_info "  3. Write initial test dataset"
         log_info "  4. Run FIO performance tests with different patterns and block sizes"
         log_info "  5. Collect test results"
-        log_info "  6. Clean up test environment"
+        log_info "  6. Clean up test environment (unmount devices and cleanup storage)"
         log_info ""
         log_info "WARNING: Step 2 will format the specified storage device!"
         log_info "Use without --dry-run to execute the actual tests"
@@ -545,6 +778,7 @@ EOF
 }
 
 # Parse command line arguments
+DEBUG_CONFIG=false
 while [ $# -gt 0 ]; do
     case $1 in
         -h|--help)
@@ -558,6 +792,11 @@ while [ $# -gt 0 ]; do
         -v|--verbose)
             VERBOSE=true
             set -x
+            shift
+            ;;
+        --debug)
+            DEBUG_CONFIG=true
+            VERBOSE=true  # Enable verbose when debug is on
             shift
             ;;
         --dry-run)
