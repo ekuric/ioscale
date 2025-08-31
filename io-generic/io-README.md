@@ -1,6 +1,7 @@
 # Generic I/O Tests
 
-This directory contains FIO (Flexible I/O Tester) performance testing scripts for virtual machines.
+This directory contains FIO (Flexible I/O Tester) performance testing scripts for linux virtual machines. Tested with virtual machines
+however it will work with any linux machine if below pre-requesties are satisfied.  
 
 
 ### Step 1: Create Test VMs
@@ -8,8 +9,12 @@ This directory contains FIO (Flexible I/O Tester) performance testing scripts fo
 # Use the provided template
 oc apply -f templates/geniotest.yml
 ```
+For virtual machine image we use current Fedora ( at time of this writing it is Fedora 42 ). Generally any RHEL based distribution will work. `dnf` is used as packet manager, so Debian based images will not work out of box. 
 
 ### Step 2: Configure Tests
+
+`fio-config.yaml` contain all necessary for test, you will need to adapt it for your specific test case! 
+
 ```bash
 # Edit the FIO configuration
 vim io-generic/fio-config.yaml
@@ -68,7 +73,9 @@ ls -la ./fio-results-*/
 
 ## Smart Host Management 🚀
 
-For large-scale testing (10s, 100s, or 1000s of VMs), manually listing hosts is impractical. 
+For large-scale testing (10s, 100s, or 1000s of VMs), manually listing hosts is impractical. Below examples show how to 
+manage many test hosts easily. 
+
 
 ### 1. Host Range Patterns
 ```yaml
@@ -205,9 +212,13 @@ Using generic [secret](https://github.com/ekuric/fusion-access/blob/main/templat
 
 ## Results Format
 
-Tests generate JSON output files with detailed performance metrics:
+FIO results is generated in `.json` format and contain full test results output with detailed performance metrics:
+
 - IOPS (Input/Output Operations Per Second)
 - Bandwidth (MB/s)
 - Latency percentiles
 - CPU usage
 - And more...
+
+From these files test results can be extracted. We will create scripts / tools to automate this. 
+

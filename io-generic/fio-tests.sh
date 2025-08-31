@@ -389,27 +389,77 @@ execute_ssh_background() {
 # Install FIO and dependencies on VMs
 install_dependencies() {
     log_info "Installing FIO and dependencies on VMs..."
-    
+    #  better to use image with fio and xfsprogs installed  
+    local bg_pids=()
     for host in $VM_HOSTS; do
         execute_ssh_background "$host" \
             "dnf update -y && dnf install -y fio xfsprogs util-linux" \
             "Installing FIO and filesystem tools"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            bg_pids+=($!)
+        fi
     done
-    wait
+    
+    # Wait for all installations to complete
+    if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
+        log_info "Waiting for dependency installation to complete on all VMs..."
+        local failed_jobs=0
+        for pid in "${bg_pids[@]}"; do
+            if wait "$pid" 2>/dev/null; then
+                log_info "Dependency installation completed successfully"
+            else
+                log_error "Dependency installation failed"
+                ((failed_jobs++))
+            fi
+        done
+        
+        if [[ $failed_jobs -gt 0 ]]; then
+            log_error "$failed_jobs dependency installation jobs failed"
+            exit 1
+        fi
+    fi
 }
 
 # Prepare storage on VMs
 prepare_storage() {
-    log_info "Preparing storage on VMs..."
+    log_info "Preparing storage on VMs with parallel execution..."
     
+    # Step 1: Create test directories on all hosts in parallel
+    log_info "Step 1/5: Creating test directories on all hosts..."
+    local bg_pids=()
     for host in $VM_HOSTS; do
-        # Create test directories
-        execute_ssh "$host" \
+        execute_ssh_background "$host" \
             "mkdir -p $OUTPUT_DIR $MOUNT_POINT" \
             "Creating test directories"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            bg_pids+=($!)
+        fi
+    done
+    
+    # Wait for directory creation to complete
+    if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
+        log_info "Waiting for directory creation to complete..."
+        local failed_jobs=0
+        for pid in "${bg_pids[@]}"; do
+            if wait "$pid" 2>/dev/null; then
+                log_info "Directory creation completed successfully"
+            else
+                log_error "Directory creation failed"
+                ((failed_jobs++))
+            fi
+        done
         
-        # Safety check: verify device exists and get confirmation
-        execute_ssh "$host" \
+        if [[ $failed_jobs -gt 0 ]]; then
+            log_error "$failed_jobs directory creation jobs failed"
+            exit 1
+        fi
+    fi
+    
+    # Step 2: Validate test devices on all hosts in parallel
+    log_info "Step 2/5: Validating test devices on all hosts..."
+    bg_pids=()
+    for host in $VM_HOSTS; do
+        execute_ssh_background "$host" \
             "if [[ ! -b /dev/$TEST_DEVICE ]]; then
                  echo 'ERROR: Block device /dev/$TEST_DEVICE not found'
                  exit 1
@@ -417,26 +467,129 @@ prepare_storage() {
              echo 'Found block device /dev/$TEST_DEVICE'
              lsblk /dev/$TEST_DEVICE" \
             "Validating test device"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            bg_pids+=($!)
+        fi
+    done
+    
+    # Wait for device validation to complete
+    if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
+        log_info "Waiting for device validation to complete..."
+        local failed_jobs=0
+        for pid in "${bg_pids[@]}"; do
+            if wait "$pid" 2>/dev/null; then
+                log_info "Device validation completed successfully"
+            else
+                log_error "Device validation failed"
+                ((failed_jobs++))
+            fi
+        done
         
-        # Unmount if already mounted
-        execute_ssh "$host" \
+        if [[ $failed_jobs -gt 0 ]]; then
+            log_error "$failed_jobs device validation jobs failed"
+            exit 1
+        fi
+    fi
+    
+    # Step 3: Unmount existing mounts on all hosts in parallel
+    log_info "Step 3/5: Unmounting existing mounts on all hosts..."
+    bg_pids=()
+    for host in $VM_HOSTS; do
+        execute_ssh_background "$host" \
             "if mountpoint -q $MOUNT_POINT; then
                  echo 'Unmounting $MOUNT_POINT'
                  umount $MOUNT_POINT || true
+             else
+                 echo 'Mount point $MOUNT_POINT is not mounted'
              fi" \
             "Unmounting existing mount"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            bg_pids+=($!)
+        fi
+    done
+    
+    # Wait for unmounting to complete
+    if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
+        log_info "Waiting for unmounting to complete..."
+        local failed_jobs=0
+        for pid in "${bg_pids[@]}"; do
+            if wait "$pid" 2>/dev/null; then
+                log_info "Unmounting completed successfully"
+            else
+                log_warn "Unmounting may have encountered issues"
+                ((failed_jobs++))
+            fi
+        done
         
-        # Format device (WARNING: destructive operation)
-        execute_ssh "$host" \
+        if [[ $failed_jobs -gt 0 ]]; then
+            log_warn "$failed_jobs unmount jobs may have failed"
+        fi
+    fi
+    
+    # Step 4: Format devices on all hosts in parallel
+    log_info "Step 4/5: Formatting devices on all hosts (WARNING: destructive operation)..."
+    bg_pids=()
+    for host in $VM_HOSTS; do
+        execute_ssh_background "$host" \
             "echo 'WARNING: Formatting /dev/$TEST_DEVICE with $FILESYSTEM'
              mkfs.$FILESYSTEM -f /dev/$TEST_DEVICE" \
             "Formatting test device"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            bg_pids+=($!)
+        fi
+    done
+    
+    # Wait for formatting to complete
+    if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
+        log_info "Waiting for device formatting to complete..."
+        local failed_jobs=0
+        for pid in "${bg_pids[@]}"; do
+            if wait "$pid" 2>/dev/null; then
+                log_info "Device formatting completed successfully"
+            else
+                log_error "Device formatting failed"
+                ((failed_jobs++))
+            fi
+        done
         
-        # Mount device
-        execute_ssh "$host" \
+        if [[ $failed_jobs -gt 0 ]]; then
+            log_error "$failed_jobs device formatting jobs failed"
+            exit 1
+        fi
+    fi
+    
+    # Step 5: Mount devices on all hosts in parallel
+    log_info "Step 5/5: Mounting devices on all hosts..."
+    bg_pids=()
+    for host in $VM_HOSTS; do
+        execute_ssh_background "$host" \
             "mount /dev/$TEST_DEVICE $MOUNT_POINT" \
             "Mounting test device"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            bg_pids+=($!)
+        fi
     done
+    
+    # Wait for mounting to complete
+    if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
+        log_info "Waiting for device mounting to complete..."
+        local failed_jobs=0
+        for pid in "${bg_pids[@]}"; do
+            if wait "$pid" 2>/dev/null; then
+                log_info "Device mounting completed successfully"
+            else
+                log_error "Device mounting failed"
+                ((failed_jobs++))
+            fi
+        done
+        
+        if [[ $failed_jobs -gt 0 ]]; then
+            log_error "$failed_jobs device mounting jobs failed"
+            exit 1
+        fi
+    fi
+    
+    log_info "Storage preparation completed on all hosts!"
 }
 
 # Write test dataset
@@ -444,6 +597,7 @@ prepare_storage() {
 write_test_data() {
     log_info "Writing initial test dataset..."
     
+    local bg_pids=()
     for host in $VM_HOSTS; do
         execute_ssh_background "$host" \
             "cd $OUTPUT_DIR && fio \
@@ -460,8 +614,29 @@ write_test_data() {
                 --output-format=$OUTPUT_FORMAT \
                 --output=write_dataset.json" \
             "Writing test dataset"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            bg_pids+=($!)
+        fi
     done
-    wait
+    
+    # Wait for all test dataset writing to complete
+    if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
+        log_info "Waiting for test dataset writing to complete on all VMs..."
+        local failed_jobs=0
+        for pid in "${bg_pids[@]}"; do
+            if wait "$pid" 2>/dev/null; then
+                log_info "Test dataset writing completed successfully"
+            else
+                log_error "Test dataset writing failed"
+                ((failed_jobs++))
+            fi
+        done
+        
+        if [[ $failed_jobs -gt 0 ]]; then
+            log_error "$failed_jobs test dataset writing jobs failed"
+            exit 1
+        fi
+    fi
 }
 
 # Run FIO performance tests
@@ -702,7 +877,7 @@ main() {
         log_info "DRY RUN MODE: Configuration validated successfully"
         log_info "Would execute the following steps:"
         log_info "  1. Install FIO and dependencies on VMs"
-        log_info "  2. Prepare storage (format and mount devices)"
+        log_info "  2. Prepare storage (format and mount devices) - 5 parallel steps"
         log_info "  3. Write initial test dataset"
         log_info "  4. Run FIO performance tests with different patterns and block sizes"
         log_info "  5. Collect test results"
