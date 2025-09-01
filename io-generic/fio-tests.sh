@@ -800,61 +800,178 @@ collect_results() {
     fi
 }
 
-# Cleanup test environment
-cleanup_storage() {
-    log_info "Cleaning up storage on VMs..."
+# Validate SSH connectivity to all hosts
+validate_ssh_connectivity() {
+    local hosts="$1"
+    local timeout_seconds="${2:-10}"
+    local failed_hosts=()
     
-    # Use parallel execution for faster cleanup
-    local bg_pids=()
-    for host in $VM_HOSTS; do
-        execute_ssh_background "$host" \
-            "# Unmount the test device if it's mounted
-             if mountpoint -q $MOUNT_POINT 2>/dev/null; then
-                 echo 'Unmounting $MOUNT_POINT'
-                 umount $MOUNT_POINT && echo 'Successfully unmounted $MOUNT_POINT'
-             else
-                 echo 'Mount point $MOUNT_POINT is not mounted or does not exist'
-             fi
-             
-             
-             # Optional: Clean up test data directory if it's empty
-             if [[ -d $MOUNT_POINT ]] && [[ -z \"\$(ls -A $MOUNT_POINT 2>/dev/null)\" ]]; then
-                 echo 'Removing empty test directory $MOUNT_POINT'
-                 rmdir $MOUNT_POINT 2>/dev/null || true
-             fi
-             
-             # Clean up any remaining FIO processes (safety measure)
-             pkill -f 'fio.*testfile' 2>/dev/null || true
-             
-             # Additional safety: check for any processes using the mount point
-             if mountpoint -q $MOUNT_POINT 2>/dev/null; then
-                 echo 'WARNING: Mount point $MOUNT_POINT is still mounted after cleanup attempt'
-                 lsof $MOUNT_POINT 2>/dev/null | head -5 || true
-             fi" \
-            "Cleaning up test environment"
-        if [[ "$DRY_RUN" == "false" ]]; then
-            bg_pids+=($!)
+    log_info "Validating SSH connectivity to all hosts (timeout: ${timeout_seconds}s)..."
+    
+    for host in $hosts; do
+        if timeout $timeout_seconds virtctl -n "$NAMESPACE" ssh -t "-o ConnectTimeout=5 -o StrictHostKeyChecking=no" \
+                "root@vmi/$host" -c "echo 'SSH connectivity test successful'" 2>/dev/null; then
+            log_info "SSH connectivity to $host: OK"
+        else
+            log_warn "SSH connectivity to $host: FAILED"
+            failed_hosts+=("$host")
         fi
     done
     
-    # Wait for all cleanup operations to complete
-    if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
-        log_info "Waiting for storage cleanup to complete on all VMs..."
-        local failed_jobs=0
-        for pid in "${bg_pids[@]}"; do
-            if wait "$pid" 2>/dev/null; then
-                log_info "Storage cleanup completed successfully"
+    if [[ ${#failed_hosts[@]} -gt 0 ]]; then
+        log_warn "SSH connectivity issues detected on ${#failed_hosts[@]} hosts: ${failed_hosts[*]}"
+        return 1
+    else
+        log_info "SSH connectivity validation successful for all hosts"
+        return 0
+    fi
+}
+
+# Retry wrapper function for SSH operations
+retry_ssh_operation() {
+    local max_retries="${1:-3}"
+    local retry_delay="${2:-10}"
+    local operation_name="${3:-SSH operation}"
+    local operation_func="$4"
+    
+    local attempt=1
+    local success=false
+    
+    while [[ $attempt -le $max_retries ]] && [[ "$success" == "false" ]]; do
+        log_info "$operation_name attempt $attempt/$max_retries"
+        
+        if $operation_func; then
+            log_info "$operation_name completed successfully on attempt $attempt"
+            success=true
+        else
+            local exit_code=$?
+            log_warn "$operation_name attempt $attempt failed with exit code $exit_code"
+            
+            if [[ $attempt -lt $max_retries ]]; then
+                log_info "Waiting $retry_delay seconds before retry..."
+                sleep $retry_delay
+                ((attempt++))
             else
-                log_warn "Storage cleanup may have encountered issues"
-                ((failed_jobs++))
+                log_error "$operation_name failed after $max_retries attempts"
+                return $exit_code
+            fi
+        fi
+    done
+    
+    return 0
+}
+
+# Cleanup test environment with retry logic and resilience
+cleanup_storage() {
+    log_info "Cleaning up storage on VMs with retry logic..."
+    
+    local max_retries=3
+    local retry_delay=10
+    local attempt=1
+    local cleanup_success=false
+    
+    # Pre-cleanup connectivity validation
+    if ! validate_ssh_connectivity "$VM_HOSTS" 15; then
+        log_warn "SSH connectivity issues detected - cleanup may fail"
+        log_info "Proceeding with cleanup anyway (will retry on failures)"
+    fi
+    
+    while [[ $attempt -le $max_retries ]] && [[ "$cleanup_success" == "false" ]]; do
+        log_info "Cleanup attempt $attempt/$max_retries"
+        
+        # Use parallel execution for faster cleanup
+        local bg_pids=()
+        local failed_hosts=()
+        
+        for host in $VM_HOSTS; do
+            execute_ssh_background "$host" \
+                "# Unmount the test device if it's mounted
+                 # Add timeout to prevent hanging operations
+                 timeout 30 bash -c '
+                 if mountpoint -q $MOUNT_POINT 2>/dev/null; then
+                     echo \"Unmounting $MOUNT_POINT\"
+                     umount $MOUNT_POINT && echo \"Successfully unmounted $MOUNT_POINT\"
+                 else
+                     echo \"Mount point $MOUNT_POINT is not mounted or does not exist\"
+                 fi
+                 
+                 # Optional: Clean up test data directory if it is empty
+                 if [[ -d $MOUNT_POINT ]] && [[ -z \"\$(ls -A $MOUNT_POINT 2>/dev/null)\" ]]; then
+                     echo \"Removing empty test directory $MOUNT_POINT\"
+                     rmdir $MOUNT_POINT 2>/dev/null || true
+                 fi
+                 
+                 # Clean up any remaining FIO processes (safety measure)
+                 pkill -f \"fio.*testfile\" 2>/dev/null || true
+                 
+                 # Additional safety: check for any processes using the mount point
+                 if mountpoint -q $MOUNT_POINT 2>/dev/null; then
+                     echo \"WARNING: Mount point $MOUNT_POINT is still mounted after cleanup attempt\"
+                     lsof $MOUNT_POINT 2>/dev/null | head -5 || true
+                 fi
+                 ' || echo \"Cleanup operation timed out on $host\"" \
+                "Cleaning up test environment (attempt $attempt)"
+            if [[ "$DRY_RUN" == "false" ]]; then
+                bg_pids+=($!)
             fi
         done
         
-        if [[ $failed_jobs -gt 0 ]]; then
-            log_warn "$failed_jobs cleanup jobs may have failed"
+        # Wait for all cleanup operations to complete
+        if [[ "$DRY_RUN" == "false" ]] && [[ ${#bg_pids[@]} -gt 0 ]]; then
+            log_info "Waiting for storage cleanup to complete on all VMs (attempt $attempt)..."
+            local failed_jobs=0
+            local successful_hosts=0
+            local total_hosts=$(echo $VM_HOSTS | wc -w)
+            
+            for pid in "${bg_pids[@]}"; do
+                if wait "$pid" 2>/dev/null; then
+                    log_info "Storage cleanup completed successfully"
+                    ((successful_hosts++))
+                else
+                    log_warn "Storage cleanup may have encountered issues (exit code: $?)"
+                    ((failed_jobs++))
+                fi
+            done
+            
+            # Determine if cleanup was successful enough
+            local success_rate=$((successful_hosts * 100 / total_hosts))
+            log_info "Cleanup attempt $attempt: $successful_hosts/$total_hosts hosts successful ($success_rate%)"
+            
+            if [[ $failed_jobs -eq 0 ]]; then
+                log_info "All storage cleanup operations completed successfully on attempt $attempt"
+                cleanup_success=true
+            elif [[ $success_rate -ge 80 ]]; then
+                log_warn "Cleanup partially successful ($success_rate% success rate) - continuing"
+                cleanup_success=true
+            else
+                log_warn "Cleanup attempt $attempt failed: $failed_jobs/$total_hosts hosts failed"
+                
+                if [[ $attempt -lt $max_retries ]]; then
+                    log_info "Waiting $retry_delay seconds before retry..."
+                    sleep $retry_delay
+                    ((attempt++))
+                else
+                    log_error "All cleanup attempts failed. Manual cleanup may be required."
+                    log_error "Failed hosts may need manual unmounting of $MOUNT_POINT"
+                fi
+            fi
         else
-            log_info "All storage cleanup operations completed successfully"
+            # Dry run mode
+            cleanup_success=true
         fi
+    done
+    
+    # Final status report
+    if [[ "$cleanup_success" == "true" ]]; then
+        log_info "Storage cleanup completed (attempts: $attempt)"
+    else
+        log_error "Storage cleanup failed after $max_retries attempts"
+        log_error "Manual cleanup may be required for some hosts"
+        log_error "Check mount points and FIO processes on failed VMs"
+        
+        # Don't exit with error code for cleanup failures - this is not critical
+        # The script should continue even if cleanup fails
+        return 0
     fi
 }
 
