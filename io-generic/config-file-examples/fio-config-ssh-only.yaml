@@ -1,0 +1,72 @@
+# FIO Test Configuration - SSH Only Mode
+# This configuration is designed for --ssh-only mode where all hosts are regular servers
+# that can be accessed directly via SSH without virtctl/oc
+
+# VM/Host Configuration
+vm:
+  # Method 1: Simple host list (recommended for SSH-only mode)
+  hosts: "server1 server2 server3 server4 server5"
+  
+  # Alternative Method 2: Host pattern expansion
+  # host_pattern: "server{1..5}"
+  
+  # Alternative Method 3: External host file
+  # host_file: "hosts.txt"
+  
+  # Alternative Method 4: Label-based selection (not applicable for SSH-only)
+  # host_labels: "environment=test,type=server"
+  
+  # Namespace (not needed for SSH-only mode - bare metal servers)
+  # namespace: "default"  # Commented out - not applicable for bare metal
+
+# Storage Configuration
+storage:
+  # Per-host device configuration (MANDATORY - no global fallback for safety)
+  devices:
+    server1: "sdb"
+    server2: "sdb"
+    server3: "sdb"
+    server4: "sdb"
+    server5: "sdb"
+  
+  # Mount point for the test filesystem
+  mount_point: "/root/tests/data"
+  
+  # Filesystem type to create
+  filesystem: "xfs"
+
+# FIO Test Configuration
+fio:
+  # Test file size (e.g., "1G", "500M", "10G")
+  test_size: "1G"
+  
+  # Test runtime in seconds
+  runtime: "60"
+  
+  # Block sizes to test (space-separated)
+  block_sizes: "4k 8k 128k 1024k"
+  
+  # I/O patterns to test (space-separated)
+  io_patterns: "read write randread randwrite"
+  
+  # Number of parallel jobs
+  numjobs: "4"
+  
+  # I/O depth
+  iodepth: "16"
+  
+  # Direct I/O (bypass page cache)
+  direct_io: "1"
+
+# Output Configuration
+output:
+  # Directory to store results on remote hosts
+  directory: "/root/fio-results"
+  
+  # Output format (json+, normal, etc.)
+  format: "json+"
+
+# Usage Examples:
+# ./fio-tests.sh --ssh-only -c fio-config-ssh-only.yaml
+# ./fio-tests.sh --ssh-only -c fio-config-ssh-only.yaml --dry-run
+# ./fio-tests.sh --ssh-only -c fio-config-ssh-only.yaml -v

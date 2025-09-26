@@ -1,0 +1,27 @@
+# Mixed Hosts Configuration File
+# This file contains both OpenShift VMs and bare metal servers for auto-detection testing
+# Lines starting with # are comments and will be ignored
+# The script will automatically detect which hosts are VMs (use virtctl) vs bare metal (use SSH)
+# 
+# NEW FEATURE: You can now use host patterns in this file!
+# Patterns like vm-{1..5} will be automatically expanded to vm-1, vm-2, vm-3, vm-4, vm-5
+
+# OpenShift Virtual Machines (will be accessed via virtctl ssh)
+# Use patterns for efficient configuration of multiple VMs
+vm-{1..5}
+worker-{1..3}
+app-server-{1..2}
+
+# Bare Metal Servers (will be accessed via direct SSH)
+# You can use patterns for bare metal servers too, or list them individually
+fed{1..3}
+baremetal-server-{1..2}
+storage-node-{1..2}
+
+# Individual hosts (for special cases)
+
+# Example patterns you can use:
+# vm-{1..10}        # vm-1, vm-2, ..., vm-10
+# server-{001..050} # server-001, server-002, ..., server-050 (zero-padded)
+# worker-{1..5}     # worker-1, worker-2, worker-3, worker-4, worker-5
+# test-{a..c}       # test-a, test-b, test-c (letter ranges)

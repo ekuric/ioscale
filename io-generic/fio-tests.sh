@@ -10,6 +10,7 @@ set -euo pipefail  # Exit on error, undefined vars, pipe failures
 CONFIG_FILE="fio-config.yaml"
 DRY_RUN=false
 VERBOSE=false
+USE_VIRTCTL=""  # Default to auto-detection, can be forced with --ssh-only or --virtctl-only
 
 # Function to check if required tools are installed
 check_dependencies() {
@@ -19,20 +20,43 @@ check_dependencies() {
         missing_tools+=("yq")
     fi
     
-    if [[ "$DRY_RUN" == "false" ]] && ! command -v virtctl &> /dev/null; then
-        missing_tools+=("virtctl")
-    fi
-    
-    if [[ "$DRY_RUN" == "false" ]] && ! command -v oc &> /dev/null; then
-        missing_tools+=("oc")
+    # Check dependencies based on mode
+    if [[ "$DRY_RUN" == "false" ]]; then
+        if [[ "$USE_VIRTCTL" == "true" ]]; then
+            # Force virtctl mode - need virtctl and oc
+            if ! command -v virtctl &> /dev/null; then
+                missing_tools+=("virtctl")
+            fi
+            if ! command -v oc &> /dev/null; then
+                missing_tools+=("oc")
+            fi
+        elif [[ "$USE_VIRTCTL" == "false" ]]; then
+            # Force SSH mode - need ssh
+            if ! command -v ssh &> /dev/null; then
+                missing_tools+=("ssh")
+            fi
+        else
+            # Auto-detection mode - need both virtctl/oc and ssh
+            if ! command -v virtctl &> /dev/null; then
+                missing_tools+=("virtctl")
+            fi
+            if ! command -v oc &> /dev/null; then
+                missing_tools+=("oc")
+            fi
+            if ! command -v ssh &> /dev/null; then
+                missing_tools+=("ssh")
+            fi
+        fi
     fi
     
     # Check if virtctl supports scp command (for result collection)
     if [[ "$DRY_RUN" == "false" ]] && command -v virtctl &> /dev/null; then
-        if ! virtctl help | grep -q "scp"; then
-            echo "Warning: virtctl does not support 'scp' command"
-            echo "Results will be archived on VMs but not automatically copied to localhost"
-            echo "You may need to upgrade virtctl or manually copy results"
+        if [[ "$USE_VIRTCTL" == "true" ]] || [[ "$USE_VIRTCTL" != "false" ]]; then
+            if ! virtctl help | grep -q "scp"; then
+                echo "Warning: virtctl does not support 'scp' command"
+                echo "Results will be archived on VMs but not automatically copied to localhost"
+                echo "You may need to upgrade virtctl or manually copy results"
+            fi
         fi
     fi
     
@@ -50,11 +74,85 @@ check_dependencies() {
                 oc)
                     echo "  - oc: Install OpenShift CLI from https://openshift.com/download"
                     ;;
+                ssh)
+                    echo "  - ssh: Install with 'sudo dnf install openssh-clients' or 'sudo apt install openssh-client'"
+                    ;;
             esac
         done
         echo ""
         echo "Install the missing tools and try again."
         exit 1
+    fi
+}
+
+# Function to detect if a host is a virtual machine
+is_vm_host() {
+    local host="$1"
+    
+    # If USE_VIRTCTL is explicitly set to false, treat all hosts as regular hosts
+    if [[ "$USE_VIRTCTL" == "false" ]]; then
+        return 1  # Not a VM
+    fi
+    
+    # If USE_VIRTCTL is explicitly set to true, treat all hosts as VMs
+    if [[ "$USE_VIRTCTL" == "true" ]]; then
+        return 0  # Is a VM
+    fi
+    
+    # Auto-detection logic (when USE_VIRTCTL is not explicitly set)
+    # Check if the host exists as a VM in the namespace
+    if command -v oc &> /dev/null && [[ -n "$NAMESPACE" ]]; then
+        if oc get vm "$host" -n "$NAMESPACE" &>/dev/null; then
+            return 0  # Is a VM
+        fi
+    fi
+    
+    # Check if the host exists as a VMI in the namespace
+    if command -v oc &> /dev/null && [[ -n "$NAMESPACE" ]]; then
+        if oc get vmi "$host" -n "$NAMESPACE" &>/dev/null; then
+            return 0  # Is a VM
+        fi
+    fi
+    
+    # Default to regular host if not found as VM
+    return 1  # Not a VM
+}
+
+# Function to get SSH command based on host type
+get_ssh_command() {
+    local host="$1"
+    local command="$2"
+    
+    if is_vm_host "$host"; then
+        echo "virtctl -n \"$NAMESPACE\" ssh -t \"-o StrictHostKeyChecking=no\" \"root@vmi/$host\" -c \"$command\""
+    else
+        echo "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@$host \"$command\""
+    fi
+}
+
+# Function to get SCP command based on host type
+get_scp_command() {
+    local source="$1"
+    local destination="$2"
+    
+    # Extract hostname from source path (format: root@vmi/hostname:path or root@hostname:path)
+    local host
+    if [[ "$source" =~ root@vmi/([^:]+): ]]; then
+        host="${BASH_REMATCH[1]}"
+    elif [[ "$source" =~ root@([^:]+): ]]; then
+        host="${BASH_REMATCH[1]}"
+    else
+        log_error "Cannot extract hostname from source: $source"
+        return 1
+    fi
+    
+    if is_vm_host "$host"; then
+        echo "virtctl -n \"$NAMESPACE\" scp \"$source\" \"$destination\""
+    else
+        # For SSH mode, convert virtctl format to regular SSH format
+        # Convert "root@vmi/hostname:path" to "root@hostname:path"
+        local ssh_source="${source/root@vmi\//root@}"
+        echo "scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \"$ssh_source\" \"$destination\""
     fi
 }
 
@@ -84,6 +182,12 @@ get_vm_hosts() {
     # Method 2: Label-based selection from Kubernetes
     local host_labels=$(yq eval '.vm.host_labels' "$config_file")
     if [[ "$host_labels" != "null" && -n "$host_labels" ]]; then
+        # Check if SSH-only mode is enabled
+        if [[ "$USE_VIRTCTL" == "false" ]]; then
+            log_error "Label-based host selection is not supported in SSH-only mode. Use hosts, host_pattern, or host_file instead."
+            exit 1
+        fi
+        
         log_info "Using label selector: $host_labels"
         
         if [[ "$DRY_RUN" == "false" ]] && command -v oc &> /dev/null; then
@@ -110,7 +214,26 @@ get_vm_hosts() {
         
         if [[ -f "$host_file" ]]; then
             # Read hosts from file, skip comments and empty lines
-            hosts=$(grep -v '^#' "$host_file" | grep -v '^[[:space:]]*$' | tr '\n' ' ' | xargs)
+            local all_hosts=""
+            while IFS= read -r line; do
+                # Skip comments and empty lines
+                if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "${line// }" ]]; then
+                    continue
+                fi
+                
+                # Check if line contains a pattern (has braces)
+                if [[ "$line" == *"{"*"}"* ]]; then
+                    # Expand the pattern
+                    local expanded=$(eval echo "$line")
+                    all_hosts="$all_hosts $expanded"
+                else
+                    # Regular hostname
+                    all_hosts="$all_hosts $line"
+                fi
+            done < "$host_file"
+            
+            # Clean up the hosts list
+            hosts=$(echo "$all_hosts" | xargs)
             if [[ -n "$hosts" ]]; then
                 log_info "Loaded $(echo $hosts | wc -w) hosts from file: $host_file"
                 echo "$hosts"
@@ -137,6 +260,61 @@ get_vm_hosts() {
     exit 1
 }
 
+# Function to check if a host matches a pattern and get its device
+get_device_from_pattern() {
+    local host="$1"
+    local pattern="$2"
+    local config_file="$3"
+    
+    # Check if the pattern contains braces (indicating a host pattern)
+    if [[ "$pattern" == *"{"*"}"* ]]; then
+        # Expand the pattern and check if our host matches
+        local expanded_hosts=$(eval echo "$pattern")
+        for expanded_host in $expanded_hosts; do
+            if [[ "$expanded_host" == "$host" ]]; then
+                # Found a match, get the device for this pattern
+                local pattern_device=$(yq eval ".storage.devices.\"${pattern}\"" "$config_file")
+                if [[ "$pattern_device" != "null" && "$pattern_device" != "" && -n "$pattern_device" ]]; then
+                    echo "$pattern_device"
+                    return 0
+                fi
+            fi
+        done
+    fi
+    return 1
+}
+
+# Function to get storage device for a specific host
+get_device_for_host() {
+    local host="$1"
+    local config_file="$2"
+    
+    # Get per-host device configuration (MANDATORY - no fallback for safety)
+    # Quote the hostname to handle hostnames with dots or special characters
+    local per_host_device=$(yq eval ".storage.devices.\"${host}\"" "$config_file")
+    
+    # Check if device is properly configured (not null and not empty)
+    if [[ "$per_host_device" != "null" && "$per_host_device" != "" && -n "$per_host_device" ]]; then
+        echo "$per_host_device"
+        return 0
+    fi
+    
+    # If no exact match, try host patterns (e.g., vm-{1..5}: "vdc")
+    local devices_section=$(yq eval '.storage.devices' "$config_file")
+    if [[ "$devices_section" != "null" ]]; then
+        # Get all keys from devices section and check for patterns
+        local all_keys=$(yq eval '.storage.devices | keys | .[]' "$config_file")
+        for pattern in $all_keys; do
+            if get_device_from_pattern "$host" "$pattern" "$config_file"; then
+                return 0
+            fi
+        done
+    fi
+    
+    # No device found - this is an error for safety
+    return 1
+}
+
 # Function to read YAML configuration
 read_config() {
     local config_file="$1"
@@ -147,11 +325,17 @@ read_config() {
     fi
     
     # Read configuration values from YAML file
-    NAMESPACE=$(yq eval '.vm.namespace' "$config_file")
+    # Namespace is only relevant for virtctl/oc operations
+    if [[ "$USE_VIRTCTL" != "false" ]]; then
+        NAMESPACE=$(yq eval '.vm.namespace' "$config_file")
+    else
+        NAMESPACE="N/A"  # Not applicable for SSH-only mode
+    fi
     
     # Smart host selection with multiple methods
     VM_HOSTS=$(get_vm_hosts "$config_file")
-    TEST_DEVICE=$(yq eval '.storage.device' "$config_file")
+    
+    # Device configuration - per-host devices only (no global fallback for safety)
     MOUNT_POINT=$(yq eval '.storage.mount_point' "$config_file")
     FILESYSTEM=$(yq eval '.storage.filesystem' "$config_file")
     
@@ -251,30 +435,69 @@ EOF
 
 # Input validation
 validate_inputs() {
-    if [[ -z "$TEST_DEVICE" || "$TEST_DEVICE" == "null" ]]; then
-        log_error "storage.device must be specified in config"
-        exit 1
-    fi
+    # Validate device configuration for each host (MANDATORY for safety)
+    for host in $VM_HOSTS; do
+        if ! get_device_for_host "$host" "$CONFIG_FILE" >/dev/null; then
+            log_error "CRITICAL: No storage device specified for host '$host'"
+            log_error "Each host MUST have a device specified in storage.devices.$host"
+            log_error "This is mandatory for safety - no fallback devices allowed"
+            log_error "Example: storage.devices.$host: \"sdb\""
+            exit 1
+        fi
+    done
     
-    # Validate VMs exist (skip in dry-run mode)
-    if [[ "$DRY_RUN" == "false" ]]; then
+    # Validate VMs exist (skip in dry-run mode and SSH-only mode)
+    if [[ "$DRY_RUN" == "false" && "$USE_VIRTCTL" != "false" ]]; then
         for host in $VM_HOSTS; do
-            if ! oc get vm "$host" -n "$NAMESPACE" &> /dev/null; then
-                log_error "Virtual machine '$host' not found in namespace '$NAMESPACE'"
-                exit 1
+            # Only validate hosts that are detected as VMs
+            if is_vm_host "$host"; then
+                if ! oc get vm "$host" -n "$NAMESPACE" &> /dev/null; then
+                    log_error "Virtual machine '$host' not found in namespace '$NAMESPACE'"
+                    exit 1
+                fi
             fi
         done
-    else
+    elif [[ "$DRY_RUN" == "true" ]]; then
         log_info "Skipping VM validation in dry-run mode"
+    elif [[ "$USE_VIRTCTL" == "false" ]]; then
+        log_info "Skipping VM validation in SSH-only mode"
     fi
 }
 
 # Display configuration
+# Function to show connection method for each host
+show_host_connection_methods() {
+    if [[ "$USE_VIRTCTL" == "true" ]] || [[ "$USE_VIRTCTL" == "false" ]]; then
+        # Fixed mode - all hosts use the same method
+        return 0
+    fi
+    
+    # Auto-detection mode - show method for each host
+    log_info "Host connection methods (auto-detection):"
+    for host in $VM_HOSTS; do
+        if is_vm_host "$host"; then
+            log_info "  $host: virtctl (VM detected)"
+        else
+            log_info "  $host: SSH (regular host)"
+        fi
+    done
+}
+
 display_config() {
     log_info "Configuration loaded from: $CONFIG_FILE"
     log_info "VMs: $VM_HOSTS"
-    log_info "Namespace: $NAMESPACE"
-    log_info "Test device: $TEST_DEVICE"
+    if [[ "$USE_VIRTCTL" != "false" ]]; then
+        log_info "Namespace: $NAMESPACE"
+    else
+        log_info "Namespace: N/A (SSH-only mode)"
+    fi
+    show_host_connection_methods
+    # Display device configuration
+    log_info "Storage device configuration:"
+    for host in $VM_HOSTS; do
+        local host_device=$(get_device_for_host "$host" "$CONFIG_FILE")
+        log_info "  $host: /dev/$host_device"
+    done
     log_info "Mount point: $MOUNT_POINT"
     log_info "Filesystem: $FILESYSTEM"
     log_info "Test size: $TEST_SIZE"
@@ -352,8 +575,10 @@ execute_ssh() {
         return 0
     fi
     
-    if ! virtctl -n "$NAMESPACE" ssh -t "-o StrictHostKeyChecking=no" \
-         "root@vmi/$host" -c "$command"; then
+    local ssh_cmd
+    ssh_cmd=$(get_ssh_command "$host" "$command")
+    
+    if ! eval "$ssh_cmd"; then
         log_error "Failed to execute '$description' on $host"
         return 1
     fi
@@ -378,8 +603,10 @@ execute_ssh_background() {
     
     # Use a subshell to prevent SSH failures from killing the main script
     (
-        if ! virtctl -n "$NAMESPACE" ssh -t "-o StrictHostKeyChecking=no" \
-                "root@vmi/$host" -c "$command" 2>&1; then
+        local ssh_cmd
+        ssh_cmd=$(get_ssh_command "$host" "$command")
+        
+        if ! eval "$ssh_cmd" 2>&1; then
             log_error "Background SSH command failed on $host: $description"
             exit 1
         fi
@@ -425,13 +652,14 @@ prepare_storage() {
     log_info "Step 2/5: Validating test devices on all hosts..."
     bg_pids=()
     for host in $VM_HOSTS; do
+        local host_device=$(get_device_for_host "$host" "$CONFIG_FILE")
         execute_ssh_background "$host" \
-            "if [[ ! -b /dev/$TEST_DEVICE ]]; then
-                 echo 'ERROR: Block device /dev/$TEST_DEVICE not found'
+            "if [[ ! -b /dev/$host_device ]]; then
+                 echo 'ERROR: Block device /dev/$host_device not found'
                  exit 1
              fi
-             echo 'Found block device /dev/$TEST_DEVICE'
-             lsblk /dev/$TEST_DEVICE" \
+             echo 'Found block device /dev/$host_device'
+             lsblk /dev/$host_device" \
             "Validating test device"
         if [[ "$DRY_RUN" == "false" ]]; then
             bg_pids+=($!)
@@ -463,9 +691,10 @@ prepare_storage() {
     log_info "Step 4/5: Formatting devices on all hosts (WARNING: destructive operation)..."
     bg_pids=()
     for host in $VM_HOSTS; do
+        local host_device=$(get_device_for_host "$host" "$CONFIG_FILE")
         execute_ssh_background "$host" \
-            "echo 'WARNING: Formatting /dev/$TEST_DEVICE with $FILESYSTEM'
-             mkfs.$FILESYSTEM -f /dev/$TEST_DEVICE" \
+            "echo 'WARNING: Formatting /dev/$host_device with $FILESYSTEM'
+             mkfs.$FILESYSTEM -f /dev/$host_device" \
             "Formatting test device"
         if [[ "$DRY_RUN" == "false" ]]; then
             bg_pids+=($!)
@@ -478,8 +707,9 @@ prepare_storage() {
     log_info "Step 5/5: Mounting devices on all hosts..."
     bg_pids=()
     for host in $VM_HOSTS; do
+        local host_device=$(get_device_for_host "$host" "$CONFIG_FILE")
         execute_ssh_background "$host" \
-            "mount /dev/$TEST_DEVICE $MOUNT_POINT" \
+            "mount /dev/$host_device $MOUNT_POINT" \
             "Mounting test device"
         if [[ "$DRY_RUN" == "false" ]]; then
             bg_pids+=($!)
@@ -606,7 +836,7 @@ run_fio_tests() {
 
 # Collect test results
 collect_results() {
-    local results_dir="${1:-./fio-results-$(date +%Y%m%d-%H%M%S)}"
+    local results_dir="${1:-./fio-results-$(date +%Y%m%d-%H%M%S)-machines_$(echo $VM_HOSTS | wc -w)}"
     
     log_info "Collecting test results..."
     mkdir -p "$results_dir"
@@ -627,7 +857,10 @@ collect_results() {
             log_info "DRY-RUN: Would copy results from $host to $host_dir/"
         else
             log_info "Copying results from $host to localhost..."
-            if virtctl -n $NAMESPACE scp "root@vmi/$host:$OUTPUT_DIR/fio-results.tar.gz" "$host_dir/fio-results.tar.gz" 2>/dev/null; then
+            local scp_cmd
+            scp_cmd=$(get_scp_command "root@vmi/$host:$OUTPUT_DIR/fio-results.tar.gz" "$host_dir/fio-results.tar.gz")
+            
+            if eval "$scp_cmd" 2>/dev/null; then
                 log_info "Successfully copied results from $host using virtctl scp"
                 
                 # Extract results locally for easier access
@@ -644,9 +877,11 @@ collect_results() {
                 fi
             else
                 log_warn "virtctl scp failed, trying alternative method..."
-                # Fallback: use virtctl ssh with cat to copy file
-                if virtctl -n $NAMESPACE ssh -t "-o StrictHostKeyChecking=no" \
-                   "root@vmi/$host" -c "cat $OUTPUT_DIR/fio-results.tar.gz" > "$host_dir/fio-results.tar.gz" 2>/dev/null; then
+                # Fallback: use ssh with cat to copy file
+                local ssh_cmd
+                ssh_cmd=$(get_ssh_command "$host" "cat $OUTPUT_DIR/fio-results.tar.gz")
+                
+                if eval "$ssh_cmd" > "$host_dir/fio-results.tar.gz" 2>/dev/null; then
                     log_info "Successfully copied results from $host using ssh+cat fallback"
                     
                     # Extract results locally
@@ -663,7 +898,11 @@ collect_results() {
                 else
                     log_error "Failed to copy results from $host using both methods"
                     log_info "Results are still available on $host at $OUTPUT_DIR/fio-results.tar.gz"
-                    log_info "Manual copy command: virtctl -n $NAMESPACE ssh root@vmi/$host -c 'cat $OUTPUT_DIR/fio-results.tar.gz' > $host_dir/fio-results.tar.gz"
+                    if [[ "$USE_VIRTCTL" == "true" ]]; then
+                        log_info "Manual copy command: virtctl -n $NAMESPACE ssh root@vmi/$host -c 'cat $OUTPUT_DIR/fio-results.tar.gz' > $host_dir/fio-results.tar.gz"
+                    else
+                        log_info "Manual copy command: ssh root@$host 'cat $OUTPUT_DIR/fio-results.tar.gz' > $host_dir/fio-results.tar.gz"
+                    fi
                 fi
             fi
         fi
@@ -736,11 +975,15 @@ cleanup_storage() {
                  echo 'Mount point $MOUNT_POINT is not mounted or does not exist'
              fi
              
-             # Optional: Clean up test data directory if it's empty
-             if [[ -d $MOUNT_POINT ]] && [[ -z \"\$(ls -A $MOUNT_POINT 2>/dev/null)\" ]]; then
-                 echo 'Removing empty test directory $MOUNT_POINT'
-                 rmdir $MOUNT_POINT 2>/dev/null || true
-             fi" \
+            # Optional: Clean up test data directory if it's empty
+            if [[ -d $MOUNT_POINT ]]; then
+                if ls -A $MOUNT_POINT 2>/dev/null | grep -q .; then
+                    echo 'Directory $MOUNT_POINT is not empty, keeping it'
+                else
+                    echo 'Removing empty test directory $MOUNT_POINT'
+                    rmdir $MOUNT_POINT 2>/dev/null || true
+                fi
+            fi" \
             "Cleaning up storage mount points"
         if [[ "$DRY_RUN" == "false" ]]; then
             bg_pids+=($!)
@@ -789,6 +1032,15 @@ cleanup_storage() {
 main() {
     log_info "Starting FIO remote testing script"
     
+    # Show connection mode
+    if [[ "$USE_VIRTCTL" == "true" ]]; then
+        log_info "Using virtctl for all host connections"
+    elif [[ "$USE_VIRTCTL" == "false" ]]; then
+        log_info "Using direct SSH for all host connections"
+    else
+        log_info "Using auto-detection: virtctl for VMs, SSH for regular hosts"
+    fi
+    
     check_dependencies
     read_config "$CONFIG_FILE"
     display_config
@@ -817,9 +1069,13 @@ main() {
     
     # Confirmation for destructive operations
     echo ""
-    log_warn "WARNING: This script will format device '$TEST_DEVICE' on all VMs!"
-    log_warn "VMs: $VM_HOSTS"
-    log_warn "Device: /dev/$TEST_DEVICE"
+    log_warn "WARNING: This script will format storage devices on all hosts!"
+    log_warn "Hosts: $VM_HOSTS"
+    log_warn "Devices to be formatted:"
+    for host in $VM_HOSTS; do
+        local host_device=$(get_device_for_host "$host" "$CONFIG_FILE")
+        log_warn "  $host: /dev/$host_device"
+    done
     echo ""
     read -p "Are you sure you want to continue? (yes/no): " confirm
     
@@ -835,7 +1091,8 @@ main() {
     
     # Collect results - create directory name once
     local results_timestamp=$(date +%Y%m%d-%H%M%S)
-    local final_results_dir="./fio-results-$results_timestamp"
+    local machine_count=$(echo $VM_HOSTS | wc -w)
+    local final_results_dir="./fio-results-$results_timestamp-machines_$machine_count"
     
     collect_results "$final_results_dir"
     cleanup_storage
@@ -855,26 +1112,36 @@ DESCRIPTION:
     Configuration is read from a YAML file.
 
 USAGE:
-    $0 [-h] [-c config_file] [-v] [--dry-run]
+    $0 [-h] [-c config_file] [-v] [--dry-run] [--ssh-only] [--virtctl-only]
 
 OPTIONS:
     -h                  Show this help message
     -c <config_file>    Path to YAML configuration file (default: fio-config.yaml)
     -v                  Verbose output
     --dry-run           Validate configuration and show what would be done without executing
+    --ssh-only          Force SSH for all hosts (requires direct SSH access)
+    --virtctl-only      Force virtctl for all hosts (requires virtctl/oc access)
+                        Default: Auto-detect host type (virtctl for VMs, SSH for regular hosts)
 
 EXAMPLES:
-    $0                          # Use default fio-config.yaml
-    $0 -c test-config.yaml      # Use custom configuration file
+    $0                          # Auto-detect: virtctl for VMs, SSH for regular hosts
+    $0 -c test-config.yaml      # Use custom config with auto-detection
     $0 -c config.yaml -v        # Use default config with verbose output
+    $0 --ssh-only               # Force SSH for all hosts
+    $0 --virtctl-only           # Force virtctl for all hosts
+    $0 --ssh-only --dry-run     # Test SSH mode without executing
 
 YAML CONFIGURATION:
     See fio-config.yaml for configuration file format and examples.
 
 NOTES:
     - Requires 'yq' tool for YAML parsing
-    - Script requires virtctl and oc for VM access
-    - All operations are performed as root on target VMs
+    - Default mode (auto-detection): requires both virtctl/oc and ssh
+    - Force virtctl mode: requires virtctl and oc for all hosts
+    - Force SSH mode: requires direct SSH access to all hosts
+    - Mixed host support: can test both VMs and regular hosts in same run
+    - All operations are performed as root on target hosts
+    - Results are saved to: fio-results-YYYYMMDD-HHMMSS-machines_N (N = number of hosts)
     - WARNING: This script formats storage devices - ensure correct configuration
 EOF
 }
@@ -903,6 +1170,14 @@ while [ $# -gt 0 ]; do
             ;;
         --dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        --ssh-only)
+            USE_VIRTCTL=false
+            shift
+            ;;
+        --virtctl-only)
+            USE_VIRTCTL=true
             shift
             ;;
         *)

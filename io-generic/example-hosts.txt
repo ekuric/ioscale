@@ -3,18 +3,5 @@
 # Lines starting with # are comments and ignored
 
 # Production storage VMs
+vm-{1..10}
 prod-storage-vm-001
-prod-storage-vm-002
-prod-storage-vm-003
-
-# Development VMs  
-dev-vm-01
-dev-vm-02
-
-# Test environment VMs
-test-storage-node-1
-test-storage-node-2
-test-storage-node-3
-
-# You can also have sections for different environments
-# Just include the hostnames you want to test 

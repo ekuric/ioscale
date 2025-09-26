@@ -1,0 +1,66 @@
+# FIO Test Configuration - Per-Host Device Configuration
+# This configuration demonstrates how to specify different storage devices
+# for different hosts, allowing fine-tuning for each machine
+
+# VM/Host Configuration
+vm:
+  # Simple host list with different devices per host
+  host_file: "mixed-hosts.txt" 
+  #  hosts: "fed1 fed2 fed3"
+  # namespace: "default"
+
+# Storage Configuration
+storage:
+  # Per-host device configuration (MANDATORY - no global fallback for safety)
+  devices:
+    fed1: "vdb"
+    fed2: "vdb"
+    fed3: "vdb"
+  
+  # Mount point for the test filesystem
+  mount_point: "/root/tests/data"
+  
+  # Filesystem type to create
+  filesystem: "xfs"
+
+# FIO Test Configuration
+fio:
+  # Test file size (e.g., "1G", "500M", "10G")
+  test_size: "1G"
+  
+  # Test runtime in seconds
+  runtime: "60"
+  
+  # Block sizes to test (space-separated)
+  block_sizes: "4k" # 8k 128k 1024k"
+  
+  # I/O patterns to test (space-separated)
+  io_patterns: "write" # write randread randwrite"
+  
+  # Number of parallel jobs
+  numjobs: "4"
+  
+  # I/O depth
+  iodepth: "16"
+  
+  # Direct I/O (bypass page cache)
+  direct_io: "1"
+
+# Output Configuration
+output:
+  # Directory to store results on remote hosts
+  directory: "/root/fio-results"
+  
+  # Output format (json+, normal, etc.)
+  format: "json+"
+
+# Usage Examples:
+# ./fio-tests.sh --ssh-only -c fio-config-per-host-devices.yaml
+# ./fio-tests.sh --ssh-only -c fio-config-per-host-devices.yaml --dry-run
+# ./fio-tests.sh --ssh-only -c fio-config-per-host-devices.yaml -v
+
+# Device Configuration Notes:
+# - If a host is not specified in storage.devices, it will use storage.device
+# - Device names should not include the /dev/ prefix (e.g., "sda" not "/dev/sda")
+# - This allows fine-tuning for different hardware configurations per host
+# - Useful when hosts have different storage devices available

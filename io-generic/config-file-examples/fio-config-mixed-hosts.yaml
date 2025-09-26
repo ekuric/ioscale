@@ -5,18 +5,16 @@
 # VM/Host Configuration
 vm:
   # Method 1: External host file (recommended for mixed environments)
-  #host_file: "mixed-hosts.txt"
+  host_file: "mixed-hosts.txt"
   
   # Alternative Method 2: Simple host list with mixed VM and server names
-  #hosts: "vm-1 vm-2 myhost.test.com" 
-  #  vm-3 vm-4 vm-5" 
-  # server1 server2 vm-3"
+  # hosts: "vm-1 vm-2 server1 server2 vm-3"
   
   # Alternative Method 3: Host pattern expansion
-  host_pattern: "vm-{1..200}" #100}"
+  # host_pattern: "vm-{1..3} server{1..2}"
   
   # Alternative Method 4: Label-based selection (VMs only)
-  #host_labels: "type=vm"
+  # host_labels: "environment=test,type=vm"
   
   # OpenShift/Kubernetes namespace for VMs (ignored for regular servers)
   namespace: "default"
@@ -26,10 +24,17 @@ storage:
   # Per-host device configuration (MANDATORY - no global fallback for safety)
   devices:
     # OpenShift VMs (typically use virtual devices) - using patterns for efficiency
-    "vm-{1..200}": "vdc"
+    "vm-{1..5}": "vdb"
+    "worker-{1..3}": "vdb"
+    "app-server-{1..2}": "vdb"
+    
+    # Bare Metal Servers (typically use physical devices) - using patterns for efficiency
+    "fed{1..3}": "sdb"
+    "baremetal-server-{1..2}": "sdb"
+    "storage-node-{1..2}": "sdb"
     
     # Individual hosts (for special cases)
-    "myhost.test.com": "sdc"
+    "n42-h01-b06-mx750c.rdu3.labs.perfscale.redhat.com": "sda"
   
   # Mount point for the test filesystem
   mount_point: "/root/tests/data"
@@ -40,13 +45,13 @@ storage:
 # FIO Test Configuration
 fio:
   # Test file size (e.g., "1G", "500M", "10G")
-  test_size: "10G"
+  test_size: "1G"
   
   # Test runtime in seconds
-  runtime: "300"
+  runtime: "60"
   
   # Block sizes to test (space-separated)
-  block_sizes: "4k 8k 128k 1024k 4096k"
+  block_sizes: "4k 8k 128k 1024k"
   
   # I/O patterns to test (space-separated)
   io_patterns: "read write randread randwrite"
@@ -67,3 +72,25 @@ output:
   
   # Output format (json+, normal, etc.)
   format: "json+"
+
+# Usage Examples:
+# ./fio-tests.sh -c fio-config-mixed-hosts.yaml                    # Auto-detect mode
+# ./fio-tests.sh -c fio-config-mixed-hosts.yaml --dry-run          # Test configuration
+# ./fio-tests.sh -c fio-config-mixed-hosts.yaml -v                 # Verbose output
+
+# Example mixed-hosts.txt file content:
+# # VMs (will use virtctl ssh)
+# vm-1
+# vm-2
+# vm-3
+# # Regular servers (will use ssh)
+# server1
+# server2
+# server3
+
+# Prerequisites for mixed host mode:
+# 1. virtctl and oc commands for VM access
+# 2. SSH access configured for regular servers
+# 3. VMs must exist in OpenShift/Kubernetes and be running
+# 4. Regular servers must be accessible via SSH
+# 5. mixed-hosts.txt file must exist with host names

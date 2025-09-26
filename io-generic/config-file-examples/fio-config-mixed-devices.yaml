@@ -1,0 +1,83 @@
+# FIO Test Configuration - Mixed Device Configuration
+# This configuration demonstrates a mix of global and per-host device configuration
+# Some hosts use the global device, others have specific devices configured
+
+# VM/Host Configuration
+vm:
+  # Host pattern expansion for larger sets
+  host_pattern: "server{1..10}"
+  # namespace: "default"  # Not needed for SSH-only mode - bare metal servers
+
+# Storage Configuration
+storage:
+  # Per-host device configuration (MANDATORY - no global fallback for safety)
+  devices:
+    server1: "sda"      # /dev/sda - different device for server1
+    server2: "sdb"      # /dev/sdb - explicit device for server2
+    server3: "sdc"      # /dev/sdc - different device for server3
+    server4: "sdb"      # /dev/sdb - explicit device for server4
+    server5: "nvme0n1"  # /dev/nvme0n1 - NVMe device for server5
+    server6: "sdb"      # /dev/sdb - explicit device for server6
+    server7: "vdb"      # /dev/vdb - virtual device for server7
+    server8: "sdb"      # /dev/sdb - explicit device for server8
+    server9: "sdb"      # /dev/sdb - explicit device for server9
+    server10: "sdb"     # /dev/sdb - explicit device for server10
+  
+  # Mount point for the test filesystem
+  mount_point: "/root/tests/data"
+  
+  # Filesystem type to create
+  filesystem: "xfs"
+
+# FIO Test Configuration
+fio:
+  # Test file size (e.g., "1G", "500M", "10G")
+  test_size: "1G"
+  
+  # Test runtime in seconds
+  runtime: "60"
+  
+  # Block sizes to test (space-separated)
+  block_sizes: "4k 8k 128k 1024k"
+  
+  # I/O patterns to test (space-separated)
+  io_patterns: "read write randread randwrite"
+  
+  # Number of parallel jobs
+  numjobs: "4"
+  
+  # I/O depth
+  iodepth: "16"
+  
+  # Direct I/O (bypass page cache)
+  direct_io: "1"
+
+# Output Configuration
+output:
+  # Directory to store results on remote hosts
+  directory: "/root/fio-results"
+  
+  # Output format (json+, normal, etc.)
+  format: "json+"
+
+# Usage Examples:
+# ./fio-tests.sh --ssh-only -c fio-config-mixed-devices.yaml
+# ./fio-tests.sh --ssh-only -c fio-config-mixed-devices.yaml --dry-run
+# ./fio-tests.sh --ssh-only -c fio-config-mixed-devices.yaml -v
+
+# Device Configuration Summary:
+# - server1: /dev/sda (per-host config)
+# - server2: /dev/sdb (global config)
+# - server3: /dev/sdc (per-host config)
+# - server4: /dev/sdb (global config)
+# - server5: /dev/nvme0n1 (per-host config)
+# - server6: /dev/sdb (global config)
+# - server7: /dev/vdb (per-host config)
+# - server8: /dev/sdb (global config)
+# - server9: /dev/sdb (global config)
+# - server10: /dev/sdb (global config)
+
+# This approach allows you to:
+# 1. Use a default device for most hosts
+# 2. Override specific hosts that have different hardware
+# 3. Mix different storage types (SATA, NVMe, virtual) in the same test

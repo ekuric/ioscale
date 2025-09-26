@@ -1,0 +1,73 @@
+# FIO Test Configuration - Virtctl Only Mode
+# This configuration is designed for --virtctl-only mode where all hosts are VMs
+# that must be accessed via virtctl/oc commands
+
+# VM/Host Configuration
+vm:
+  # Method 1: Simple host list (VM names in OpenShift/Kubernetes)
+  hosts: "vm-1 vm-2 vm-3 vm-4 vm-5"
+  
+  # Alternative Method 2: Host pattern expansion
+  # host_pattern: "vm-{1..5}"
+  
+  # Alternative Method 3: External host file
+  # host_file: "vm-hosts.txt"
+  
+  # Alternative Method 4: Label-based selection (recommended for large VM sets)
+  # host_labels: "environment=test,workload=fio"
+  
+  # OpenShift/Kubernetes namespace containing the VMs
+  namespace: "fio-testing"
+
+# Storage Configuration
+storage:
+  # Block device to test (e.g., /dev/vdb, /dev/nvme0n1)
+  device: "/dev/vdb"
+  
+  # Mount point for the test filesystem
+  mount_point: "/root/tests/data"
+  
+  # Filesystem type to create
+  filesystem: "xfs"
+
+# FIO Test Configuration
+fio:
+  # Test file size (e.g., "1G", "500M", "10G")
+  test_size: "1G"
+  
+  # Test runtime in seconds
+  runtime: "60"
+  
+  # Block sizes to test (space-separated)
+  block_sizes: "4k 8k 128k 1024k"
+  
+  # I/O patterns to test (space-separated)
+  io_patterns: "read write randread randwrite"
+  
+  # Number of parallel jobs
+  numjobs: "4"
+  
+  # I/O depth
+  iodepth: "16"
+  
+  # Direct I/O (bypass page cache)
+  direct_io: "1"
+
+# Output Configuration
+output:
+  # Directory to store results on remote VMs
+  directory: "/root/fio-results"
+  
+  # Output format (json+, normal, etc.)
+  format: "json+"
+
+# Usage Examples:
+# ./fio-tests.sh --virtctl-only -c fio-config-virtctl-only.yaml
+# ./fio-tests.sh --virtctl-only -c fio-config-virtctl-only.yaml --dry-run
+# ./fio-tests.sh --virtctl-only -c fio-config-virtctl-only.yaml -v
+
+# Prerequisites for virtctl-only mode:
+# 1. virtctl and oc commands must be installed and configured
+# 2. Must be logged into OpenShift/Kubernetes cluster
+# 3. VMs must exist in the specified namespace
+# 4. VMs must be running and accessible via virtctl ssh

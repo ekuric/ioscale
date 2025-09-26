@@ -1,0 +1,71 @@
+# FIO Test Configuration - Host Patterns in Devices Section
+# This configuration demonstrates how to use host patterns in the devices section
+# to specify the same device for multiple hosts efficiently
+
+# VM/Host Configuration
+vm:
+  # Use host pattern to define multiple VMs
+  host_pattern: "vm-{1..5}"
+  namespace: "default"
+
+# Storage Configuration
+storage:
+  # Per-host device configuration with host patterns
+  devices:
+    # Use host pattern for VMs with same device
+    "vm-{1..5}": "vdc"
+    
+    # You can also mix patterns with individual hosts
+    "server-{1..3}": "sdb"
+    "worker-{1..10}": "nvme0n1"
+    
+    # Individual hosts can still be specified
+    "special-server": "sda"
+  
+  # Mount point for the test filesystem
+  mount_point: "/root/tests/data"
+  
+  # Filesystem type to create
+  filesystem: "xfs"
+
+# FIO Test Configuration
+fio:
+  # Test file size (e.g., "1G", "500M", "10G")
+  test_size: "1G"
+  
+  # Test runtime in seconds
+  runtime: "60"
+  
+  # Block sizes to test (space-separated)
+  block_sizes: "4k 8k 128k 1024k"
+  
+  # I/O patterns to test (space-separated)
+  io_patterns: "read write randread randwrite"
+  
+  # Number of parallel jobs
+  numjobs: "4"
+  
+  # I/O depth
+  iodepth: "16"
+  
+  # Direct I/O (bypass page cache)
+  direct_io: "1"
+
+# Output Configuration
+output:
+  # Directory to store results on remote hosts
+  directory: "/root/fio-results"
+  
+  # Output format (json+, normal, etc.)
+  format: "json+"
+
+# Usage Examples:
+# ./fio-tests.sh -c fio-config-host-patterns.yaml
+# ./fio-tests.sh -c fio-config-host-patterns.yaml --dry-run
+# ./fio-tests.sh -c fio-config-host-patterns.yaml -v
+
+# Host Pattern Examples:
+# "vm-{1..5}": "vdc"        # vm-1, vm-2, vm-3, vm-4, vm-5 all use /dev/vdc
+# "server-{1..3}": "sdb"    # server-1, server-2, server-3 all use /dev/sdb
+# "worker-{1..10}": "nvme0n1" # worker-1 through worker-10 all use /dev/nvme0n1
+# "test-{001..050}": "vdb"  # test-001 through test-050 all use /dev/vdb (zero-padded)

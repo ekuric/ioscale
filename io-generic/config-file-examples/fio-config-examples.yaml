@@ -1,0 +1,154 @@
+# FIO Test Configuration - Multiple Examples
+# This file demonstrates different host selection methods and configurations
+
+# =============================================================================
+# EXAMPLE 1: Simple Host List (SSH Only Mode)
+# =============================================================================
+# Uncomment this section for SSH-only testing
+# vm:
+#   hosts: "server1 server2 server3 server4 server5"
+#   namespace: "default"
+# 
+# storage:
+#   device: "/dev/sdb"
+#   mount_point: "/root/tests/data"
+#   filesystem: "xfs"
+# 
+# fio:
+#   test_size: "1G"
+#   runtime: "60"
+#   block_sizes: "4k 8k 128k 1024k"
+#   io_patterns: "read write randread randwrite"
+#   numjobs: "4"
+#   iodepth: "16"
+#   direct_io: "1"
+# 
+# output:
+#   directory: "/root/fio-results"
+#   format: "json+"
+
+# =============================================================================
+# EXAMPLE 2: Host Pattern Expansion (Virtctl Only Mode)
+# =============================================================================
+# Uncomment this section for virtctl-only testing with pattern expansion
+# vm:
+#   host_pattern: "vm-{1..100}"
+#   namespace: "fio-testing"
+# 
+# storage:
+#   device: "/dev/vdb"
+#   mount_point: "/root/tests/data"
+#   filesystem: "xfs"
+# 
+# fio:
+#   test_size: "500M"
+#   runtime: "30"
+#   block_sizes: "4k 8k 64k 128k"
+#   io_patterns: "read write randread randwrite"
+#   numjobs: "2"
+#   iodepth: "8"
+#   direct_io: "1"
+# 
+# output:
+#   directory: "/root/fio-results"
+#   format: "json+"
+
+# =============================================================================
+# EXAMPLE 3: Label-Based Selection (Virtctl Only Mode)
+# =============================================================================
+# Uncomment this section for virtctl-only testing with Kubernetes labels
+# vm:
+#   host_labels: "environment=test,workload=fio,size=large"
+#   namespace: "performance-testing"
+# 
+# storage:
+#   device: "/dev/nvme0n1"
+#   mount_point: "/root/tests/data"
+#   filesystem: "xfs"
+# 
+# fio:
+#   test_size: "2G"
+#   runtime: "120"
+#   block_sizes: "4k 8k 16k 32k 64k 128k 256k 512k 1024k"
+#   io_patterns: "read write randread randwrite"
+#   numjobs: "8"
+#   iodepth: "32"
+#   direct_io: "1"
+# 
+# output:
+#   directory: "/root/fio-results"
+#   format: "json+"
+
+# =============================================================================
+# EXAMPLE 4: External Host File (Mixed Hosts Mode)
+# =============================================================================
+# Uncomment this section for mixed hosts testing
+vm:
+  host_file: "mixed-hosts.txt"
+  namespace: "fio-testing"
+
+storage:
+  device: "/dev/vdb"
+  mount_point: "/root/tests/data"
+  filesystem: "xfs"
+
+fio:
+  test_size: "1G"
+  runtime: "60"
+  block_sizes: "4k 8k 128k 1024k"
+  io_patterns: "read write randread randwrite"
+  numjobs: "4"
+  iodepth: "16"
+  direct_io: "1"
+
+output:
+  directory: "/root/fio-results"
+  format: "json+"
+
+# =============================================================================
+# EXAMPLE 5: High-Performance Testing Configuration
+# =============================================================================
+# Uncomment this section for high-performance testing
+# vm:
+#   host_pattern: "perf-vm-{1..50}"
+#   namespace: "performance"
+# 
+# storage:
+#   device: "/dev/nvme0n1"
+#   mount_point: "/root/tests/data"
+#   filesystem: "xfs"
+# 
+# fio:
+#   test_size: "5G"
+#   runtime: "300"
+#   block_sizes: "4k 8k 16k 32k 64k 128k 256k 512k 1024k 2048k 4096k"
+#   io_patterns: "read write randread randwrite"
+#   numjobs: "16"
+#   iodepth: "64"
+#   direct_io: "1"
+# 
+# output:
+#   directory: "/root/fio-results"
+#   format: "json+"
+
+# =============================================================================
+# USAGE EXAMPLES:
+# =============================================================================
+# 
+# SSH Only Mode:
+# ./fio-tests.sh --ssh-only -c fio-config-examples.yaml
+# 
+# Virtctl Only Mode:
+# ./fio-tests.sh --virtctl-only -c fio-config-examples.yaml
+# 
+# Auto-detection Mode (Mixed Hosts):
+# ./fio-tests.sh -c fio-config-examples.yaml
+# 
+# Dry Run (Test Configuration):
+# ./fio-tests.sh --ssh-only -c fio-config-examples.yaml --dry-run
+# 
+# Verbose Output:
+# ./fio-tests.sh --virtctl-only -c fio-config-examples.yaml -v
+# 
+# Debug Configuration Parsing:
+# ./fio-tests.sh -c fio-config-examples.yaml --debug
