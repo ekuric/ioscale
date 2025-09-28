@@ -11,6 +11,7 @@ CONFIG_FILE="fio-config.yaml"
 DRY_RUN=false
 VERBOSE=false
 USE_VIRTCTL=""  # Default to auto-detection, can be forced with --ssh-only or --virtctl-only
+SKIP_CONFIRMATION=false
 
 # Function to check if required tools are installed
 check_dependencies() {
@@ -347,6 +348,11 @@ read_config() {
     NUMJOBS=$(yq eval '.fio.numjobs' "$config_file")
     IODEPTH=$(yq eval '.fio.iodepth' "$config_file")
     DIRECT_IO=$(yq eval '.fio.direct_io' "$config_file")
+    RATE_IOPS=$(yq eval '.fio.rate_iops' "$config_file")
+    # Check if rate_iops is set (not null and not empty)
+    if [[ "$RATE_IOPS" == "null" ]] || [[ -z "$RATE_IOPS" ]]; then
+        RATE_IOPS=""
+    fi
     
     # Output Configuration
     OUTPUT_DIR=$(yq eval '.output.directory' "$config_file")
@@ -408,7 +414,7 @@ DESCRIPTION:
     Configuration is read from a YAML file.
 
 USAGE:
-    $0 [-h] [-c config_file] [-v] [--dry-run]
+    $0 [-h] [-c config_file] [-v] [--dry-run] [--yes-i-mean-it]
 
 OPTIONS:
     -h                  Show this help message
@@ -416,6 +422,7 @@ OPTIONS:
     -v                  Verbose output
     --debug             Show detailed configuration parsing debug information
     --dry-run           Validate configuration and show what would be done without executing
+    --yes-i-mean-it     Skip confirmation prompt for device formatting (use with caution!)
 
 EXAMPLES:
     $0                          # Use default fio-config.yaml
@@ -507,6 +514,7 @@ display_config() {
     log_info "Number of jobs: $NUMJOBS"
     log_info "I/O depth: $IODEPTH"
     log_info "Direct I/O: $DIRECT_IO"
+    log_info "Rate I/O limit: $RATE_IOPS"
     log_info "Output directory: $OUTPUT_DIR"
 }
 
@@ -536,6 +544,11 @@ debug_config_parsing() {
         yq eval '.fio.io_patterns' "$CONFIG_FILE" | while read line; do
             log_info "  io_patterns: '$line'"
         done
+        if [[ -n "$RATE_IOPS" ]]; then
+            log_info "  rate_iops: '$RATE_IOPS'"
+        else
+            log_info "  rate_iops: 'Not set (unlimited)'"
+        fi
     fi
     
     # Show how arrays are parsed
@@ -782,21 +795,28 @@ run_fio_tests() {
                 log_info "Starting FIO test on $host: $test_name"
                 
                 # Run in background and capture PID
-                execute_ssh_background "$host" \
-                    "cd $OUTPUT_DIR && fio \
-                        --name=testfile \
-                        --directory=$MOUNT_POINT \
-                        --size=$TEST_SIZE \
-                        --rw=$pattern \
-                        --bs=$bs \
-                        --runtime=$TEST_RUNTIME \
-                        --direct=$DIRECT_IO \
-                        --numjobs=$NUMJOBS \
-                        --time_based=1 \
-                        --iodepth=$IODEPTH \
-                        --output-format=$OUTPUT_FORMAT \
-                        --output=${test_name}.json" \
-                    "FIO test: $pattern, block size: $bs"
+                # Build FIO command with conditional rate_iops
+                fio_cmd="cd $OUTPUT_DIR && fio \
+                    --name=testfile \
+                    --directory=$MOUNT_POINT \
+                    --size=$TEST_SIZE \
+                    --rw=$pattern \
+                    --bs=$bs \
+                    --runtime=$TEST_RUNTIME \
+                    --direct=$DIRECT_IO \
+                    --numjobs=$NUMJOBS \
+                    --time_based=1 \
+                    --iodepth=$IODEPTH \
+                    --output-format=$OUTPUT_FORMAT"
+                
+                # Add rate_iops only if it's set
+                if [[ -n "$RATE_IOPS" ]]; then
+                    fio_cmd="$fio_cmd --rate_iops=$RATE_IOPS"
+                fi
+                
+                fio_cmd="$fio_cmd --output=${test_name}.json"
+                
+                execute_ssh_background "$host" "$fio_cmd" "FIO test: $pattern, block size: $bs"
                 
                 # Store the PID of the last background job
                 if [[ "$DRY_RUN" == "false" ]]; then
@@ -1067,21 +1087,33 @@ main() {
         return 0
     fi
     
-    # Confirmation for destructive operations
-    echo ""
-    log_warn "WARNING: This script will format storage devices on all hosts!"
-    log_warn "Hosts: $VM_HOSTS"
-    log_warn "Devices to be formatted:"
-    for host in $VM_HOSTS; do
-        local host_device=$(get_device_for_host "$host" "$CONFIG_FILE")
-        log_warn "  $host: /dev/$host_device"
-    done
-    echo ""
-    read -p "Are you sure you want to continue? (yes/no): " confirm
-    
-    if [[ "$confirm" != "yes" ]]; then
-        log_info "Operation cancelled by user"
-        exit 0
+    # Confirmation for destructive operations (unless --yes-i-mean-it is used)
+    if [[ "$SKIP_CONFIRMATION" == "false" ]]; then
+        echo ""
+        log_warn "WARNING: This script will format storage devices on all hosts!"
+        log_warn "Hosts: $VM_HOSTS"
+        log_warn "Devices to be formatted:"
+        for host in $VM_HOSTS; do
+            local host_device=$(get_device_for_host "$host" "$CONFIG_FILE")
+            log_warn "  $host: /dev/$host_device"
+        done
+        echo ""
+        read -p "Are you sure you want to continue? (yes/no): " confirm
+        
+        if [[ "$confirm" != "yes" ]]; then
+            log_info "Operation cancelled by user"
+            exit 0
+        fi
+    else
+        log_info "Skipping confirmation prompt (--yes-i-mean-it specified)"
+        log_warn "WARNING: This script will format storage devices on all hosts!"
+        log_warn "Hosts: $VM_HOSTS"
+        log_warn "Devices to be formatted:"
+        for host in $VM_HOSTS; do
+            local host_device=$(get_device_for_host "$host" "$CONFIG_FILE")
+            log_warn "  $host: /dev/$host_device"
+        done
+        echo ""
     fi
     
     install_dependencies
@@ -1112,7 +1144,7 @@ DESCRIPTION:
     Configuration is read from a YAML file.
 
 USAGE:
-    $0 [-h] [-c config_file] [-v] [--dry-run] [--ssh-only] [--virtctl-only]
+    $0 [-h] [-c config_file] [-v] [--dry-run] [--ssh-only] [--virtctl-only] [--yes-i-mean-it]
 
 OPTIONS:
     -h                  Show this help message
@@ -1122,6 +1154,7 @@ OPTIONS:
     --ssh-only          Force SSH for all hosts (requires direct SSH access)
     --virtctl-only      Force virtctl for all hosts (requires virtctl/oc access)
                         Default: Auto-detect host type (virtctl for VMs, SSH for regular hosts)
+    --yes-i-mean-it     Skip confirmation prompt for device formatting (use with caution!)
 
 EXAMPLES:
     $0                          # Auto-detect: virtctl for VMs, SSH for regular hosts
@@ -1130,6 +1163,7 @@ EXAMPLES:
     $0 --ssh-only               # Force SSH for all hosts
     $0 --virtctl-only           # Force virtctl for all hosts
     $0 --ssh-only --dry-run     # Test SSH mode without executing
+    $0 --yes-i-mean-it          # Skip confirmation prompt (use with caution!)
 
 YAML CONFIGURATION:
     See fio-config.yaml for configuration file format and examples.
@@ -1178,6 +1212,10 @@ while [ $# -gt 0 ]; do
             ;;
         --virtctl-only)
             USE_VIRTCTL=true
+            shift
+            ;;
+        --yes-i-mean-it)
+            SKIP_CONFIRMATION=true
             shift
             ;;
         *)
