@@ -118,6 +118,9 @@ fio:
   
   # Direct I/O (bypass page cache)
   direct_io: "1"
+  
+  # rate_iops - if not set then it is ignore, if set - rate_iops value will be used in test
+  # rate_iops: "500"
 
 # Output Configuration
 output:
@@ -209,8 +212,12 @@ If everything is as we want - we can execute test. Do not execute test if there 
 
 ### Step 4: Execute Tests
 ```bash
-./fio-tests.sh -c fio-config.yaml
+./fio-tests.sh -c fio-config.yaml 
 ```
+
+If you want to avoid prompt to confirm to proceed with test, then it is possible to use  `--yes-i-mean-it` what will force test to proceed without asking to confirm it. 
+Use option `--yes-i-mean-it` when you are sure that you have proper configuration in `hosts` and `devices` section of `fio-config.yaml`.
+
 
 Depending on specified IO operations and test duration test can take different time to finish. 
 
