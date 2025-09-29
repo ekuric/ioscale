@@ -21,6 +21,7 @@ fio:
   numjobs: 16                    # Number of parallel jobs
   iodepth: 16                    # I/O queue depth
   direct_io: 1                   # Use direct I/O (1=yes, 0=no)
+  # rate_iops: "500"             # rate_iops - supported, disabled by default 
 
 # Output Configuration
 output:

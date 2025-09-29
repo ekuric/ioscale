@@ -60,6 +60,9 @@ fio:
   # Direct I/O (bypass page cache)
   direct_io: "1"
 
+  # rate_iops  - uncomment if there need to impose rate iops
+  # rate_iops: "1000" 
+
 # Output Configuration
 output:
   # Directory to store results on remote hosts
