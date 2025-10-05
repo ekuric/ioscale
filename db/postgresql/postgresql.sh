@@ -10,6 +10,26 @@ set -euo pipefail  # Exit on error, undefined vars, pipe failures
 CONFIG_FILE="config.yaml"
 DRY_RUN=false
 
+# Function to extract VM number from hostname
+get_vm_number() {
+    local hostname="$1"
+    
+    # First try to extract number from vm-* pattern
+    if [[ "$hostname" =~ vm-([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    
+    # For non-vm- directories, try to extract any number from the name
+    if [[ "$hostname" =~ ([0-9]+) ]]; then
+        echo "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    
+    # If no number found, return 1 as default
+    echo "1"
+}
+
 # Function to check if required tools are installed
 check_dependencies() {
     local missing_tools=()
@@ -525,33 +545,31 @@ build_database() {
     # Step 4: Copy and configure build scripts in parallel
     log_info "Step 4/5: Preparing build scripts on all hosts..."
     bg_pids=()
-    local counter=1
     for host in $DB_HOSTS; do
+        local vm_number=$(get_vm_number "$host")
         execute_ssh_background "$host" \
             "cd /usr/local/HammerDB && 
-             cp '$HAMMERDB_PATH/templates/postgresql/postgresqlsetup/build_pg.tcl' build${counter}_pg.tcl &&
-             sed -i 's/^diset connection pg_host.*/diset connection pg_host 127.0.0.1/g' build${counter}_pg.tcl &&
-             sed -i 's/^diset tpcc pg_count_ware.*/diset tpcc pg_count_ware $WAREHOUSE_COUNT/g' build${counter}_pg.tcl" \
-            "Preparing build script (build${counter}_pg.tcl)"
+             cp '$HAMMERDB_PATH/templates/postgresql/postgresqlsetup/build_pg.tcl' build${vm_number}_pg.tcl &&
+             sed -i 's/^diset connection pg_host.*/diset connection pg_host 127.0.0.1/g' build${vm_number}_pg.tcl &&
+             sed -i 's/^diset tpcc pg_count_ware.*/diset tpcc pg_count_ware $WAREHOUSE_COUNT/g' build${vm_number}_pg.tcl" \
+            "Preparing build script (build${vm_number}_pg.tcl)"
         if [[ "$DRY_RUN" == "false" ]]; then
             bg_pids+=($!)
         fi
-        ((counter++))
     done
     wait_for_background_jobs "build script preparation" "${bg_pids[@]}"
     
     # Step 5: Build databases in parallel
     log_info "Step 5/5: Building TPCC databases on all hosts (this may take a while)..."
     bg_pids=()
-    counter=1
     for host in $DB_HOSTS; do
+        local vm_number=$(get_vm_number "$host")
         execute_ssh_background "$host" \
-            "cd /usr/local/HammerDB && nohup ./hammerdbcli auto build${counter}_pg.tcl > build_pg${counter}.out 2>&1" \
-            "Building database (output: build_pg${counter}.out)"
+            "cd /usr/local/HammerDB && nohup ./hammerdbcli auto build${vm_number}_pg.tcl > build_pg${vm_number}.out 2>&1" \
+            "Building database (output: build_pg${vm_number}.out)"
         if [[ "$DRY_RUN" == "false" ]]; then
             bg_pids+=($!)
         fi
-        ((counter++))
     done
     wait_for_background_jobs "database building" "${bg_pids[@]}"
     
@@ -573,43 +591,41 @@ run_tests() {
         # Step 1: Setup test scripts on all hosts in parallel
         log_info "Preparing test scripts for $user_count users..."
         local bg_pids=()
-        local counter=1
         for host in $DB_HOSTS; do
+            local vm_number=$(get_vm_number "$host")
             execute_ssh_background "$host" \
                 "cd /usr/local/HammerDB && 
-                 cp '$HAMMERDB_PATH/templates/postgresql/postgresqlsetup/runtest_pg.tcl' runtest${counter}_pg.tcl &&
-                 sed -i 's/^diset tpcc pg_count_ware.*/diset tpcc pg_count_ware $WAREHOUSE_COUNT/g' runtest${counter}_pg.tcl &&
-                 sed -i 's/^vuset.*/vuset vu $user_count/g' runtest${counter}_pg.tcl &&
-                 sed -i 's/^diset tpcc pg_duration.*/diset tpcc pg_duration $TEST_DURATION/g' runtest${counter}_pg.tcl" \
-                "Preparing test script (runtest${counter}_pg.tcl) for $user_count users"
+                 cp '$HAMMERDB_PATH/templates/postgresql/postgresqlsetup/runtest_pg.tcl' runtest${vm_number}_pg.tcl &&
+                 sed -i 's/^diset tpcc pg_count_ware.*/diset tpcc pg_count_ware $WAREHOUSE_COUNT/g' runtest${vm_number}_pg.tcl &&
+                 sed -i 's/^vuset.*/vuset vu $user_count/g' runtest${vm_number}_pg.tcl &&
+                 sed -i 's/^diset tpcc pg_duration.*/diset tpcc pg_duration $TEST_DURATION/g' runtest${vm_number}_pg.tcl" \
+                "Preparing test script (runtest${vm_number}_pg.tcl) for $user_count users"
             if [[ "$DRY_RUN" == "false" ]]; then
                 bg_pids+=($!)
             fi
-            ((counter++))
         done
         wait_for_background_jobs "test script preparation for $user_count users" "${bg_pids[@]}"
         
         # Step 2: Run performance tests on all hosts in parallel
         log_info "Executing performance tests with $user_count users..."
         bg_pids=()
-        counter=1
         for host in $DB_HOSTS; do
-            local output_file="test_ESX_pg_${run_date}_${num_hosts}pod_pod${counter}_${user_count}.out"
+            local vm_number=$(get_vm_number "$host")
+            local output_file="test_ESX_pg_${run_date}_${num_hosts}pod_pod${vm_number}_${user_count}.out"
             execute_ssh_background "$host" \
-                "cd /usr/local/HammerDB && nohup ./hammerdbcli auto runtest${counter}_pg.tcl > '$output_file' 2>&1" \
+                "cd /usr/local/HammerDB && nohup ./hammerdbcli auto runtest${vm_number}_pg.tcl > '$output_file' 2>&1" \
                 "Running performance test (output: $output_file)"
             if [[ "$DRY_RUN" == "false" ]]; then
                 bg_pids+=($!)
             fi
-            ((counter++))
         done
         wait_for_background_jobs "performance test execution with $user_count users" "${bg_pids[@]}"
         
         # Step 3: Collect results from all hosts
         log_info "Collecting test results for $user_count users:"
-        counter=1
         for host in $DB_HOSTS; do
-            local output_file="test_ESX_pg_${run_date}_${num_hosts}pod_pod${counter}_${user_count}.out"
+            local vm_number=$(get_vm_number "$host")
+            local output_file="test_ESX_pg_${run_date}_${num_hosts}pod_pod${vm_number}_${user_count}.out"
             if [[ "$DRY_RUN" == "false" ]]; then
                 local result
                 result=$(execute_ssh "$host" \
@@ -619,7 +635,6 @@ run_tests() {
             else
                 log_info "DRY-RUN: Would collect results from $host"
             fi
-            ((counter++))
         done
         
         log_info "Completed test run with $user_count users on all hosts"
