@@ -611,7 +611,7 @@ run_tests() {
         bg_pids=()
         for host in $DB_HOSTS; do
             local vm_number=$(get_vm_number "$host")
-            local output_file="test_ESX_pg_${run_date}_${num_hosts}pod_pod${vm_number}_${user_count}.out"
+            local output_file="test_postgresql_pg_${run_date}_${num_hosts}pod_pod${vm_number}_${user_count}.out"
             execute_ssh_background "$host" \
                 "cd /usr/local/HammerDB && nohup ./hammerdbcli auto runtest${vm_number}_pg.tcl > '$output_file' 2>&1" \
                 "Running performance test (output: $output_file)"
@@ -625,7 +625,7 @@ run_tests() {
         log_info "Collecting test results for $user_count users:"
         for host in $DB_HOSTS; do
             local vm_number=$(get_vm_number "$host")
-            local output_file="test_ESX_pg_${run_date}_${num_hosts}pod_pod${vm_number}_${user_count}.out"
+            local output_file="test_postgresql_pg_${run_date}_${num_hosts}pod_pod${vm_number}_${user_count}.out"
             if [[ "$DRY_RUN" == "false" ]]; then
                 local result
                 result=$(execute_ssh "$host" \
@@ -659,7 +659,7 @@ collect_results() {
             log_info "DRY-RUN: Would archive results on $host"
         else
             execute_ssh "$host" \
-                "cd /usr/local/HammerDB && tar czf postgresql-results.tar.gz build_pg*.out test_ESX_pg_*.out 2>/dev/null || tar czf postgresql-results.tar.gz build_pg*.out 2>/dev/null || echo 'No result files found'" \
+                "cd /usr/local/HammerDB && tar czf postgresql-results.tar.gz build_pg*.out test_postgresql_pg_*.out 2>/dev/null || tar czf postgresql-results.tar.gz build_pg*.out 2>/dev/null || echo 'No result files found'" \
                 "Creating results archive"
         fi
         
@@ -727,11 +727,11 @@ collect_results() {
             if [[ -d "$host_dir" ]]; then
                 local hostname=$(basename "$host_dir")
                 local build_files=$(find "$host_dir" -name "build_pg*.out" | wc -l)
-                local test_files=$(find "$host_dir" -name "test_ESX_pg_*.out" | wc -l)
+                local test_files=$(find "$host_dir" -name "test_postgresql_pg_*.out" | wc -l)
                 log_info "  $hostname: $build_files build files, $test_files test files"
                 
                 # Extract performance metrics if available
-                for test_file in "$host_dir"/test_ESX_pg_*.out; do
+                for test_file in "$host_dir"/test_postgresql_pg_*.out; do
                     if [[ -f "$test_file" ]]; then
                         local tpm=$(grep -o "TPM.*[0-9]\+" "$test_file" 2>/dev/null | tail -1 || echo "TPM not found")
                         log_info "    $(basename "$test_file"): $tpm"
