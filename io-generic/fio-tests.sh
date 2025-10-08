@@ -12,6 +12,7 @@ DRY_RUN=false
 VERBOSE=false
 USE_VIRTCTL=""  # Default to auto-detection, can be forced with --ssh-only or --virtctl-only
 SKIP_CONFIRMATION=false
+PREPARE_MACHINE=false
 
 # Function to check if required tools are installed
 check_dependencies() {
@@ -633,7 +634,7 @@ install_dependencies() {
     local bg_pids=()
     for host in $VM_HOSTS; do
         execute_ssh_background "$host" \
-            "dnf update -y && dnf install -y fio xfsprogs util-linux" \
+            "dnf install -y fio xfsprogs util-linux" \
             "Installing FIO and filesystem tools"
         if [[ "$DRY_RUN" == "false" ]]; then
             bg_pids+=($!)
@@ -641,6 +642,35 @@ install_dependencies() {
     done
     
     wait_for_background_jobs "dependency installation" "${bg_pids[@]}"
+}
+
+# Prepare machines by installing FIO dependencies only
+prepare_machine() {
+    log_info "Preparing machines - installing FIO dependencies only..."
+    
+    # Check if FIO is already installed on each host
+    local bg_pids=()
+    for host in $VM_HOSTS; do
+        execute_ssh_background "$host" \
+            "# Check if FIO is already installed
+             if command -v fio &> /dev/null; then
+                 echo 'FIO is already installed on this host'
+                 fio --version
+             else
+                 echo 'Installing FIO and dependencies...'
+                 dnf install -y fio xfsprogs util-linux
+                 echo 'FIO installation completed'
+                 fio --version
+             fi" \
+            "Checking and installing FIO dependencies"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            bg_pids+=($!)
+        fi
+    done
+    
+    wait_for_background_jobs "FIO dependency preparation" "${bg_pids[@]}"
+    
+    log_info "Machine preparation completed - FIO dependencies are ready on all hosts"
 }
 
 # Prepare storage on VMs
@@ -1072,6 +1102,16 @@ main() {
     
     validate_inputs
     
+    # Handle prepare-machine mode
+    if [[ "$PREPARE_MACHINE" == "true" ]]; then
+        log_info "PREPARE MACHINE MODE: Installing FIO dependencies only"
+        prepare_machine
+        log_info "Machine preparation completed successfully"
+        log_info "FIO and dependencies are now installed on all hosts"
+        log_info "You can now run the full test suite without --prepare-machine"
+        return 0
+    fi
+    
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "DRY RUN MODE: Configuration validated successfully"
         log_info "Would execute the following steps:"
@@ -1144,7 +1184,7 @@ DESCRIPTION:
     Configuration is read from a YAML file.
 
 USAGE:
-    $0 [-h] [-c config_file] [-v] [--dry-run] [--ssh-only] [--virtctl-only] [--yes-i-mean-it]
+    $0 [-h] [-c config_file] [-v] [--dry-run] [--ssh-only] [--virtctl-only] [--yes-i-mean-it] [--prepare-machine]
 
 OPTIONS:
     -h                  Show this help message
@@ -1155,6 +1195,7 @@ OPTIONS:
     --virtctl-only      Force virtctl for all hosts (requires virtctl/oc access)
                         Default: Auto-detect host type (virtctl for VMs, SSH for regular hosts)
     --yes-i-mean-it     Skip confirmation prompt for device formatting (use with caution!)
+    --prepare-machine    Only install FIO dependencies on machines, skip all testing
 
 EXAMPLES:
     $0                          # Auto-detect: virtctl for VMs, SSH for regular hosts
@@ -1164,6 +1205,7 @@ EXAMPLES:
     $0 --virtctl-only           # Force virtctl for all hosts
     $0 --ssh-only --dry-run     # Test SSH mode without executing
     $0 --yes-i-mean-it          # Skip confirmation prompt (use with caution!)
+    $0 --prepare-machine        # Only install FIO dependencies, skip testing
 
 YAML CONFIGURATION:
     See fio-config.yaml for configuration file format and examples.
@@ -1216,6 +1258,10 @@ while [ $# -gt 0 ]; do
             ;;
         --yes-i-mean-it)
             SKIP_CONFIRMATION=true
+            shift
+            ;;
+        --prepare-machine)
+            PREPARE_MACHINE=true
             shift
             ;;
         *)
