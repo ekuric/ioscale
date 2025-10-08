@@ -193,31 +193,26 @@ def create_tpm_graphs(csv_file_path, output_dir, chart_type='scatter'):
                 plt.scatter(test_data['VM_Number'], test_data['TPM'], s=50, alpha=0.7)
             
             # Customize the graph (title will be updated later with machine count)
-            plt.xlabel('VM Number', fontsize=12, fontweight='bold')
+            plt.xlabel('Machines', fontsize=12, fontweight='bold')
             plt.ylabel('TPM (Transactions Per Minute)', fontsize=12, fontweight='bold')
             
-            # Set X-axis labels based on number of machines
+            # Calculate number of machines for title and X-axis labels
             num_machines = len(test_data['VM_Number'].unique())
-            if num_machines <= 10:
-                # Show every machine if 10 or fewer
-                plt.xticks(test_data['VM_Number'], [int(x) for x in test_data['VM_Number']], rotation=45, ha='right')
-            elif num_machines <= 50:
-                # Show every 5th machine if 11-50 machines
+            
+            # Set X-axis labels based on number of machines
+            if num_machines <= 20:
+                # Show all machine numbers if 20 or fewer
                 vm_numbers = sorted(test_data['VM_Number'].unique())
-                x_positions = range(0, len(vm_numbers), 5)
-                x_labels = [int(vm_numbers[i]) for i in x_positions]
-                plt.xticks(x_positions, x_labels, rotation=45, ha='right')
-            elif num_machines <= 100:
-                # Show every 10th machine if 51-100 machines
-                vm_numbers = sorted(test_data['VM_Number'].unique())
-                x_positions = range(0, len(vm_numbers), 10)
-                x_labels = [int(vm_numbers[i]) for i in x_positions]
-                plt.xticks(x_positions, x_labels, rotation=45, ha='right')
+                plt.xticks(vm_numbers, [int(x) for x in vm_numbers], rotation=45, ha='right')
             else:
-                # Show every 20th machine if more than 100 machines
+                # Show every 10th machine if more than 20 machines
                 vm_numbers = sorted(test_data['VM_Number'].unique())
-                x_positions = range(0, len(vm_numbers), 20)
-                x_labels = [int(vm_numbers[i]) for i in x_positions]
+                x_positions = []
+                x_labels = []
+                for i, vm_num in enumerate(vm_numbers):
+                    if (i + 1) % 10 == 1 or i == 0:  # 1st, 11th, 21st, etc.
+                        x_positions.append(vm_num)
+                        x_labels.append(int(vm_num))
                 plt.xticks(x_positions, x_labels, rotation=45, ha='right')
             
             # Add grid for better readability
@@ -386,29 +381,25 @@ def create_combined_tpm_graph(csv_file_path, output_dir, chart_type='scatter'):
                            label=test_type.replace('_', ' ').title(), color=color)
         
         # Customize the graph (title will be updated later with machine count)
-        plt.xlabel('VM Number', fontsize=12, fontweight='bold')
+        plt.xlabel('Machines', fontsize=12, fontweight='bold')
         plt.ylabel('TPM (Transactions Per Minute)', fontsize=12, fontweight='bold')
+        
+        # Calculate number of machines for title and X-axis labels
+        num_machines = len(df['VM_Number'].unique())
         
         # Set X-axis labels based on number of machines
         all_vm_numbers = sorted(df['VM_Number'].unique())
-        num_machines = len(all_vm_numbers)
-        if num_machines <= 10:
-            # Show every machine if 10 or fewer
+        if num_machines <= 20:
+            # Show all machine numbers if 20 or fewer
             plt.xticks(all_vm_numbers, [int(x) for x in all_vm_numbers], rotation=45, ha='right')
-        elif num_machines <= 50:
-            # Show every 5th machine if 11-50 machines
-            x_positions = range(0, len(all_vm_numbers), 5)
-            x_labels = [int(all_vm_numbers[i]) for i in x_positions]
-            plt.xticks(x_positions, x_labels, rotation=45, ha='right')
-        elif num_machines <= 100:
-            # Show every 10th machine if 51-100 machines
-            x_positions = range(0, len(all_vm_numbers), 10)
-            x_labels = [int(all_vm_numbers[i]) for i in x_positions]
-            plt.xticks(x_positions, x_labels, rotation=45, ha='right')
         else:
-            # Show every 20th machine if more than 100 machines
-            x_positions = range(0, len(all_vm_numbers), 20)
-            x_labels = [int(all_vm_numbers[i]) for i in x_positions]
+            # Show every 10th machine if more than 20 machines
+            x_positions = []
+            x_labels = []
+            for i, vm_num in enumerate(all_vm_numbers):
+                if (i + 1) % 10 == 1 or i == 0:  # 1st, 11th, 21st, etc.
+                    x_positions.append(vm_num)
+                    x_labels.append(int(vm_num))
             plt.xticks(x_positions, x_labels, rotation=45, ha='right')
         
         # Determine database type from filename
@@ -888,17 +879,29 @@ def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, ch
             
             # Customize the graph
             test_type_label = test_type.replace('_', ' ').title()
-            plt.xlabel('VM Number', fontsize=12, fontweight='bold')
+            plt.xlabel('Machines', fontsize=12, fontweight='bold')
             plt.ylabel('TPM (Transactions Per Minute)', fontsize=12, fontweight='bold')
             plt.title(f'{title_prefix} - {test_type_label}', fontsize=16, fontweight='bold', pad=20)
             
-            # Set x-axis labels for bar charts
-            if chart_type == 'bar' and test_data:
-                all_vm_numbers = set()
-                for df in test_data.values():
-                    all_vm_numbers.update(df['VM_Number'].unique())
-                all_vm_numbers = sorted(all_vm_numbers)
+            # Set X-axis labels based on number of machines
+            all_vm_numbers = set()
+            for df in test_data.values():
+                all_vm_numbers.update(df['VM_Number'].unique())
+            all_vm_numbers = sorted(all_vm_numbers)
+            num_machines = len(all_vm_numbers)
+            
+            if num_machines <= 20:
+                # Show all machine numbers if 20 or fewer
                 plt.xticks(all_vm_numbers, [int(x) for x in all_vm_numbers], rotation=45, ha='right')
+            else:
+                # Show every 10th machine if more than 20 machines
+                x_positions = []
+                x_labels = []
+                for i, vm_num in enumerate(all_vm_numbers):
+                    if (i + 1) % 10 == 1 or i == 0:  # 1st, 11th, 21st, etc.
+                        x_positions.append(vm_num)
+                        x_labels.append(int(vm_num))
+                plt.xticks(x_positions, x_labels, rotation=45, ha='right')
             
             # Add grid and legend
             plt.grid(True, alpha=0.3)
