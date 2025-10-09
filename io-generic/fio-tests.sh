@@ -13,6 +13,7 @@ VERBOSE=false
 USE_VIRTCTL=""  # Default to auto-detection, can be forced with --ssh-only or --virtctl-only
 SKIP_CONFIRMATION=false
 PREPARE_MACHINE=false
+DESCRIPTION=""
 
 # Function to check if required tools are installed
 check_dependencies() {
@@ -317,6 +318,31 @@ get_device_for_host() {
     return 1
 }
 
+# Function to sanitize description for use in filenames
+sanitize_description() {
+    local desc="$1"
+    
+    # If description is empty, return empty string
+    if [[ -z "$desc" ]]; then
+        echo ""
+        return 0
+    fi
+    
+    # Convert to lowercase
+    desc=$(echo "$desc" | tr '[:upper:]' '[:lower:]')
+    
+    # Replace spaces and special characters with underscores
+    desc=$(echo "$desc" | sed 's/[^a-z0-9]/_/g')
+    
+    # Remove multiple consecutive underscores
+    desc=$(echo "$desc" | sed 's/__*/_/g')
+    
+    # Remove leading/trailing underscores
+    desc=$(echo "$desc" | sed 's/^_*//;s/_*$//')
+    
+    echo "$desc"
+}
+
 # Function to read YAML configuration
 read_config() {
     local config_file="$1"
@@ -358,6 +384,7 @@ read_config() {
     # Output Configuration
     OUTPUT_DIR=$(yq eval '.output.directory' "$config_file")
     OUTPUT_FORMAT=$(yq eval '.output.format' "$config_file")
+    DESCRIPTION=$(yq eval '.description' "$config_file")
     
     # Handle null values
     if [[ "$NAMESPACE" == "null" ]]; then
@@ -374,6 +401,9 @@ read_config() {
     fi
     if [[ "$OUTPUT_FORMAT" == "null" ]]; then
         OUTPUT_FORMAT="json+"
+    fi
+    if [[ "$DESCRIPTION" == "null" ]] || [[ -z "$DESCRIPTION" ]]; then
+        DESCRIPTION=""
     fi
 }
 
@@ -517,6 +547,9 @@ display_config() {
     log_info "Direct I/O: $DIRECT_IO"
     log_info "Rate I/O limit: $RATE_IOPS"
     log_info "Output directory: $OUTPUT_DIR"
+    if [[ -n "$DESCRIPTION" ]]; then
+        log_info "Test description: $DESCRIPTION"
+    fi
 }
 
 # Debug configuration parsing
@@ -886,7 +919,20 @@ run_fio_tests() {
 
 # Collect test results
 collect_results() {
-    local results_dir="${1:-./fio-results-$(date +%Y%m%d-%H%M%S)-machines_$(echo $VM_HOSTS | wc -w)}"
+    # Create default directory name with description if not provided
+    if [[ -z "$1" ]]; then
+        local results_timestamp=$(date +%Y%m%d-%H%M%S)
+        local machine_count=$(echo $VM_HOSTS | wc -w)
+        local sanitized_desc=$(sanitize_description "$DESCRIPTION")
+        
+        if [[ -n "$sanitized_desc" ]]; then
+            local results_dir="./fio-results-$results_timestamp-$sanitized_desc-machines_$machine_count"
+        else
+            local results_dir="./fio-results-$results_timestamp-machines_$machine_count"
+        fi
+    else
+        local results_dir="$1"
+    fi
     
     log_info "Collecting test results..."
     mkdir -p "$results_dir"
@@ -1164,7 +1210,14 @@ main() {
     # Collect results - create directory name once
     local results_timestamp=$(date +%Y%m%d-%H%M%S)
     local machine_count=$(echo $VM_HOSTS | wc -w)
-    local final_results_dir="./fio-results-$results_timestamp-machines_$machine_count"
+    local sanitized_desc=$(sanitize_description "$DESCRIPTION")
+    
+    # Build directory name with optional description
+    if [[ -n "$sanitized_desc" ]]; then
+        local final_results_dir="./fio-results-$results_timestamp-$sanitized_desc-machines_$machine_count"
+    else
+        local final_results_dir="./fio-results-$results_timestamp-machines_$machine_count"
+    fi
     
     collect_results "$final_results_dir"
     cleanup_storage
@@ -1209,6 +1262,7 @@ EXAMPLES:
 
 YAML CONFIGURATION:
     See fio-config.yaml for configuration file format and examples.
+    Optional 'description' field will be included in output directory names.
 
 NOTES:
     - Requires 'yq' tool for YAML parsing
