@@ -1,6 +1,8 @@
 # FIO Remote Testing Configuration
 # This YAML file configures all aspects of the FIO performance testing script
 
+description: "this is new test" 
+
 # Virtual Machine Configuration
 vm:
   hosts: "vm1"                   # Space-separated list of VM hostnames to test
