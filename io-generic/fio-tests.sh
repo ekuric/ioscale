@@ -934,19 +934,48 @@ collect_results() {
         local results_dir="$1"
     fi
     
-    log_info "Collecting test results..."
+    local machine_count=$(echo $VM_HOSTS | wc -w)
+    log_info "Collecting test results in parallel from $machine_count hosts..."
     mkdir -p "$results_dir"
     
+    # Pre-create all host directories to avoid race conditions
     for host in $VM_HOSTS; do
         local host_dir="$results_dir/$host"
         mkdir -p "$host_dir"
+    done
+    
+    log_info "Pre-created directories for all $machine_count hosts, starting parallel collection..."
+    
+    # Start parallel collection for all hosts
+    local bg_pids=()
+    local host_counter=0
+    for host in $VM_HOSTS; do
+        local host_dir="$results_dir/$host"
+        host_counter=$((host_counter + 1))
+        log_info "Starting collection job $host_counter/$machine_count for host: $host"
         
-        log_info "Collecting results from $host..."
-        
-        # Create results archive on VM
-        execute_ssh "$host" \
+        # Start background collection for this host using execute_ssh_background
+        execute_ssh_background "$host" \
             "cd $OUTPUT_DIR && tar czf fio-results.tar.gz *.json" \
-            "Creating results archive"
+            "Creating results archive for $host"
+        if [[ "$DRY_RUN" == "false" ]]; then
+            local pid=$!
+            if [[ -n "$pid" ]]; then
+                bg_pids+=("$pid")
+            fi
+        fi
+    done
+    
+    # Wait for all tar creation jobs to complete
+    wait_for_background_jobs "results archive creation" "${bg_pids[@]}"
+    
+    # Now copy the results in parallel
+    bg_pids=()
+    host_counter=0
+    for host in $VM_HOSTS; do
+        local host_dir="$results_dir/$host"
+        host_counter=$((host_counter + 1))
+        log_info "Starting copy job $host_counter/$machine_count for host: $host"
         
         # Copy results from VM to localhost using virtctl scp
         if [[ "$DRY_RUN" == "true" ]]; then
@@ -956,63 +985,103 @@ collect_results() {
             local scp_cmd
             scp_cmd=$(get_scp_command "root@vmi/$host:$OUTPUT_DIR/fio-results.tar.gz" "$host_dir/fio-results.tar.gz")
             
-            if eval "$scp_cmd" 2>/dev/null; then
-                log_info "Successfully copied results from $host using virtctl scp"
-                
-                # Extract results locally for easier access
-                if command -v tar &> /dev/null; then
-                    cd "$host_dir"
-                    if tar -xzf fio-results.tar.gz; then
-                        log_info "Extracted results for $host"
-                        # Remove the tar file to save space, keep extracted JSON files
-                        rm -f fio-results.tar.gz
-                    else
-                        log_warn "Failed to extract results for $host, keeping tar file"
-                    fi
-                    cd - > /dev/null
-                fi
-            else
-                log_warn "virtctl scp failed, trying alternative method..."
-                # Fallback: use ssh with cat to copy file
-                local ssh_cmd
-                ssh_cmd=$(get_ssh_command "$host" "cat $OUTPUT_DIR/fio-results.tar.gz")
-                
-                if eval "$ssh_cmd" > "$host_dir/fio-results.tar.gz" 2>/dev/null; then
-                    log_info "Successfully copied results from $host using ssh+cat fallback"
+            # Use background execution for the copy operation
+            (
+                if eval "$scp_cmd" 2>/dev/null; then
+                    log_info "Successfully copied results from $host using virtctl scp"
                     
-                    # Extract results locally
+                    # Extract results locally for easier access
                     if command -v tar &> /dev/null; then
-                        cd "$host_dir"
-                        if tar -xzf fio-results.tar.gz; then
-                            log_info "Extracted results for $host"
-                            rm -f fio-results.tar.gz
+                        local original_dir=$(pwd)
+                        if cd "$host_dir" 2>/dev/null; then
+                            if tar -xzf fio-results.tar.gz; then
+                                log_info "Extracted results for $host"
+                                # Remove the tar file to save space, keep extracted JSON files
+                                rm -f fio-results.tar.gz
+                            else
+                                log_warn "Failed to extract results for $host, keeping tar file"
+                            fi
+                            cd "$original_dir" 2>/dev/null || true
                         else
-                            log_warn "Failed to extract results for $host, keeping tar file"
+                            log_warn "Failed to change to directory $host_dir"
                         fi
-                        cd - > /dev/null
                     fi
                 else
-                    log_error "Failed to copy results from $host using both methods"
-                    log_info "Results are still available on $host at $OUTPUT_DIR/fio-results.tar.gz"
-                    if [[ "$USE_VIRTCTL" == "true" ]]; then
-                        log_info "Manual copy command: virtctl -n $NAMESPACE ssh root@vmi/$host -c 'cat $OUTPUT_DIR/fio-results.tar.gz' > $host_dir/fio-results.tar.gz"
+                    log_warn "virtctl scp failed for $host, trying alternative method..."
+                    # Fallback: use ssh with cat to copy file
+                    local ssh_cmd
+                    ssh_cmd=$(get_ssh_command "$host" "cat $OUTPUT_DIR/fio-results.tar.gz")
+                    
+                    if eval "$ssh_cmd" > "$host_dir/fio-results.tar.gz" 2>/dev/null; then
+                        log_info "Successfully copied results from $host using ssh+cat fallback"
+                        
+                        # Extract results locally
+                        if command -v tar &> /dev/null; then
+                            local original_dir=$(pwd)
+                            if cd "$host_dir" 2>/dev/null; then
+                                if tar -xzf fio-results.tar.gz; then
+                                    log_info "Extracted results for $host"
+                                    rm -f fio-results.tar.gz
+                                else
+                                    log_warn "Failed to extract results for $host, keeping tar file"
+                                fi
+                                cd "$original_dir" 2>/dev/null || true
+                            else
+                                log_warn "Failed to change to directory $host_dir"
+                            fi
+                        fi
                     else
-                        log_info "Manual copy command: ssh root@$host 'cat $OUTPUT_DIR/fio-results.tar.gz' > $host_dir/fio-results.tar.gz"
+                        log_error "Failed to copy results from $host using both methods"
+                        log_info "Results are still available on $host at $OUTPUT_DIR/fio-results.tar.gz"
+                        if [[ "$USE_VIRTCTL" == "true" ]]; then
+                            log_info "Manual copy command: virtctl -n $NAMESPACE ssh root@vmi/$host -c 'cat $OUTPUT_DIR/fio-results.tar.gz' > $host_dir/fio-results.tar.gz"
+                        else
+                            log_info "Manual copy command: ssh root@$host 'cat $OUTPUT_DIR/fio-results.tar.gz' > $host_dir/fio-results.tar.gz"
+                        fi
                     fi
                 fi
+                
+                log_info "Completed collection from $host"
+            ) &
+            local pid=$!
+            if [[ -n "$pid" ]]; then
+                bg_pids+=("$pid")
             fi
         fi
     done
     
+    # Wait for all parallel collection jobs to complete
+    local start_time=$(date +%s)
+    wait_for_background_jobs "parallel results collection" "${bg_pids[@]}"
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
     if [[ "$DRY_RUN" == "false" ]]; then
+        log_info "Parallel collection completed in ${duration} seconds for $machine_count hosts"
         log_info "All results collected in: $results_dir"
         log_info "Results structure:"
         if command -v tree &> /dev/null; then
-            tree "$results_dir" 2>/dev/null || ls -la "$results_dir"/*
+            if tree "$results_dir" 2>/dev/null; then
+                true  # tree succeeded
+            else
+                # tree failed, try ls
+                if ls -la "$results_dir"/* 2>/dev/null; then
+                    true  # ls succeeded
+                else
+                    log_warn "No files found in results directory"
+                fi
+            fi
         else
-            find "$results_dir" -type f -name "*.json" | head -10
-            local total_files=$(find "$results_dir" -type f -name "*.json" | wc -l)
-            log_info "Total JSON result files: $total_files"
+            local json_files
+            json_files=$(find "$results_dir" -type f -name "*.json" 2>/dev/null)
+            if [[ -n "$json_files" ]]; then
+                echo "$json_files" | head -10
+                local total_files
+                total_files=$(echo "$json_files" | wc -l)
+                log_info "Total JSON result files: $total_files"
+            else
+                log_warn "No JSON files found in results directory"
+            fi
         fi
     fi
 }
