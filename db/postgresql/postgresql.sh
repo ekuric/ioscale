@@ -9,6 +9,7 @@ set -euo pipefail  # Exit on error, undefined vars, pipe failures
 # Default configuration file
 CONFIG_FILE="config.yaml"
 DRY_RUN=false
+PREPARE_HOSTS=false
 
 # Function to extract VM number from hostname
 get_vm_number() {
@@ -230,18 +231,21 @@ DESCRIPTION:
     Configuration is read from a YAML file instead of command line arguments.
 
 USAGE:
-    $0 [-h] [-c config_file] [-v] [--dry-run]
+    $0 [-h] [-c config_file] [-v] [--dry-run] [--prepare-hosts]
 
 OPTIONS:
     -h                  Show this help message
     -c <config_file>    Path to YAML configuration file (default: config.yaml)
     -v                  Verbose output
     --dry-run           Validate configuration and show what would be done without executing
+    --prepare-hosts     Only run preparation steps (install packages, git clone, PostgreSQL setup)
 
 EXAMPLES:
     $0                          # Use default config.yaml
     $0 -c test-config.yaml      # Use custom configuration file
     $0 -c config.yaml -v        # Use default config with verbose output
+    $0 --prepare-hosts          # Only prepare hosts (install packages, PostgreSQL)
+    $0 --prepare-hosts -v       # Prepare hosts with verbose output
 
 YAML CONFIGURATION:
     See config.yaml for configuration file format and examples.
@@ -250,6 +254,13 @@ NOTES:
     - Requires 'yq' tool for YAML parsing
     - Script requires virtctl for VM access
     - All operations are performed as root on target VMs
+
+WORKFLOW:
+    For large deployments, you can split the process into two phases:
+    1. Preparation: ./postgresql.sh --prepare-hosts    # Install packages, PostgreSQL
+    2. Testing:     ./postgresql.sh                   # Run performance tests
+    
+    This allows you to prepare all hosts first, then run tests when ready.
 EOF
 }
 
@@ -828,9 +839,51 @@ stop_postgresql() {
     fi
 }
 
+# Preparation-only function
+prepare_hosts() {
+    log_info "=== HOST PREPARATION MODE ==="
+    log_info "Starting host preparation phase"
+    log_info "This will install packages, clone repositories, and setup PostgreSQL"
+    log_info "Performance tests will NOT be executed"
+    
+    check_dependencies
+    read_config "$CONFIG_FILE"
+    display_config
+    validate_inputs
+    
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "DRY RUN MODE: Host preparation configuration validated successfully"
+        log_info "Would execute the following preparation steps:"
+        log_info "  1. Install dependencies on VMs"
+        log_info "  2. Deploy HammerDB scripts"
+        log_info "  3. Install PostgreSQL"
+        log_info "Use without --dry-run to execute the actual preparation"
+        return 0
+    fi
+    
+    log_info "Running host preparation steps..."
+    install_dependencies
+    deploy_scripts
+    install_postgresql
+    
+    log_info "=== HOST PREPARATION COMPLETED ==="
+    log_info "Host preparation completed successfully"
+    log_info "All hosts are now ready for performance testing"
+    log_info ""
+    log_info "Next steps:"
+    log_info "  1. Run the script without --prepare-hosts to execute performance tests"
+    log_info "  2. Or run with --dry-run to validate the test configuration"
+    log_info ""
+    log_info "Example: $0 -c $CONFIG_FILE  # Run full performance test"
+}
+
 # Main function
 main() {
-    log_info "Starting PostgreSQL HammerDB TPCC testing script"
+    if [[ "$PREPARE_HOSTS" == "true" ]]; then
+        log_info "Starting PostgreSQL HammerDB TPCC testing script (PREPARATION MODE)"
+    else
+        log_info "Starting PostgreSQL HammerDB TPCC testing script (FULL TEST MODE)"
+    fi
     
     check_dependencies
     read_config "$CONFIG_FILE"
@@ -839,18 +892,31 @@ main() {
     
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "DRY RUN MODE: Configuration validated successfully"
-        log_info "Would execute the following steps:"
-        log_info "  1. Install dependencies on VMs"
-        log_info "  2. Deploy HammerDB scripts"
-        log_info "  3. Install PostgreSQL"
-        log_info "  4. Build TPCC database"
-        log_info "  5. Run performance tests"
-        log_info "  6. Collect test results from all VMs"
-        log_info "  7. Stop PostgreSQL instances and cleanup storage"
+        if [[ "$PREPARE_HOSTS" == "true" ]]; then
+            log_info "Would execute the following preparation steps:"
+            log_info "  1. Install dependencies on VMs"
+            log_info "  2. Deploy HammerDB scripts"
+            log_info "  3. Install PostgreSQL"
+        else
+            log_info "Would execute the following steps:"
+            log_info "  1. Install dependencies on VMs"
+            log_info "  2. Deploy HammerDB scripts"
+            log_info "  3. Install PostgreSQL"
+            log_info "  4. Build TPCC database"
+            log_info "  5. Run performance tests"
+            log_info "  6. Collect test results from all VMs"
+            log_info "  7. Stop PostgreSQL instances and cleanup storage"
+        fi
         log_info "Use without --dry-run to execute the actual tests"
         return 0
     fi
     
+    if [[ "$PREPARE_HOSTS" == "true" ]]; then
+        prepare_hosts
+        return 0
+    fi
+    
+    # Full test execution
     install_dependencies
     deploy_scripts
     install_postgresql
@@ -886,6 +952,10 @@ while [ $# -gt 0 ]; do
             ;;
         --dry-run)
             DRY_RUN=true
+            shift
+            ;;
+        --prepare-hosts)
+            PREPARE_HOSTS=true
             shift
             ;;
         *)
