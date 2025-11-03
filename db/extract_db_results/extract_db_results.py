@@ -12,25 +12,33 @@ Supports both:
 - MariaDB: Files containing "test_mariadb" and "MySQL TPM" results
 
 Usage:
-    # Single directory processing
-    python3 extract_db_results.py [input_directory] [output_directory]
+    # Single directory processing (new recommended syntax)
+    python3 extract_db_results.py --input-dir input_directory --output-dir output_directory
     
-    # Multiple directories with comparison graphs
-    python3 extract_db_results.py dir1 dir2 dir3 output_directory
+    # Multiple directories with comparison graphs (new recommended syntax)
+    python3 extract_db_results.py --input-dir dir1 --input-dir dir2 --input-dir dir3 --output-dir output_directory
     
     # Force comparison graphs even with single directory
-    python3 extract_db_results.py --compare [input_directory] [output_directory]
+    python3 extract_db_results.py --input-dir input_directory --output-dir output_directory --compare
     
     # Choose chart type (scatter, line, or bar)
-    python3 extract_db_results.py --chart-type bar [input_directory] [output_directory]
+    python3 extract_db_results.py --input-dir input_directory --output-dir output_directory --chart-type bar
+    
+    # Legacy syntax (still supported for backward compatibility)
+    python3 extract_db_results.py [input_directory] [output_directory]
+    python3 extract_db_results.py dir1 dir2 dir3 output_directory
 
 Arguments:
-    input_directories: One or more directories containing subdirectories with .out files (default: postgresql-results-20250828-140741)
-    output_directory: Directory to save CSV and PNG output files (default: postgresql_analysis)
+    --input-dir: Input directory containing subdirectories with .out files (can be specified multiple times)
+    --output-dir: Directory to save CSV and PNG output files (default: postgresql_analysis)
     --compare: Force creation of comparison graphs
     --chart-type: Type of chart to create - scatter (dots only), line (with connections), or bar (default: scatter)
+    
+    Legacy positional arguments (deprecated):
+    input_directories: One or more directories containing subdirectories with .out files (default: postgresql-results-20250828-140741)
+    output_directory: Directory to save CSV and PNG output files (default: postgresql_analysis)
 
-Note: When multiple arguments are provided, the last argument is treated as the output directory.
+Note: The new --input-dir and --output-dir options are recommended. Legacy positional arguments are still supported for backward compatibility.
 
 Output Files:
     - {database}_detailed_results.csv: All individual results (postgresql_ or mariadb_)
@@ -924,8 +932,12 @@ def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, ch
 
 def main():
     parser = argparse.ArgumentParser(description='Extract PostgreSQL and MariaDB benchmark results')
-    parser.add_argument('args', nargs='*', default=['postgresql-results-20250828-140741'],
-                       help='Input directories and optional output directory (default: postgresql-results-20250828-140741)')
+    parser.add_argument('args', nargs='*', default=[],
+                       help='Input directories and optional output directory (deprecated: use --input-dir and --output-dir instead)')
+    parser.add_argument('--input-dir', action='append', dest='input_dirs',
+                       help='Input directory containing database result files (can be specified multiple times)')
+    parser.add_argument('--output-dir', default='postgresql_analysis',
+                       help='Output directory for CSV and PNG files (default: postgresql_analysis)')
     parser.add_argument('--compare', action='store_true',
                        help='Create comparison graphs when multiple input directories are provided')
     parser.add_argument('--chart-type', choices=['scatter', 'line', 'bar'], default='scatter',
@@ -933,19 +945,25 @@ def main():
     
     args = parser.parse_args()
     
-    # Parse input directories and output directory from positional arguments
-    if len(args.args) == 0:
+    # Determine input directories and output directory
+    if args.input_dirs:
+        # Use --input-dir arguments
+        input_dirs = args.input_dirs
+        output_dir = args.output_dir
+    elif args.args:
+        # Fall back to positional arguments for backward compatibility
+        if len(args.args) == 1:
+            # One argument: treat as input directory, use default output
+            input_dirs = args.args
+            output_dir = args.output_dir
+        else:
+            # Multiple arguments: last one is output directory, rest are input directories
+            input_dirs = args.args[:-1]
+            output_dir = args.args[-1]
+    else:
         # No arguments provided, use defaults
         input_dirs = ['postgresql-results-20250828-140741']
-        output_dir = 'postgresql_analysis'
-    elif len(args.args) == 1:
-        # One argument: treat as input directory, use default output
-        input_dirs = args.args
-        output_dir = 'postgresql_analysis'
-    else:
-        # Multiple arguments: last one is output directory, rest are input directories
-        input_dirs = args.args[:-1]
-        output_dir = args.args[-1]
+        output_dir = args.output_dir
     
     # Validate input directories
     valid_dirs = []
