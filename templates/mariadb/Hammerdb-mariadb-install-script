@@ -51,8 +51,6 @@ echo "/usr/local/HammerDB" >> input
 ./HammerDB-3.2-Linux-x86-64-Install < input
 
 ### Shutdown all running instances
-systemctl stop mssql-server
-systemctl stop postgresql
 systemctl stop mariadb
 
 # Installing Mariadb Server and tools

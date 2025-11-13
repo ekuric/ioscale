@@ -44,9 +44,7 @@ done
 setenforce 0
 
 ### Shutdown any running databases
-systemctl stop mssql-server
 systemctl stop postgresql
-systemctl stop mariadb
 
 cd /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/
 tar xf hammerdb-tpcc.tar
