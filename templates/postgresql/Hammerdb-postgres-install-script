@@ -1,108 +1,351 @@
-disks=none
-mountpoint=none
+#!/bin/bash
+#
+# HammerDB PostgreSQL Installation Script
+# This script installs HammerDB and configures PostgreSQL for TPCC testing
+#
+# Usage: ./Hammerdb-postgres-install-script [-h] [-d disk_device] [-m mount_point]
+#
+# Options:
+#   -h              Show this help message
+#   -d <device>     Block device to format and mount (e.g., /dev/sdb)
+#   -m <mountpoint> Existing mount point to use (e.g., /perf1)
+#
+# Examples:
+#   ./Hammerdb-postgres-install-script -d '/dev/sdb'
+#   ./Hammerdb-postgres-install-script -m '/perf1'
 
-usage()
-{
-  echo "Usage:
-        ./Hammerdb-postgres-install-script [-h] [-d disk name] [-m mount point] 
+set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
-        Usage:
-        -h help
-        -d <disk device name>
-        -m <mount point>
+# ============================================================================
+# Configuration Variables
+# ============================================================================
+DISKS="none"
+MOUNTPOINT="none"
+HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts"
+HAMMERDB_INSTALL_DIR="/usr/local/HammerDB"
+POSTGRES_PASSWORD="postgres"
+DEFAULT_MOUNTPOINT="/perf1"
+POSTGRES_DATA_DIR="/var/lib/pgsql/data"
 
+# ============================================================================
+# Functions
+# ============================================================================
 
-       Examples:
-        ./Hammerdb-postgres-install-script -d '/dev/sdb' 
-        ./Hammerdb-postgres-install-script -d '/perf1' 
-  "
+usage() {
+    cat << EOF
+Usage: $0 [-h] [-d disk_device] [-m mount_point]
+
+Options:
+    -h              Show this help message
+    -d <device>     Block device to format and mount (e.g., /dev/sdb)
+    -m <mountpoint> Existing mount point to use (e.g., /perf1)
+
+Examples:
+    $0 -d '/dev/sdb'
+    $0 -m '/perf1'
+
+Note: Either -d or -m must be specified, but not both.
+EOF
 }
-if [ $# -eq 0 ]
-then
-    usage;
-    exit;
+
+error_exit() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_step() {
+    echo ""
+    echo "============================================================================"
+    echo "STEP: $1"
+    echo "============================================================================"
+}
+
+# ============================================================================
+# Parse Command Line Arguments
+# ============================================================================
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
 fi
 
-while [ $# -gt 0 ]
-do
-case $1 in
-        -h) usage;
-            exit;
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h|--help)
+            usage
+            exit 0
             ;;
-        -d) disks=$2
+        -d)
+            DISKS="$2"
             shift 2
             ;;
-        -m) mountpoint=$2
+        -m)
+            MOUNTPOINT="$2"
             shift 2
             ;;
-         *) usage;
-            exit;
+        *)
+            echo "ERROR: Unknown option: $1" >&2
+            usage
+            exit 1
             ;;
-esac
+    esac
 done
 
-setenforce 0
+# Validate arguments
+if [[ "$MOUNTPOINT" == "none" && "$DISKS" == "none" ]]; then
+    error_exit "Either -d (disk device) or -m (mount point) must be specified"
+fi
 
-### Shutdown any running databases
-systemctl stop postgresql
+if [[ "$MOUNTPOINT" != "none" && "$DISKS" != "none" ]]; then
+    error_exit "Cannot specify both -d and -m options. Use either disk device or mount point."
+fi
 
-cd /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/
-tar xf hammerdb-tpcc.tar
-cd /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/Hammerdb
+# ============================================================================
+# Main Installation Process
+# ============================================================================
+
+log_step "Starting PostgreSQL and HammerDB Installation"
+
+# ----------------------------------------------------------------------------
+# Step 1: Disable SELinux
+# ----------------------------------------------------------------------------
+log_step "Disabling SELinux"
+setenforce 0 || log_info "SELinux already disabled or not available"
+
+# ----------------------------------------------------------------------------
+# Step 2: Stop PostgreSQL
+# ----------------------------------------------------------------------------
+log_step "Stopping Existing PostgreSQL Instances"
+log_info "Stopping PostgreSQL service..."
+systemctl stop postgresql || log_info "PostgreSQL was not running"
+
+# ----------------------------------------------------------------------------
+# Step 3: Install HammerDB
+# ----------------------------------------------------------------------------
+log_step "Installing HammerDB"
+
+if [ ! -d "${HAMMERDB_PATH}/templates/mariadb" ]; then
+    error_exit "HammerDB templates directory not found: ${HAMMERDB_PATH}/templates/mariadb"
+fi
+
+cd "${HAMMERDB_PATH}/templates/mariadb" || error_exit "Cannot change to HammerDB templates directory"
+
+if [ ! -f "hammerdb-tpcc.tar" ]; then
+    error_exit "HammerDB tar archive not found: hammerdb-tpcc.tar"
+fi
+
+log_info "Extracting HammerDB archive..."
+tar xf hammerdb-tpcc.tar || error_exit "Failed to extract hammerdb-tpcc.tar"
+
+cd "${HAMMERDB_PATH}/templates/mariadb/Hammerdb" || error_exit "Cannot change to HammerDB directory"
+
+log_info "Running HammerDB installer..."
 unset DISPLAY
 echo "y" > input
-echo "/usr/local/HammerDB" >> input
-./HammerDB-3.2-Linux-x86-64-Install < input
+echo "${HAMMERDB_INSTALL_DIR}" >> input
+./HammerDB-3.2-Linux-x86-64-Install < input || error_exit "HammerDB installation failed"
 
-# Installing Postgres Server and tools
-dnf -y install postgresql.x86_64 postgresql-contrib.x86_64 postgresql-server.x86_64 glibc-langpack-en libpq
+# ----------------------------------------------------------------------------
+# Step 4: Install PostgreSQL Packages
+# ----------------------------------------------------------------------------
+log_step "Installing PostgreSQL Packages"
 
+log_info "Installing PostgreSQL and related packages..."
+dnf -y install postgresql.x86_64 postgresql-contrib.x86_64 postgresql-server.x86_64 glibc-langpack-en libpq || \
+    error_exit "Failed to install PostgreSQL packages"
 
-cd /usr/local/HammerDB
-cp -R /tmp/hammerdb-tpcc/postgres/* .
+# ----------------------------------------------------------------------------
+# Step 5: Copy PostgreSQL Setup Files
+# ----------------------------------------------------------------------------
+log_step "Copying PostgreSQL Configuration Files"
 
-if [[ $mountpoint == *"none"* ]]; then
-  echo "using disk option"
-  umount /perf1
-  mkfs.xfs -f ${disks}
-  mkdir -p /perf1
-  mount ${disks} /perf1
-  mountpoint="/perf1"
+cd "${HAMMERDB_INSTALL_DIR}" || error_exit "Cannot change to HammerDB install directory"
+
+# Try multiple possible locations for PostgreSQL setup files
+if [ -d "/tmp/hammerdb-tpcc/postgres" ]; then
+    log_info "Copying PostgreSQL files from /tmp/hammerdb-tpcc/postgres..."
+    cp -R /tmp/hammerdb-tpcc/postgres/* . || log_info "Warning: Some files may not have been copied"
+elif [ -d "${HAMMERDB_PATH}/templates/postgresql/postgresqlsetup" ]; then
+    log_info "Copying PostgreSQL files from templates/postgresql/postgresqlsetup..."
+    cp -R "${HAMMERDB_PATH}/templates/postgresql/postgresqlsetup/"* . 2>/dev/null || \
+        log_info "Warning: Some files may not have been copied"
 else
-  echo "using mountpoint option"
-  echo ${mountpoint}
+    log_info "Warning: PostgreSQL setup files directory not found, continuing without copying"
 fi
 
-rm -rf /var/lib/pgsql/data
-rm -rf ${mountpoint}/postgres_data
+# ----------------------------------------------------------------------------
+# Step 6: Setup Storage (Disk Formatting or Mount Point)
+# ----------------------------------------------------------------------------
+log_step "Setting Up Storage"
 
-mkdir -p ${mountpoint}/postgres_data
-ln -sf ${mountpoint}/postgres_data /var/lib/pgsql/data
-chmod 700 ${mountpoint}/postgres_data
-chown -R postgres:postgres ${mountpoint}/postgres_data
-
-postgresql-setup --initdb --unit postgresql
-
-sleep 20 
-
-totmem=`cat /proc/meminfo |grep "MemTotal:" | awk '{print $2}'`
-
-# Change shared_buffer size based on available memory
-totmem_MB=`expr $totmem / 1024`
-totmem_BP=`expr $totmem_MB / 2`   # Buffer pool is half of physical memory
-## IF total memory is more than 128G then bufferpool is set to 64G else set to half of physical memory
-if [ ${totmem_BP} -lt 64000 ]
-then
-   sed -i "s/^shared_buffers =.*/shared_buffers = ${totmem_BP}MB/" /root/hammerdb-tpcc-wrapper-scripts/templates/postgresql/postgresqlsetup/postgresql.conf
+if [[ "$MOUNTPOINT" == *"none"* ]]; then
+    # Using disk device option - format and mount
+    log_info "Using disk device option: ${DISKS}"
+    
+    if [ ! -b "${DISKS}" ]; then
+        error_exit "Disk device ${DISKS} does not exist or is not a block device"
+    fi
+    
+    log_info "Unmounting existing mount (if any)..."
+    umount /perf1 2>/dev/null || log_info "No existing mount to unmount"
+    
+    log_info "Formatting disk ${DISKS} with XFS..."
+    mkfs.xfs -f "${DISKS}" || error_exit "Failed to format disk ${DISKS}"
+    
+    log_info "Creating mount point..."
+    mkdir -p "${DEFAULT_MOUNTPOINT}" || error_exit "Failed to create mount point"
+    
+    log_info "Mounting ${DISKS} to ${DEFAULT_MOUNTPOINT}..."
+    mount "${DISKS}" "${DEFAULT_MOUNTPOINT}" || error_exit "Failed to mount ${DISKS}"
+    
+    MOUNTPOINT="${DEFAULT_MOUNTPOINT}"
 else
-   sed -i "s/^shared_buffers =.*/shared_buffers = 64000MB/" /root/hammerdb-tpcc-wrapper-scripts/templates/postgresql/postgresqlsetup/postgresql.conf
+    # Using existing mount point
+    log_info "Using mount point option: ${MOUNTPOINT}"
+    
+    if [ ! -d "${MOUNTPOINT}" ]; then
+        error_exit "Mount point directory does not exist: ${MOUNTPOINT}"
+    fi
 fi
 
-/usr/bin/cp -f /root/hammerdb-tpcc-wrapper-scripts/templates/postgresql/postgresqlsetup/pg_hba.conf /var/lib/pgsql/data
-/usr/bin/cp -f /root/hammerdb-tpcc-wrapper-scripts/templates/postgresql/postgresqlsetup/postgresql.conf /var/lib/pgsql/data
-systemctl restart postgresql
-echo "alter role postgres password 'postgres'" > input
+# ----------------------------------------------------------------------------
+# Step 7: Create PostgreSQL Data Directory
+# ----------------------------------------------------------------------------
+log_step "Creating PostgreSQL Data Directory"
 
-psql -U postgres -d postgres < input
+log_info "Removing existing PostgreSQL data directories..."
+rm -rf "${POSTGRES_DATA_DIR}" 2>/dev/null || log_info "No existing data directory to remove"
+rm -rf "${MOUNTPOINT}/postgres_data" 2>/dev/null || log_info "No existing postgres_data directory to remove"
+
+log_info "Creating PostgreSQL data directory..."
+mkdir -p "${MOUNTPOINT}/postgres_data" || error_exit "Failed to create PostgreSQL data directory"
+
+log_info "Creating symbolic link from ${POSTGRES_DATA_DIR} to ${MOUNTPOINT}/postgres_data..."
+ln -sf "${MOUNTPOINT}/postgres_data" "${POSTGRES_DATA_DIR}" || \
+    error_exit "Failed to create symbolic link"
+
+log_info "Setting permissions on PostgreSQL data directory..."
+chmod 700 "${MOUNTPOINT}/postgres_data" || error_exit "Failed to set permissions"
+chown -R postgres:postgres "${MOUNTPOINT}/postgres_data" || error_exit "Failed to set ownership"
+
+# ----------------------------------------------------------------------------
+# Step 8: Initialize PostgreSQL Database
+# ----------------------------------------------------------------------------
+log_step "Initializing PostgreSQL Database"
+
+log_info "Initializing PostgreSQL database cluster..."
+postgresql-setup --initdb --unit postgresql || error_exit "Failed to initialize PostgreSQL database"
+
+log_info "Waiting for initialization to complete..."
+sleep 20
+
+# ----------------------------------------------------------------------------
+# Step 9: Configure PostgreSQL
+# ----------------------------------------------------------------------------
+log_step "Configuring PostgreSQL"
+
+# Calculate shared_buffers size (half of physical memory, max 64GB)
+log_info "Calculating shared_buffers size..."
+TOTMEM=$(cat /proc/meminfo | grep "MemTotal:" | awk '{print $2}')
+TOTMEM_MB=$((TOTMEM / 1024))
+TOTMEM_BP=$((TOTMEM_MB / 2))
+
+if [ $TOTMEM_BP -lt 64000 ]; then
+    SHARED_BUFFERS="${TOTMEM_BP}MB"
+    log_info "Setting shared_buffers to ${SHARED_BUFFERS} (half of ${TOTMEM_MB}MB total memory)"
+else
+    SHARED_BUFFERS="64000MB"
+    log_info "Setting shared_buffers to ${SHARED_BUFFERS} (capped at 64GB)"
+fi
+
+# Update postgresql.conf if it exists in the template location
+POSTGRESQL_CONF_TEMPLATE="${HAMMERDB_PATH}/templates/postgresql/postgresqlsetup/postgresql.conf"
+if [ -f "${POSTGRESQL_CONF_TEMPLATE}" ]; then
+    log_info "Updating shared_buffers in PostgreSQL configuration template..."
+    sed -i "s/^shared_buffers =.*/shared_buffers = ${SHARED_BUFFERS}/" "${POSTGRESQL_CONF_TEMPLATE}" || \
+        log_info "Warning: Failed to update shared_buffers in template"
+fi
+
+# Copy configuration files to PostgreSQL data directory
+log_info "Copying PostgreSQL configuration files..."
+
+if [ -f "${HAMMERDB_PATH}/templates/postgresql/postgresqlsetup/pg_hba.conf" ]; then
+    cp -f "${HAMMERDB_PATH}/templates/postgresql/postgresqlsetup/pg_hba.conf" "${POSTGRES_DATA_DIR}/" || \
+        log_info "Warning: Failed to copy pg_hba.conf"
+else
+    log_info "Warning: pg_hba.conf template not found"
+fi
+
+if [ -f "${HAMMERDB_PATH}/templates/postgresql/postgresqlsetup/postgresql.conf" ]; then
+    cp -f "${HAMMERDB_PATH}/templates/postgresql/postgresqlsetup/postgresql.conf" "${POSTGRES_DATA_DIR}/" || \
+        log_info "Warning: Failed to copy postgresql.conf"
+else
+    log_info "Warning: postgresql.conf template not found"
+fi
+
+# If template files don't exist, update the config in place
+if [ ! -f "${POSTGRES_DATA_DIR}/postgresql.conf" ]; then
+    error_exit "postgresql.conf not found in ${POSTGRES_DATA_DIR}"
+fi
+
+# Update shared_buffers in the actual config file if not already set from template
+if ! grep -q "^shared_buffers = ${SHARED_BUFFERS}" "${POSTGRES_DATA_DIR}/postgresql.conf" 2>/dev/null; then
+    log_info "Updating shared_buffers in PostgreSQL configuration..."
+    sed -i "s/^shared_buffers =.*/shared_buffers = ${SHARED_BUFFERS}/" "${POSTGRES_DATA_DIR}/postgresql.conf" || \
+        log_info "Warning: Failed to update shared_buffers"
+fi
+
+# ----------------------------------------------------------------------------
+# Step 10: Start PostgreSQL and Set Password
+# ----------------------------------------------------------------------------
+log_step "Starting PostgreSQL and Setting Password"
+
+log_info "Restarting PostgreSQL service..."
+systemctl restart postgresql || error_exit "Failed to restart PostgreSQL service"
+
+log_info "Waiting for PostgreSQL to be ready..."
+sleep 5
+
+# Wait for PostgreSQL to be ready (retry up to 5 times)
+RETRY_COUNT=0
+MAX_RETRIES=5
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    if psql -U postgres -d postgres -c "SELECT 1" >/dev/null 2>&1; then
+        log_info "PostgreSQL is ready"
+        break
+    fi
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    log_info "Waiting for PostgreSQL to be ready... (attempt $RETRY_COUNT/$MAX_RETRIES)"
+    sleep 2
+done
+
+if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+    log_info "Warning: PostgreSQL may not be fully ready, attempting to set password anyway"
+fi
+
+# Set postgres user password
+log_info "Setting PostgreSQL postgres user password..."
+echo "alter role postgres password '${POSTGRES_PASSWORD}';" > input
+psql -U postgres -d postgres < input || log_info "Warning: Password may already be set"
+
+log_info "Waiting before final restart..."
 sleep 30
-systemctl restart postgresql.service
+
+log_info "Performing final PostgreSQL restart..."
+systemctl restart postgresql.service || error_exit "Failed to restart PostgreSQL service"
+
+# ----------------------------------------------------------------------------
+# Installation Complete
+# ----------------------------------------------------------------------------
+log_step "Installation Complete"
+
+log_info "PostgreSQL and HammerDB installation completed successfully!"
+log_info "PostgreSQL data directory: ${MOUNTPOINT}/postgres_data (linked to ${POSTGRES_DATA_DIR})"
+log_info "HammerDB installation: ${HAMMERDB_INSTALL_DIR}"
+log_info "PostgreSQL postgres user password: ${POSTGRES_PASSWORD}"
+
+exit 0
