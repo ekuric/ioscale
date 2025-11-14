@@ -1,108 +1,301 @@
-disks=none
-mountpoint=none
+#!/bin/bash
+#
+# HammerDB MariaDB Installation Script
+# This script installs HammerDB and configures MariaDB for TPCC testing
+#
+# Usage: ./Hammerdb-mariadb-install-script [-h] [-d disk_device] [-m mount_point]
+#
+# Options:
+#   -h              Show this help message
+#   -d <device>     Block device to format and mount (e.g., /dev/sdb)
+#   -m <mountpoint> Existing mount point to use (e.g., /perf1)
+#
+# Examples:
+#   ./Hammerdb-mariadb-install-script -d '/dev/sdb'
+#   ./Hammerdb-mariadb-install-script -m '/perf1'
 
-usage()
-{
-  echo "Usage:
-        ./Hammerdb-mariadb-install-script [-h] [-d disk name] [-m mount point] 
+set -euo pipefail  # Exit on error, undefined vars, pipe failures
 
-        Usage:
-        -h help
-        -d <disk device name>
-        -m <mount point>
+# ============================================================================
+# Configuration Variables
+# ============================================================================
+DISKS="none"
+MOUNTPOINT="none"
+HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts"
+HAMMERDB_INSTALL_DIR="/usr/local/HammerDB"
+MARIADB_PASSWORD="mysql"
+DEFAULT_MOUNTPOINT="/perf1"
 
+# ============================================================================
+# Functions
+# ============================================================================
 
-       Examples:
-        ./Hammerdb-mariadb-install-script -d '/dev/sdb' 
-        ./Hammerdb-mariadb-install-script -d '/perf1' 
-  "
+usage() {
+    cat << EOF
+Usage: $0 [-h] [-d disk_device] [-m mount_point]
+
+Options:
+    -h              Show this help message
+    -d <device>     Block device to format and mount (e.g., /dev/sdb)
+    -m <mountpoint> Existing mount point to use (e.g., /perf1)
+
+Examples:
+    $0 -d '/dev/sdb'
+    $0 -m '/perf1'
+
+Note: Either -d or -m must be specified, but not both.
+EOF
 }
-if [ $# -eq 0 ]
-then
-    usage;
-    exit;
+
+error_exit() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+log_info() {
+    echo "[INFO] $1"
+}
+
+log_step() {
+    echo ""
+    echo "============================================================================"
+    echo "STEP: $1"
+    echo "============================================================================"
+}
+
+# ============================================================================
+# Parse Command Line Arguments
+# ============================================================================
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 1
 fi
 
-while [ $# -gt 0 ]
-do
-case $1 in
-        -h) usage;
-            exit;
+while [ $# -gt 0 ]; do
+    case $1 in
+        -h|--help)
+            usage
+            exit 0
             ;;
-        -d) disks=$2
+        -d)
+            DISKS="$2"
             shift 2
             ;;
-        -m) mountpoint=$2
+        -m)
+            MOUNTPOINT="$2"
             shift 2
             ;;
-         *) usage;
-            exit;
+        *)
+            echo "ERROR: Unknown option: $1" >&2
+            usage
+            exit 1
             ;;
-esac
+    esac
 done
 
-setenforce 0
-cd /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/
-tar xf hammerdb-tpcc.tar
-cd /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/Hammerdb
+# Validate arguments
+if [[ "$MOUNTPOINT" == "none" && "$DISKS" == "none" ]]; then
+    error_exit "Either -d (disk device) or -m (mount point) must be specified"
+fi
+
+if [[ "$MOUNTPOINT" != "none" && "$DISKS" != "none" ]]; then
+    error_exit "Cannot specify both -d and -m options. Use either disk device or mount point."
+fi
+
+# ============================================================================
+# Main Installation Process
+# ============================================================================
+
+log_step "Starting MariaDB and HammerDB Installation"
+
+# ----------------------------------------------------------------------------
+# Step 1: Disable SELinux
+# ----------------------------------------------------------------------------
+log_step "Disabling SELinux"
+setenforce 0 || log_info "SELinux already disabled or not available"
+
+# ----------------------------------------------------------------------------
+# Step 2: Install HammerDB
+# ----------------------------------------------------------------------------
+log_step "Installing HammerDB"
+
+if [ ! -d "${HAMMERDB_PATH}/templates/mariadb" ]; then
+    error_exit "HammerDB templates directory not found: ${HAMMERDB_PATH}/templates/mariadb"
+fi
+
+cd "${HAMMERDB_PATH}/templates/mariadb" || error_exit "Cannot change to HammerDB templates directory"
+
+if [ ! -f "hammerdb-tpcc.tar" ]; then
+    error_exit "HammerDB tar archive not found: hammerdb-tpcc.tar"
+fi
+
+log_info "Extracting HammerDB archive..."
+tar xf hammerdb-tpcc.tar || error_exit "Failed to extract hammerdb-tpcc.tar"
+
+cd "${HAMMERDB_PATH}/templates/mariadb/Hammerdb" || error_exit "Cannot change to HammerDB directory"
+
+log_info "Running HammerDB installer..."
 unset DISPLAY
 echo "y" > input
-echo "/usr/local/HammerDB" >> input
-./HammerDB-3.2-Linux-x86-64-Install < input
+echo "${HAMMERDB_INSTALL_DIR}" >> input
+./HammerDB-3.2-Linux-x86-64-Install < input || error_exit "HammerDB installation failed"
 
-### Shutdown all running instances
-systemctl stop mariadb
+# ----------------------------------------------------------------------------
+# Step 3: Stop MariaDB and Install Packages
+# ----------------------------------------------------------------------------
+log_step "Installing MariaDB Packages"
 
-# Installing Mariadb Server and tools
-dnf -y install mariadb mariadb-server mariadb-server-utils mariadb-errmsg
+log_info "Stopping existing MariaDB instances..."
+systemctl stop mariadb || log_info "MariaDB was not running"
 
-cd /usr/local/HammerDB
-cp /root/hammerdb-tpcc-wrapper-scripts/templates/mariadb/mariadbsetup/* .
+log_info "Installing MariaDB packages..."
+dnf -y install mariadb mariadb-server mariadb-server-utils mariadb-errmsg || \
+    error_exit "Failed to install MariaDB packages"
 
-if [[ $mountpoint == *"none"* ]]; then
-  echo "using disk option"
-  umount /perf1
-  mkfs.xfs -f ${disks}
-  mkdir -p /perf1
-  mount ${disks} /perf1
-  mountpoint="/perf1"
+# ----------------------------------------------------------------------------
+# Step 4: Copy MariaDB Setup Files
+# ----------------------------------------------------------------------------
+log_step "Copying MariaDB Configuration Files"
+
+cd "${HAMMERDB_INSTALL_DIR}" || error_exit "Cannot change to HammerDB install directory"
+
+if [ -d "${HAMMERDB_PATH}/templates/mariadb/mariadbsetup" ]; then
+    log_info "Copying mariadbsetup files..."
+    cp "${HAMMERDB_PATH}/templates/mariadb/mariadbsetup/"* . 2>/dev/null || \
+        log_info "Warning: Some files may not have been copied"
 else
-  echo "using mountpoint option"
-  echo ${mountpoint}
+    log_info "Warning: mariadbsetup directory not found, skipping file copy"
 fi
 
-rm -rf ${mountpoint}/mysql/*
-mkdir -p ${mountpoint}/mysql/data
-chown -R mysql:mysql ${mountpoint}/mysql
+# ----------------------------------------------------------------------------
+# Step 5: Setup Storage (Disk Formatting or Mount Point)
+# ----------------------------------------------------------------------------
+log_step "Setting Up Storage"
 
-totmem=`cat /proc/meminfo |grep "MemTotal:" | awk '{print $2}'`
-## Updating the value of buffer_pool_size based on available memory
-## Setting bufferpool to half of physical memory if memory is less than 128G else set to 64G
-totmem_BP=`expr $totmem / 1024`
-totmem_BP=`expr $totmem_BP / 2`
-
-##Configuring the mariadb config file with mountpoint and bufferpool
-
-sed -i "s+^datadir=.*+datadir=${mountpoint}\/mysql\/data+" my.cnf
-if [ $totmem_BP -lt 64000 ]
-then
-   sed -i "s/^innodb_buffer_pool_size=.*/innodb_buffer_pool_size=${totmem_BP}M/" my.cnf
+if [[ "$MOUNTPOINT" == *"none"* ]]; then
+    # Using disk device option - format and mount
+    log_info "Using disk device option: ${DISKS}"
+    
+    if [ ! -b "${DISKS}" ]; then
+        error_exit "Disk device ${DISKS} does not exist or is not a block device"
+    fi
+    
+    log_info "Unmounting existing mount (if any)..."
+    umount /perf1 2>/dev/null || log_info "No existing mount to unmount"
+    
+    log_info "Formatting disk ${DISKS} with XFS..."
+    mkfs.xfs -f "${DISKS}" || error_exit "Failed to format disk ${DISKS}"
+    
+    log_info "Creating mount point..."
+    mkdir -p "${DEFAULT_MOUNTPOINT}" || error_exit "Failed to create mount point"
+    
+    log_info "Mounting ${DISKS} to ${DEFAULT_MOUNTPOINT}..."
+    mount "${DISKS}" "${DEFAULT_MOUNTPOINT}" || error_exit "Failed to mount ${DISKS}"
+    
+    MOUNTPOINT="${DEFAULT_MOUNTPOINT}"
 else
-   sed -i "s/^innodb_buffer_pool_size=.*/innodb_buffer_pool_size=64000M/" my.cnf
+    # Using existing mount point
+    log_info "Using mount point option: ${MOUNTPOINT}"
+    
+    if [ ! -d "${MOUNTPOINT}" ]; then
+        error_exit "Mount point directory does not exist: ${MOUNTPOINT}"
+    fi
 fi
 
+# ----------------------------------------------------------------------------
+# Step 6: Create MariaDB Data Directory
+# ----------------------------------------------------------------------------
+log_step "Creating MariaDB Data Directory"
 
-/usr/bin/cp my.cnf /etc/my.cnf
+log_info "Cleaning existing MySQL data directory..."
+rm -rf "${MOUNTPOINT}/mysql/*" 2>/dev/null || true
 
-systemctl restart mariadb.service
+log_info "Creating MySQL data directory structure..."
+mkdir -p "${MOUNTPOINT}/mysql/data" || error_exit "Failed to create MySQL data directory"
 
-#echo "UPDATE mysql.user SET Password=PASSWORD('dbpassword')  WHERE User='root';" > input
-echo "use mysql;" > input
-echo "SET PASSWORD FOR 'root'@localhost = PASSWORD('mysql');" > input
-echo "flush privileges;" >> input
-echo "exit" >> input
+log_info "Setting ownership to mysql:mysql..."
+chown -R mysql:mysql "${MOUNTPOINT}/mysql" || error_exit "Failed to set ownership"
 
-mysql -u root < input
+# ----------------------------------------------------------------------------
+# Step 7: Configure MariaDB (my.cnf)
+# ----------------------------------------------------------------------------
+log_step "Configuring MariaDB"
 
+if [ ! -f "my.cnf" ]; then
+    error_exit "my.cnf not found in ${HAMMERDB_INSTALL_DIR}"
+fi
+
+# Calculate buffer pool size (half of physical memory, max 64GB)
+log_info "Calculating InnoDB buffer pool size..."
+TOTMEM=$(cat /proc/meminfo | grep "MemTotal:" | awk '{print $2}')
+TOTMEM_BP=$((TOTMEM / 1024 / 2))
+
+if [ $TOTMEM_BP -lt 64000 ]; then
+    BUFFER_POOL_SIZE="${TOTMEM_BP}M"
+    log_info "Setting buffer pool size to ${BUFFER_POOL_SIZE} (half of ${TOTMEM_BP}MB total memory)"
+else
+    BUFFER_POOL_SIZE="64000M"
+    log_info "Setting buffer pool size to ${BUFFER_POOL_SIZE} (capped at 64GB)"
+fi
+
+log_info "Updating my.cnf configuration..."
+sed -i "s+^datadir=.*+datadir=${MOUNTPOINT}/mysql/data+" my.cnf || \
+    error_exit "Failed to update datadir in my.cnf"
+
+sed -i "s/^innodb_buffer_pool_size=.*/innodb_buffer_pool_size=${BUFFER_POOL_SIZE}/" my.cnf || \
+    error_exit "Failed to update innodb_buffer_pool_size in my.cnf"
+
+log_info "Copying my.cnf to /etc/my.cnf..."
+cp my.cnf /etc/my.cnf || error_exit "Failed to copy my.cnf to /etc/"
+
+# ----------------------------------------------------------------------------
+# Step 8: Start MariaDB and Set Root Password
+# ----------------------------------------------------------------------------
+log_step "Starting MariaDB and Setting Root Password"
+
+log_info "Restarting MariaDB service..."
+systemctl restart mariadb.service || error_exit "Failed to restart MariaDB service"
+
+log_info "Waiting for MariaDB to be ready..."
+sleep 10
+
+# Wait for MariaDB to be ready (retry up to 5 times)
+RETRY_COUNT=0
+MAX_RETRIES=5
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+    if mysql -u root -e "SELECT 1" >/dev/null 2>&1; then
+        log_info "MariaDB is ready"
+        break
+    fi
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    log_info "Waiting for MariaDB to be ready... (attempt $RETRY_COUNT/$MAX_RETRIES)"
+    sleep 2
+done
+
+if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+    log_info "Warning: MariaDB may not be fully ready, attempting to set password anyway"
+fi
+
+# Set root password - use UPDATE mysql.user which works in both normal and skip-grant-tables modes
+log_info "Setting MariaDB root password..."
+mysql -u root -e "UPDATE mysql.user SET Password=PASSWORD('${MARIADB_PASSWORD}') WHERE User='root' AND Host='localhost'; FLUSH PRIVILEGES;" 2>&1 || \
+    log_info "Warning: Password may already be set or MariaDB is in skip-grant-tables mode"
+
+log_info "Waiting before final restart..."
 sleep 30
-systemctl restart mariadb.service
+
+log_info "Performing final MariaDB restart..."
+systemctl restart mariadb.service || error_exit "Failed to restart MariaDB service"
+
+# ----------------------------------------------------------------------------
+# Installation Complete
+# ----------------------------------------------------------------------------
+log_step "Installation Complete"
+
+log_info "MariaDB and HammerDB installation completed successfully!"
+log_info "MariaDB data directory: ${MOUNTPOINT}/mysql/data"
+log_info "HammerDB installation: ${HAMMERDB_INSTALL_DIR}"
+log_info "MariaDB root password: ${MARIADB_PASSWORD}"
+
+exit 0
