@@ -1,0 +1,54 @@
+# FIO Test Configuration - Windows Only Example
+# This configuration demonstrates Windows-only testing
+# Omit 'vm', 'storage', 'fio', and 'output' sections for Windows-only testing
+
+# Test Description (Optional)
+description: "windows performance test"
+
+# Windows Hosts Configuration
+windows:
+  hosts: "win-vm-1 win-vm-2"
+  # OR use pattern: 
+  #host_pattern: "win-vm-{1..10}"
+  
+  # Windows Storage Configuration
+  storage_win:
+    devices:
+      # Individual host configuration
+      "win-vm-1": "1"
+      "win-vm-2": "1"
+      # OR use pattern-based configuration (more efficient for many hosts)
+      # Example: "win-vm-{1..10}": "1"  # Disk ID 1 for Windows VMs matching pattern win-vm-1 through win-vm-10
+    mount_point: "d\\:/fio/data"  # Windows path format  
+
+  # Windows FIO Configuration
+  fio_win:
+    run_dir: "d:/fio"  # Directory containing fio.exe
+    test_size: "10GB"
+    runtime: 600
+    block_sizes: "4k 8k 128k 512k 1024k 4096k"
+    io_patterns: "read write randread randwrite randrw"
+    numjobs: 1
+    iodepth: 16
+    direct_io: 1
+  
+  # Windows Output Configuration
+  output_win:
+    directory: "d:/fio/results"
+    format: "json+"
+
+# Retry Configuration
+retry:
+  interval: 30
+  max_retries: 10
+
+# Task Monitoring Configuration
+monitoring:
+  task_monitor_interval: 60
+
+# VM Migration Configuration (optional for Windows VMs)
+migrate:
+  workloads: ""  # No migrations for this example
+  # Migrate during these patterns - example: workloads: "write randwrite randrw read randread" 
+  interval: 0
+

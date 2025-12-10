@@ -1,0 +1,75 @@
+# FIO Test Configuration - Mixed Linux and Windows Example
+# This configuration demonstrates testing both Linux and Windows hosts simultaneously
+
+# Test Description (Optional)
+description: "cross-platform performance test"
+
+# Linux Hosts Configuration
+vm:
+  host_pattern: "linux-vm-{1..5}"
+  namespace: "default"
+
+# Linux Storage Configuration
+storage:
+  devices:
+    "linux-vm-{1..5}": "vdc"
+  mount_point: "/root/tests/data"
+  filesystem: "xfs"
+
+# Linux FIO Configuration
+fio:
+  test_size: "10G"
+  runtime: 600
+  block_sizes: "4k 8k 128k 512k 1024k 4096k"
+  io_patterns: "read write randread randwrite randrw"
+  numjobs: 1
+  iodepth: 16
+  direct_io: 1
+
+# Linux Output Configuration
+output:
+  directory: "/root/fio-results"
+  format: "json+"
+
+# Windows Hosts Configuration
+windows:
+  host_pattern: "win-vm-{1..5}"
+  
+  # Windows Storage Configuration
+  storage_win:
+    devices:
+      "win-vm-{1..5}": "1"  # Disk ID (not /dev/ path)
+    mount_point: "d\\:/fio/data"  # Windows path format
+    # pattern based configuration - example:
+    #"win-vm-{1..5}": "1"  # Disk ID 1 for Windows VMs matching pattern win-vm-1 through win-vm-5
+  # Windows FIO Configuration
+  fio_win:
+    run_dir: "d:/fio"  # Directory containing fio.exe
+    test_size: "10GB"
+    runtime: 600
+    block_sizes: "4k 8k 128k 512k 1024k 4096k"
+    io_patterns: "read write randread randwrite randrw"
+    numjobs: 1
+    iodepth: 16
+    direct_io: 1
+  
+  # Windows Output Configuration
+  output_win:
+    directory: "d:/fio/results"
+    format: "json+"
+
+# Retry Configuration
+retry:
+  interval: 30
+  max_retries: 10
+
+# Task Monitoring Configuration
+monitoring:
+  task_monitor_interval: 60
+
+# VM Migration Configuration (applies to both Linux and Windows VMs)
+migrate:
+  workloads: "" # list of workloads which will trigger VM migration. Default is empty string which means no migrations will be triggered.
+  # Migrate during these patterns - example: workloads: "write randwrite randrw read randread" 
+  interval: 0  # Seconds between migrations (0 = parallel, >0 = sequential)
+

@@ -1,0 +1,53 @@
+# FIO Test Configuration - With VM Migration Example
+# This configuration demonstrates VM migration during FIO tests
+
+# Test Description (Optional)
+description: "migration performance test"
+
+# VM/Host Configuration
+vm:
+  host_pattern: "vm{1..50}"
+  namespace: "default"
+
+# Storage Configuration
+storage:
+  devices:
+    "vm{1..50}": "vdc"
+  mount_point: "/root/tests/data"
+  filesystem: "xfs"
+
+# FIO Test Configuration
+fio:
+  test_size: "1G"
+  runtime: 600  # 10 minutes - migrations will occur at 5 minutes
+  block_sizes: "4k 8k 128k 512k 1024k 4096k"
+  io_patterns: "read write randread randwrite randrw"
+  numjobs: 1
+  iodepth: 16
+  direct_io: 1
+
+# Output Configuration
+output:
+  directory: "/root/fio-results"
+  format: "json+"
+
+# Retry Configuration
+retry:
+  interval: 30
+  max_retries: 10
+
+# Task Monitoring Configuration
+monitoring:
+  task_monitor_interval: 60
+
+# VM Migration Configuration
+migrate:
+  workloads: "read write randread randwrite randrw" # list of workloads which will trigger VM migration. Default is empty string which means no migrations will be triggered.
+  # Migrate during these patterns - example: workloads: "write randwrite randrw read randread" 
+  interval: 0  # Seconds between migrations (0 = parallel, >0 = sequential)
+
+  
+  # Sequential migration with 2 second interval (recommended for many VMs)
+  # This prevents overloading CNV when migrating 50 VMs
+  # interval: 2  # Seconds between migrations (0 = parallel, >0 = sequential)
+

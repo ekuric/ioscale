@@ -1,0 +1,51 @@
+# FIO Test Configuration - Linux Only Example
+# This configuration demonstrates Linux-only testing
+
+# Test Description (Optional)
+description: "linux performance test"  # Will be included in log and results directory names
+
+# VM/Host Configuration
+vm:
+  host_pattern: "vm{1..100}"  # Or use hosts, host_file, or host_labels
+  namespace: "default"
+
+# Storage Configuration
+storage:
+  devices:
+    "vm{1..100}": "vdc"  # Per-host or pattern-based device mapping
+  mount_point: "/root/tests/data"
+  filesystem: "xfs"
+  persistent: ""  # Set to "true" for persistent mounts via /etc/fstab
+
+# FIO Test Configuration
+fio:
+  test_size: "1G"
+  runtime: 600  # 10 minutes
+  block_sizes: "4k 8k 128k 512k 1024k 4096k"
+  io_patterns: "read write randread randwrite randrw"
+  numjobs: 1
+  iodepth: 16
+  direct_io: 1
+  # rate_iops: 1000  # Optional rate limiting
+
+# Output Configuration
+output:
+  directory: "/root/fio-results"
+  format: "json+"
+
+# Retry Configuration
+retry:
+  interval: 30
+  max_retries: 10
+  skip_connectivity_test: false
+
+# Task Monitoring Configuration
+monitoring:
+  task_monitor_interval: 60
+
+# VM Migration Configuration
+migrate:
+  workloads: "" # list of workloads which will trigger VM migration. Default is empty string which means no migrations will be triggered.
+  # Migrate during these patterns - example: workloads: "write randwrite randrw read randread" 
+  interval: 0  # Seconds between migrations (0 = parallel, >0 = sequential)
+
