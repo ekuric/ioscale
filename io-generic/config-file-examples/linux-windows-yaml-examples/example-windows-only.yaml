@@ -1,9 +1,16 @@
 # FIO Test Configuration - Windows Only Example
 # This configuration demonstrates Windows-only testing
-# Omit 'vm', 'storage', 'fio', and 'output' sections for Windows-only testing
+# Note: The 'vm' section with 'namespace' is required for virtctl access
+# Omit 'storage', 'fio', and 'output' sections for Windows-only testing (use 'windows' section instead)
 
 # Test Description (Optional)
 description: "windows performance test"
+
+# VM/Host Configuration (required for virtctl access to Windows VMs)
+# Note: Windows hosts are defined in the 'windows' section below
+# The 'vm' section here only needs the namespace for virtctl access
+vm:
+  namespace: "default"  # Namespace where Windows VMs are located
 
 # Windows Hosts Configuration
 windows:

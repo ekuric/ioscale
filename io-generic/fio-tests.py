@@ -1219,6 +1219,65 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
         else:
             root_dir_ps_with_slash = root_dir_ps
         
+        # CRITICAL: For Windows hosts, we need to provision/format the disk BEFORE copying FIO
+        # The disk must exist (be partitioned and formatted) before we can copy files to it
+        # Extract drive letter from root_dir (e.g., "d:\" -> "d")
+        drive_letter = root_dir_ps[0].upper() if root_dir_ps else "D"
+        logger.info(f"Ensuring Windows disk is provisioned for drive {drive_letter}: before FIO installation...")
+        
+        # Check if the drive exists, and if not, provision it
+        with ThreadPoolExecutor(max_workers=len(windows_hosts)) as pool:
+            provision_futures = []
+            for host in windows_hosts:
+                device = config.windows_storage_devices.get(host, "1")
+                # Check if drive exists - use a more robust check that handles errors properly
+                # Test-Path returns $true/$false, so we check the output explicitly
+                check_drive_cmd = f"powershell -Command \"$result = Test-Path '{drive_letter}:\\'; if ($result) {{ Write-Host 'EXISTS' }} else {{ Write-Host 'NOT_FOUND' }}\""
+                logger.debug(f"Checking if drive {drive_letter}: exists on {host}...")
+                check_success, check_output = executor.execute_command(host, check_drive_cmd, f"Checking if drive {drive_letter}: exists", timeout=10)
+                
+                # Log the check result for debugging
+                if check_success:
+                    logger.debug(f"Drive check output from {host}: {check_output.strip()}")
+                else:
+                    logger.warning(f"Drive check command failed on {host}: {check_output}")
+                
+                # If check succeeded and drive exists, skip provisioning
+                if check_success and 'EXISTS' in check_output:
+                    logger.info(f"Drive {drive_letter}: already exists on {host} - skipping disk provisioning")
+                else:
+                    # Drive doesn't exist or check failed - need to provision it
+                    logger.info(f"Drive {drive_letter}: not found on {host} (or check failed) - provisioning disk {device}...")
+                    # Match bash script format: powershell c:\tools\setup\provision-data-disk.ps1 -DiskID {device}
+                    provision_cmd = f"powershell c:\\tools\\setup\\provision-data-disk.ps1 -DiskID {device}"
+                    future = pool.submit(executor.execute_command, host, provision_cmd, "Provisioning Windows disk for FIO installation")
+                    provision_futures.append((future, host))
+            
+            # Wait for all disk provisioning to complete
+            if provision_futures:
+                logger.info(f"Waiting for disk provisioning to complete on {len(provision_futures)} host(s)...")
+                for future, host in provision_futures:
+                    success, output = future.result()
+                    if not success:
+                        logger.error(f"Failed to provision disk on {host}: {output}")
+                        logger.error(f"Cannot proceed with FIO installation - disk must be provisioned first")
+                        sys.exit(1)
+                    else:
+                        logger.info(f"Disk provisioning completed on {host} - drive {drive_letter}: is now available")
+                
+                # Verify the drive exists after provisioning
+                logger.info(f"Verifying drive {drive_letter}: exists after provisioning...")
+                for host in windows_hosts:
+                    verify_cmd = f"powershell -Command \"$result = Test-Path '{drive_letter}:\\'; if ($result) {{ Write-Host 'EXISTS' }} else {{ Write-Host 'NOT_FOUND' }}\""
+                    verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying drive {drive_letter}: after provisioning", timeout=10)
+                    if verify_success and 'EXISTS' in verify_output:
+                        logger.info(f"✓ Drive {drive_letter}: verified on {host}")
+                    else:
+                        logger.error(f"✗ Drive {drive_letter}: still not found on {host} after provisioning - cannot proceed")
+                        sys.exit(1)
+            else:
+                logger.info("All drives already exist - no provisioning needed")
+        
         logger.info(f"Copying FIO from c:\\tools\\fio to {root_dir_ps_with_slash} on Windows hosts...")
         logger.info(f"Source path: c:\\tools\\fio, Destination path: {root_dir_ps_with_slash}")
         with ThreadPoolExecutor(max_workers=len(windows_hosts)) as pool:
