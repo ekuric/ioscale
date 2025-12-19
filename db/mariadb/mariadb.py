@@ -51,6 +51,7 @@ class MariaDBTestConfig:
         self.dry_run = False
         self.verbose = False
         self.prepare_hosts = False
+        self.use_virtctl = None  # None = auto-detect, True = force virtctl, False = force SSH
         self.namespace = None
         self.db_hosts = []
         self.mount_point = None
@@ -72,13 +73,19 @@ class MariaDBTestConfig:
 
 
 class CommandExecutor:
-    """Handles command execution via virtctl"""
+    """Handles command execution via virtctl or SSH"""
     
     def __init__(self, config: MariaDBTestConfig):
         self.config = config
     
     def is_vm_host(self, host: str) -> bool:
         """Check if host is a VM"""
+        if self.config.use_virtctl is False:
+            return False
+        if self.config.use_virtctl is True:
+            return True
+        
+        # Auto-detection: check if VM exists in namespace
         if not self.config.namespace or self.config.namespace == "N/A":
             return False
         
@@ -102,24 +109,48 @@ class CommandExecutor:
             return False
     
     def get_ssh_command(self, host: str, command: str) -> List[str]:
-        """Get SSH command for host using virtctl"""
-        if not self.config.namespace or self.config.namespace == "N/A":
-            raise ValueError(f"NAMESPACE is not set but host '{host}' requires virtctl")
-        return [
-            "virtctl", "-n", self.config.namespace, "ssh",
-            "--local-ssh-opts=-o StrictHostKeyChecking=no",
-            f"root@vmi/{host}", "-c", command
-        ]
+        """Get SSH command for host"""
+        if self.is_vm_host(host):
+            if not self.config.namespace or self.config.namespace == "N/A":
+                raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
+            return [
+                "virtctl", "-n", self.config.namespace, "ssh",
+                "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                f"root@vmi/{host}", "-c", command
+            ]
+        else:
+            return [
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                f"root@{host}", command
+            ]
     
     def get_scp_command(self, source: str, destination: str) -> List[str]:
         """Get SCP command for copying files"""
-        if not self.config.namespace or self.config.namespace == "N/A":
-            raise ValueError(f"NAMESPACE is not set but host requires virtctl")
-        return [
-            "virtctl", "-n", self.config.namespace, "scp",
-            "--local-ssh-opts=-o StrictHostKeyChecking=no",
-            source, destination
-        ]
+        # Extract hostname from source - support both root@vmi/ and root@
+        host_match = (re.search(r'root@vmi/([^:]+):', source) or 
+                     re.search(r'root@([^:]+):', source))
+        if not host_match:
+            raise ValueError(f"Cannot extract hostname from source: {source}")
+        
+        host = host_match.group(1)
+        
+        if self.is_vm_host(host):
+            if not self.config.namespace or self.config.namespace == "N/A":
+                raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
+            return [
+                "virtctl", "-n", self.config.namespace, "scp",
+                "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                source, destination
+            ]
+        else:
+            # Convert virtctl format to SSH format
+            ssh_source = source.replace("root@vmi/", "root@")
+            return [
+                "scp", "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                ssh_source, destination
+            ]
     
     def execute_command(self, host: str, command: str, description: str = "command",
                        timeout: Optional[int] = None) -> Tuple[bool, str]:
@@ -146,9 +177,16 @@ class CommandExecutor:
                 return True, result.stdout
             else:
                 logger.error(f"Failed to execute '{description}' on {host}")
+                # Combine stdout and stderr for better error reporting
+                error_output = ""
+                if result.stdout:
+                    error_output += f"STDOUT: {result.stdout}\n"
                 if result.stderr:
-                    logger.error(f"Error output: {result.stderr}")
-                return False, result.stderr
+                    error_output += f"STDERR: {result.stderr}\n"
+                if not error_output:
+                    error_output = f"Exit code: {result.returncode}"
+                logger.error(f"Error output: {error_output}")
+                return False, error_output
                 
         except subprocess.TimeoutExpired:
             logger.error(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s)")
@@ -183,9 +221,12 @@ class ConfigLoader:
             yaml_data = yaml.safe_load(f)
         
         # Load namespace
-        self.config.namespace = yaml_data.get('database', {}).get('namespace', 'default')
-        if self.config.namespace == "null" or not self.config.namespace:
-            self.config.namespace = "default"
+        if self.config.use_virtctl is not False:
+            self.config.namespace = yaml_data.get('database', {}).get('namespace', 'default')
+            if self.config.namespace == "null" or not self.config.namespace:
+                self.config.namespace = "default"
+        else:
+            self.config.namespace = "N/A"
         
         # Load VM hosts
         self.config.db_hosts = self._get_db_hosts(yaml_data)
@@ -295,6 +336,9 @@ class ConfigLoader:
         # Method 2: Host labels
         host_labels = database.get('host_labels')
         if host_labels:
+            if self.config.use_virtctl is False:
+                logger.error("Label-based host selection is not supported in SSH-only mode")
+                sys.exit(1)
             logger.info(f"Using label selector: {host_labels}")
             if not self.config.dry_run:
                 try:
@@ -356,10 +400,24 @@ def check_dependencies(config: MariaDBTestConfig) -> None:
     missing_tools = []
     
     if not config.dry_run:
-        if not shutil.which("virtctl"):
-            missing_tools.append("virtctl")
-        if not shutil.which("oc"):
-            missing_tools.append("oc")
+        if config.use_virtctl is True:
+            # Force virtctl mode
+            if not shutil.which("virtctl"):
+                missing_tools.append("virtctl")
+            if not shutil.which("oc"):
+                missing_tools.append("oc")
+        elif config.use_virtctl is False:
+            # Force SSH mode
+            if not shutil.which("ssh"):
+                missing_tools.append("ssh")
+        else:
+            # Auto-detection mode
+            if not shutil.which("virtctl"):
+                missing_tools.append("virtctl")
+            if not shutil.which("oc"):
+                missing_tools.append("oc")
+            if not shutil.which("ssh"):
+                missing_tools.append("ssh")
     
     if missing_tools:
         logger.error("The following required tools are missing:")
@@ -369,12 +427,14 @@ def check_dependencies(config: MariaDBTestConfig) -> None:
                 logger.error("    Or if using kubectl: 'kubectl krew install virt'")
             elif tool == "oc":
                 logger.error("  - oc: Install OpenShift CLI from https://openshift.com/download")
+            elif tool == "ssh":
+                logger.error("  - ssh: Install OpenSSH client")
         logger.error("")
         logger.error("Install the missing tools and try again.")
         sys.exit(1)
     
-    # Check if virtctl supports scp command
-    if not config.dry_run and shutil.which("virtctl"):
+    # Check if virtctl supports scp command (only if using virtctl)
+    if not config.dry_run and config.use_virtctl is not False and shutil.which("virtctl"):
         try:
             result = subprocess.run(
                 ["virtctl", "help"],
@@ -396,31 +456,38 @@ def validate_inputs(config: MariaDBTestConfig) -> None:
         logger.error("Either storage.disk_list or storage.mount_point must be specified in config")
         sys.exit(1)
     
-    # Validate hosts are reachable (skip in dry-run mode)
-    if not config.dry_run:
+    # Validate hosts are reachable (skip in dry-run mode and SSH-only mode)
+    if not config.dry_run and config.use_virtctl is not False:
         executor = CommandExecutor(config)
         for host in config.db_hosts:
-            try:
-                result = subprocess.run(
-                    ["oc", "get", "vm", host, "-n", config.namespace],
-                    capture_output=True,
-                    timeout=10
-                )
-                if result.returncode != 0:
-                    logger.error(f"Virtual machine '{host}' not found in namespace '{config.namespace}'")
+            if executor.is_vm_host(host):
+                try:
+                    result = subprocess.run(
+                        ["oc", "get", "vm", host, "-n", config.namespace],
+                        capture_output=True,
+                        timeout=10
+                    )
+                    if result.returncode != 0:
+                        logger.error(f"Virtual machine '{host}' not found in namespace '{config.namespace}'")
+                        sys.exit(1)
+                except Exception as e:
+                    logger.error(f"Failed to validate VM '{host}': {e}")
                     sys.exit(1)
-            except Exception as e:
-                logger.error(f"Failed to validate VM '{host}': {e}")
-                sys.exit(1)
     else:
-        logger.info("Skipping VM validation in dry-run mode")
+        if config.dry_run:
+            logger.info("Skipping host validation in dry-run mode")
+        else:
+            logger.info("Skipping VM validation in SSH-only mode")
 
 
 def display_config(config: MariaDBTestConfig) -> None:
     """Display configuration"""
     logger.info(f"Configuration loaded from: {config.config_file}")
     logger.info(f"Hosts: {' '.join(config.db_hosts)}")
-    logger.info(f"Namespace: {config.namespace}")
+    if config.use_virtctl is not False:
+        logger.info(f"Namespace: {config.namespace}")
+    else:
+        logger.info("Namespace: N/A (SSH-only mode)")
     logger.info(f"Warehouse count: {config.warehouse_count}")
     logger.info(f"User counts: {' '.join(config.user_count)}")
     logger.info(f"Test duration: {config.test_duration} minutes")
@@ -527,13 +594,69 @@ def deploy_scripts(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
-            cmd = f"cd '{config.hammerdb_path}' && git clone '{config.hammerdb_repo}' ."
-            future = pool.submit(executor.execute_command, host, cmd, "Cloning HammerDB scripts")
+            # Improved git clone with better error handling and diagnostics
+            # Use bash -c with proper quoting to ensure consistent execution for both SSH and virtctl
+            # This ensures the same shell behavior regardless of connection method
+            # Check multiple possible locations for templates directory
+            hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
+            hammerdb_repo_escaped = config.hammerdb_repo.replace("'", "'\"'\"'")
+            hammerdb_path_display = config.hammerdb_path.replace("'", "'\"'\"'")
+            cmd = (
+                f"bash -c '"
+                f"cd \"{hammerdb_path_escaped}\" && "
+                f"export GIT_SSL_NO_VERIFY=true && "
+                f"echo \"Starting git clone...\" && "
+                f"git clone --recursive \"{hammerdb_repo_escaped}\" . 2>&1 && "
+                f"if [ $? -eq 0 ]; then "
+                f"  echo \"Git clone completed successfully\"; "
+                f"  echo \"Initializing submodules if any...\"; "
+                f"  git submodule update --init --recursive 2>&1 || echo \"No submodules found or already initialized\"; "
+                f"  echo \"Checking for templates directory in various locations...\"; "
+                f"  if [ -d \"templates/mariadb\" ]; then "
+                f"    echo \"Found templates/mariadb directory\"; "
+                f"  elif [ -d \"scripts/templates/mariadb\" ]; then "
+                f"    echo \"Found scripts/templates/mariadb directory - creating symlink\"; "
+                f"    mkdir -p templates && ln -sf ../scripts/templates/mariadb templates/mariadb && echo \"Symlink created\"; "
+                f"  elif [ -d \"scripts/mariadb\" ]; then "
+                f"    echo \"Found scripts/mariadb directory - creating symlink\"; "
+                f"    mkdir -p templates && ln -sf ../scripts/mariadb templates/mariadb && echo \"Symlink created\"; "
+                f"  else "
+                f"    echo \"ERROR: templates/mariadb directory not found in any expected location\"; "
+                f"    echo \"Current branch: $(git branch --show-current 2>&1 || echo 'unknown')\"; "
+                f"    echo \"Available branches: $(git branch -a 2>&1 | head -10)\"; "
+                f"    echo \"Repository structure (top level):\"; "
+                f"    ls -la . 2>&1; "
+                f"    echo \"Checking scripts directory:\"; "
+                f"    ls -la scripts/ 2>&1 | head -20 || echo \"scripts directory does not exist\"; "
+                f"    echo \"Checking for any mariadb-related directories:\"; "
+                f"    find . -type d -iname '*mariadb*' 2>&1 | head -10; "
+                f"    echo \"Checking for templates directories:\"; "
+                f"    find . -type d -iname 'templates' 2>&1 | head -10; "
+                f"    exit 1; "
+                f"  fi; "
+                f"  if [ -d \"templates/mariadb\" ]; then "
+                f"    echo \"Clone successful - templates/mariadb directory exists\"; "
+                f"  else "
+                f"    echo \"ERROR: Failed to locate or create templates/mariadb directory\"; "
+                f"    exit 1; "
+                f"  fi; "
+                f"else "
+                f"  echo \"ERROR: Git clone failed with exit code $?\"; "
+                f"  exit 1; "
+                f"fi"
+                f"'"
+            )
+            future = pool.submit(executor.execute_command, host, cmd, "Cloning HammerDB scripts", timeout=600)
             futures.append(future)
         for future in as_completed(futures):
             success, output = future.result()
             if not success:
-                logger.error(f"Failed to clone repository: {output}")
+                logger.error(f"Failed to clone repository on host")
+                logger.error(f"Error output: {output}")
+                logger.error(f"Please check:")
+                logger.error(f"  1. Repository URL is correct: {config.hammerdb_repo}")
+                logger.error(f"  2. Host has internet access")
+                logger.error(f"  3. Git is installed on the host")
                 sys.exit(1)
     
     # Step 3: Set permissions
@@ -541,11 +664,30 @@ def deploy_scripts(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
-            cmd = f"chmod +x '{config.hammerdb_path}/templates/mariadb/Hammerdb-mariadb-install-script'"
+            script_path = f"{config.hammerdb_path}/templates/mariadb/Hammerdb-mariadb-install-script"
+            # Check if file exists before chmod, and verify git clone was successful
+            # Use bash -c for consistent execution across SSH and virtctl
+            script_path_escaped = script_path.replace("'", "'\"'\"'")
+            hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
+            cmd = (
+                f"bash -c '"
+                f"if [ -f \"{script_path_escaped}\" ]; then "
+                f"chmod +x \"{script_path_escaped}\" && echo \"Permissions set successfully\"; "
+                f"else "
+                f"echo \"ERROR: Script file not found at {script_path_escaped}\"; "
+                f"echo \"Checking if git clone was successful...\"; "
+                f"ls -la \"{hammerdb_path_escaped}/templates/mariadb/\" 2>&1 || echo \"Directory does not exist\"; "
+                f"exit 1; "
+                f"fi"
+                f"'"
+            )
             future = pool.submit(executor.execute_command, host, cmd, "Setting execute permissions")
             futures.append(future)
         for future in as_completed(futures):
-            future.result()
+            success, output = future.result()
+            if not success:
+                logger.error(f"Failed to set execute permissions: {output}")
+                sys.exit(1)
 
 
 def install_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
@@ -907,6 +1049,10 @@ def migrate_vms_during_test(config: MariaDBTestConfig, executor: CommandExecutor
     if not config.migrate_user_counts or user_count not in config.migrate_user_counts:
         return True
     
+    if config.use_virtctl is False:
+        logger.warning(f"Migration requested for user_count '{user_count}' but SSH-only mode is enabled")
+        return True
+    
     if not config.namespace or config.namespace == "N/A":
         logger.warning(f"Migration requested for user_count '{user_count}' but namespace is not set")
         return True
@@ -1085,17 +1231,87 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
             for host in config.db_hosts:
                 output_file = f"test_mariadb_{run_date}_{num_hosts}pod_pod{counter}_{user_count}.out"
                 # Use nohup with & to truly background the process and return immediately
-                cmd = f"cd '{config.hammerdb_dir}' && nohup ./hammerdbcli auto runtest{counter}_mariadb.tcl > '{output_file}' 2>&1 &"
-                # Use short timeout (30s) just to verify command starts - nohup should return immediately
-                future = pool.submit(executor.execute_command, host, cmd, f"Starting performance test (output: {output_file})", timeout=30)
+                # The command should return quickly, but we use a longer timeout to account for slow SSH connections
+                cmd = f"cd '{config.hammerdb_dir}' && nohup ./hammerdbcli auto runtest{counter}_mariadb.tcl > '{output_file}' 2>&1 & echo 'Test start command executed'"
+                # Use longer timeout (60s) to account for slow SSH connections, but verification will confirm actual start
+                future = pool.submit(executor.execute_command, host, cmd, f"Starting performance test (output: {output_file})", timeout=60)
                 futures.append((future, counter, host, output_file))
                 counter += 1
             
             # Wait for all tests to start (should be quick with nohup)
+            # Collect results and verify tests actually started
+            hosts_to_verify = []
             for future, counter, host, output_file in futures:
-                success, output = future.result()
-                if not success:
-                    logger.warning(f"Failed to start test on {host}: {output}")
+                try:
+                    success, output = future.result()  # Wait for the future (already has timeout)
+                    if not success:
+                        # Command may have timed out, but test might still be running
+                        logger.warning(f"Command to start test on {host} reported failure, verifying test status...")
+                        hosts_to_verify.append((counter, host, output_file))
+                    else:
+                        # Command succeeded, but verify test actually started
+                        hosts_to_verify.append((counter, host, output_file))
+                except Exception as e:
+                    # Future exception occurred (shouldn't happen, but handle it)
+                    logger.warning(f"Exception getting result for {host}: {e}, verifying test status...")
+                    hosts_to_verify.append((counter, host, output_file))
+            
+            # Verify tests actually started by checking processes and output files
+            logger.info("Verifying that performance tests actually started on all hosts...")
+            time.sleep(2)  # Give processes a moment to start
+            failed_starts = []
+            with ThreadPoolExecutor(max_workers=len(hosts_to_verify)) as verify_pool:
+                verify_futures = []
+                for counter, host, output_file in hosts_to_verify:
+                    # Check both process and output file
+                    verify_cmd = (
+                        f"cd '{config.hammerdb_dir}' && "
+                        f"process_count=$(ps aux | grep -E 'hammerdbcli.*runtest{counter}_mariadb' | grep -v grep | wc -l) && "
+                        f"file_exists=$(test -f '{output_file}' && echo 'yes' || echo 'no') && "
+                        f"file_size=$(test -f '{output_file}' && stat -c%s '{output_file}' 2>/dev/null || echo '0') && "
+                        f"echo \"PROCESS:$process_count FILE:$file_exists SIZE:$file_size\""
+                    )
+                    verify_future = verify_pool.submit(
+                        executor.execute_command, host, verify_cmd, 
+                        f"Verifying test started on {host}", timeout=30
+                    )
+                    verify_futures.append((verify_future, counter, host, output_file))
+                
+                for verify_future, counter, host, output_file in verify_futures:
+                    verify_success, verify_output = verify_future.result()
+                    if verify_success and verify_output:
+                        # Parse verification output
+                        process_count = 0
+                        file_exists = False
+                        file_size = 0
+                        for part in verify_output.strip().split():
+                            if part.startswith("PROCESS:"):
+                                try:
+                                    process_count = int(part.split(":")[1])
+                                except (ValueError, IndexError):
+                                    pass
+                            elif part.startswith("FILE:"):
+                                file_exists = part.split(":")[1] == "yes"
+                            elif part.startswith("SIZE:"):
+                                try:
+                                    file_size = int(part.split(":")[1])
+                                except (ValueError, IndexError):
+                                    pass
+                        
+                        if process_count > 0:
+                            logger.info(f"✓ Test confirmed running on {host} (process found, output file: {output_file})")
+                        elif file_exists and file_size > 0:
+                            logger.info(f"✓ Test appears to have started on {host} (output file exists with size {file_size} bytes)")
+                        else:
+                            logger.error(f"✗ Test verification failed on {host}: process not found, file missing or empty")
+                            failed_starts.append(host)
+                    else:
+                        logger.warning(f"Could not verify test status on {host}, assuming it started: {verify_output}")
+            
+            if failed_starts:
+                logger.error(f"Failed to start or verify tests on {len(failed_starts)} host(s): {', '.join(failed_starts)}")
+                logger.error("Please check the hosts manually to confirm test status")
+                # Don't exit - let the monitoring phase catch if tests aren't running
         
         # Check if migration is needed for this user_count - do this immediately after starting tests
         if user_count in config.migrate_user_counts:
@@ -1257,6 +1473,18 @@ def collect_results(config: MariaDBTestConfig, executor: CommandExecutor, result
                             tar.extractall(host_dir, members=safe_members)
                         os.remove(destination)
                         logger.info(f"Extracted results for {host}")
+                        
+                        # Clean up result files on remote host after successful copy
+                        cleanup_cmd = (
+                            f"cd '{config.hammerdb_dir}' && "
+                            f"rm -f test_mariadb_*.out mariadb-results.tar.gz && "
+                            f"echo 'Cleaned up test result files and archive'"
+                        )
+                        cleanup_success, cleanup_output = executor.execute_command(host, cleanup_cmd, "Cleaning up result files", timeout=30)
+                        if cleanup_success:
+                            logger.info(f"Cleaned up test result files on {host}")
+                        else:
+                            logger.warning(f"Failed to clean up result files on {host}: {cleanup_output}")
                     except Exception as e:
                         logger.warning(f"Failed to extract results for {host}: {e}")
                 else:
@@ -1286,6 +1514,18 @@ def collect_results(config: MariaDBTestConfig, executor: CommandExecutor, result
                                     tar.extractall(host_dir, members=safe_members)
                                 os.remove(destination)
                                 logger.info(f"Extracted results for {host}")
+                                
+                                # Clean up result files on remote host after successful copy
+                                cleanup_cmd = (
+                                    f"cd '{config.hammerdb_dir}' && "
+                                    f"rm -f test_mariadb_*.out mariadb-results.tar.gz && "
+                                    f"echo 'Cleaned up test result files and archive'"
+                                )
+                                cleanup_success, cleanup_output = executor.execute_command(host, cleanup_cmd, "Cleaning up result files", timeout=30)
+                                if cleanup_success:
+                                    logger.info(f"Cleaned up test result files on {host}")
+                                else:
+                                    logger.warning(f"Failed to clean up result files on {host}: {cleanup_output}")
                             except Exception as e:
                                 logger.warning(f"Failed to extract results for {host}: {e}")
                         except Exception as e:
@@ -1460,8 +1700,9 @@ YAML CONFIGURATION:
 
 NOTES:
     - Requires PyYAML for YAML parsing
-    - Script requires virtctl and oc for VM access
-    - All operations are performed as root on target VMs
+    - Script supports both virtctl (OpenShift VMs) and SSH (baremetal/KVM) access
+    - Use --ssh-only for baremetal/KVM hosts, --virtctl-only for OpenShift VMs
+    - All operations are performed as root on target hosts
 
 WORKFLOW:
     For large deployments, you can split the process into phases:
@@ -1482,6 +1723,10 @@ WORKFLOW:
                        help='Only run preparation steps (install packages, git clone, MariaDB setup)')
     parser.add_argument('--copy-results', action='store_true',
                        help='Only copy results from hosts (skip installation, building, and testing)')
+    parser.add_argument('--ssh-only', action='store_true',
+                       help='Force SSH for all hosts (baremetal/KVM, no virtctl)')
+    parser.add_argument('--virtctl-only', action='store_true',
+                       help='Force virtctl for all hosts (OpenShift VMs)')
     
     args = parser.parse_args()
     
@@ -1499,6 +1744,7 @@ WORKFLOW:
     config.config_file = args.config
     config.dry_run = args.dry_run
     config.verbose = args.verbose
+    config.use_virtctl = None if not (args.ssh_only or args.virtctl_only) else (not args.ssh_only)
     config.prepare_hosts = args.prepare_hosts
     config.copy_results = args.copy_results
     

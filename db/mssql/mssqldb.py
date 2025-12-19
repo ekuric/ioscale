@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-PostgreSQL HammerDB TPCC Testing Script
-This script sets up and runs PostgreSQL performance tests using HammerDB TPCC benchmarks
+MSSQL Server HammerDB TPCC Testing Script
+This script sets up and runs MSSQL Server performance tests using HammerDB TPCC benchmarks
 Configuration is read from a YAML file instead of command line arguments
 """
 
@@ -43,11 +43,11 @@ except ImportError:
     sys.exit(1)
 
 
-class PostgreSQLTestConfig:
-    """Configuration class for PostgreSQL tests"""
+class MSSQLTestConfig:
+    """Configuration class for MSSQL Server tests"""
     
     def __init__(self):
-        self.config_file = "config.yaml"
+        self.config_file = "mssql-config.yaml"
         self.dry_run = False
         self.verbose = False
         self.prepare_hosts = False
@@ -89,7 +89,7 @@ def get_vm_number(hostname: str) -> str:
 class CommandExecutor:
     """Handles command execution via virtctl or SSH"""
     
-    def __init__(self, config: PostgreSQLTestConfig):
+    def __init__(self, config: MSSQLTestConfig):
         self.config = config
     
     def is_vm_host(self, host: str) -> bool:
@@ -222,7 +222,7 @@ class CommandExecutor:
 class ConfigLoader:
     """Loads and validates configuration from YAML file"""
     
-    def __init__(self, config: PostgreSQLTestConfig):
+    def __init__(self, config: MSSQLTestConfig):
         self.config = config
     
     def load_config(self) -> None:
@@ -398,7 +398,7 @@ class ConfigLoader:
         sys.exit(1)
 
 
-def check_dependencies(config: PostgreSQLTestConfig) -> None:
+def check_dependencies(config: MSSQLTestConfig) -> None:
     """Check if required tools are installed"""
     missing_tools = []
     
@@ -453,7 +453,7 @@ def check_dependencies(config: PostgreSQLTestConfig) -> None:
             pass
 
 
-def validate_inputs(config: PostgreSQLTestConfig) -> None:
+def validate_inputs(config: MSSQLTestConfig) -> None:
     """Validate configuration inputs"""
     if config.mount_point == "none" and config.disk_list == "none":
         logger.error("Either storage.disk_list or storage.mount_point must be specified in config")
@@ -483,7 +483,7 @@ def validate_inputs(config: PostgreSQLTestConfig) -> None:
             logger.info("Skipping VM validation in SSH-only mode")
 
 
-def display_config(config: PostgreSQLTestConfig) -> None:
+def display_config(config: MSSQLTestConfig) -> None:
     """Display configuration"""
     logger.info(f"Configuration loaded from: {config.config_file}")
     logger.info(f"Hosts: {' '.join(config.db_hosts)}")
@@ -513,18 +513,20 @@ def display_config(config: PostgreSQLTestConfig) -> None:
         logger.info("VM Migration: DISABLED")
 
 
-def ensure_packages_installed(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+def ensure_packages_installed(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     """Ensure required packages are installed on all hosts"""
     logger.info("Checking if required packages are installed on all hosts...")
     
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
-            # Check and install basic packages and PostgreSQL packages
+            # Check and install basic packages and MSSQL packages
+            # Note: MSSQL Server packages require Microsoft repositories to be configured
+            # The install script handles repository configuration
             cmd = (
                 "bash -c '"
                 "packages_installed=true; "
-                "for pkg in git curl vim wget postgresql postgresql-contrib postgresql-server glibc-langpack-en libpq; do "
+                "for pkg in git curl vim wget; do "
                 "  if ! rpm -q $pkg &>/dev/null; then "
                 "    packages_installed=false; "
                 "    break; "
@@ -534,7 +536,7 @@ def ensure_packages_installed(config: PostgreSQLTestConfig, executor: CommandExe
                 "  echo \"All required packages are already installed\"; "
                 "else "
                 "  echo \"Installing required packages...\"; "
-                "  dnf -y install curl vim wget git postgresql.x86_64 postgresql-contrib.x86_64 postgresql-server.x86_64 glibc-langpack-en libpq; "
+                "  dnf -y install curl vim wget git; "
                 "  echo \"Package installation completed\"; "
                 "fi"
                 "'"
@@ -570,12 +572,12 @@ def ensure_packages_installed(config: PostgreSQLTestConfig, executor: CommandExe
     logger.info("Required packages are ready on all hosts")
 
 
-def install_dependencies(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+def install_dependencies(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     """Install dependencies on VMs (legacy function - now calls ensure_packages_installed)"""
     ensure_packages_installed(config, executor)
 
 
-def deploy_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+def deploy_scripts(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     """Deploy HammerDB scripts to VMs"""
     logger.info("Deploying HammerDB scripts to VMs...")
     
@@ -611,17 +613,17 @@ def deploy_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
                 f"  echo \"Git clone completed successfully\"; "
                 f"  echo \"Initializing submodules if any...\"; "
                 f"  git submodule update --init --recursive 2>&1 || echo \"No submodules found or already initialized\"; "
-                f"  if [ -d \"templates/postgresql\" ]; then "
-                f"    echo \"Clone successful - templates/postgresql directory exists\"; "
+                f"  if [ -d \"templates/mssql\" ]; then "
+                f"    echo \"Clone successful - templates/mssql directory exists\"; "
                 f"  else "
-                f"    echo \"ERROR: Clone completed but templates/postgresql directory not found\"; "
+                f"    echo \"ERROR: Clone completed but templates/mssql directory not found\"; "
                 f"    echo \"Current branch: $(git branch --show-current 2>&1 || echo 'unknown')\"; "
                 f"    echo \"Repository structure (top level):\"; "
                 f"    ls -la . 2>&1; "
                 f"    echo \"Checking scripts directory:\"; "
                 f"    ls -la scripts/ 2>&1 | head -20 || echo \"scripts directory does not exist\"; "
-                f"    echo \"Checking for any postgresql-related directories:\"; "
-                f"    find . -type d -iname '*postgresql*' 2>&1 | head -10; "
+                    f"    echo \"Checking for any mssql-related directories:\"; "
+                    f"    find . -type d -iname '*mssql*' 2>&1 | head -10; "
                 f"    echo \"Checking for templates directories:\"; "
                 f"    find . -type d -iname 'templates' 2>&1 | head -10; "
                 f"    exit 1; "
@@ -650,7 +652,7 @@ def deploy_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
-            script_path = f"{config.hammerdb_path}/templates/postgresql/Hammerdb-postgres-install-script"
+            script_path = f"{config.hammerdb_path}/templates/mssql/Hammerdb-mssql-install-script"
             # Check if file exists before chmod, and verify git clone was successful
             # Use bash -c for consistent execution across SSH and virtctl
             script_path_escaped = script_path.replace("'", "'\"'\"'")
@@ -662,7 +664,7 @@ def deploy_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
                 f"else "
                 f"echo \"ERROR: Script file not found at {script_path_escaped}\"; "
                 f"echo \"Checking if git clone was successful...\"; "
-                f"ls -la \"{hammerdb_path_escaped}/templates/postgresql/\" 2>&1 || echo \"Directory does not exist\"; "
+                f"ls -la \"{hammerdb_path_escaped}/templates/mssql/\" 2>&1 || echo \"Directory does not exist\"; "
                 f"exit 1; "
                 f"fi"
                 f"'"
@@ -676,29 +678,29 @@ def deploy_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
                 sys.exit(1)
 
 
-def install_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
-    """Install PostgreSQL on VMs"""
-    logger.info("Installing PostgreSQL on VMs...")
+def install_mssql(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
+    """Install MSSQL Server on VMs"""
+    logger.info("Installing MSSQL Server on VMs...")
     
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
             if config.mount_point == "none":
-                cmd = f"cd '{config.hammerdb_path}/templates/postgresql'; ./Hammerdb-postgres-install-script -d '{config.disk_list}'"
+                cmd = f"cd '{config.hammerdb_path}/templates/mssql'; ./Hammerdb-mssql-install-script -d '{config.disk_list}'"
             else:
-                cmd = f"cd '{config.hammerdb_path}/templates/postgresql'; ./Hammerdb-postgres-install-script -m '{config.mount_point}'"
-            future = pool.submit(executor.execute_command, host, cmd, "Installing PostgreSQL")
+                cmd = f"cd '{config.hammerdb_path}/templates/mssql'; ./Hammerdb-mssql-install-script -m '{config.mount_point}'"
+            future = pool.submit(executor.execute_command, host, cmd, "Installing MSSQL Server", timeout=1800)
             futures.append(future)
         
         failed = 0
         for future in as_completed(futures):
             success, output = future.result()
             if not success:
-                logger.error(f"Failed to install PostgreSQL: {output}")
+                logger.error(f"Failed to install MSSQL Server: {output}")
                 failed += 1
         
         if failed > 0:
-            logger.error(f"{failed}/{len(config.db_hosts)} hosts failed to install PostgreSQL")
+            logger.error(f"{failed}/{len(config.db_hosts)} hosts failed to install MSSQL Server")
             sys.exit(1)
     
     # Create /etc/fstab entries if persistent mount is enabled
@@ -761,71 +763,71 @@ def install_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) 
         logger.info("Skipping /etc/fstab entries (persistent mount not enabled)")
 
 
-def manage_postgresql_service(config: PostgreSQLTestConfig, executor: CommandExecutor, 
-                             host: str, action: str, description: str = "PostgreSQL service management") -> None:
-    """Safely manage PostgreSQL service"""
+def manage_mssql_service(config: MSSQLTestConfig, executor: CommandExecutor, 
+                         host: str, action: str, description: str = "MSSQL Server service management") -> None:
+    """Safely manage MSSQL Server service"""
     if action == "restart":
         cmd = (
-            "if systemctl list-unit-files | grep -q '^postgresql.*\\.service'; then "
-            "if systemctl is-active --quiet postgresql; then "
-            "echo 'PostgreSQL is running, restarting...' && "
-            "systemctl restart postgresql; "
+            "if systemctl list-unit-files | grep -q '^mssql-server.*\\.service'; then "
+            "if systemctl is-active --quiet mssql-server; then "
+            "echo 'MSSQL Server is running, restarting...' && "
+            "systemctl restart mssql-server; "
             "else "
-            "echo 'PostgreSQL is installed but not running, starting...' && "
-            "systemctl start postgresql; "
+            "echo 'MSSQL Server is installed but not running, starting...' && "
+            "systemctl start mssql-server; "
             "fi; "
             "else "
-            "echo 'WARNING: PostgreSQL service not found, skipping restart'; "
+            "echo 'WARNING: MSSQL Server service not found, skipping restart'; "
             "exit 0; "
             "fi"
         )
     elif action == "stop":
         cmd = (
-            "if systemctl list-unit-files | grep -q '^postgresql.*\\.service'; then "
-            "if systemctl is-active --quiet postgresql; then "
-            "echo 'PostgreSQL is running, stopping...' && "
-            "systemctl stop postgresql; "
+            "if systemctl list-unit-files | grep -q '^mssql-server.*\\.service'; then "
+            "if systemctl is-active --quiet mssql-server; then "
+            "echo 'MSSQL Server is running, stopping...' && "
+            "systemctl stop mssql-server; "
             "else "
-            "echo 'PostgreSQL is not running'; "
+            "echo 'MSSQL Server is not running'; "
             "fi; "
             "else "
-            "echo 'WARNING: PostgreSQL service not found, nothing to stop'; "
+            "echo 'WARNING: MSSQL Server service not found, nothing to stop'; "
             "fi"
         )
     else:
-        logger.error(f"Invalid action '{action}' for PostgreSQL service management")
+        logger.error(f"Invalid action '{action}' for MSSQL Server service management")
         return
     
     executor.execute_command(host, cmd, description)
 
 
-def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     """Build TPCC database"""
     logger.info("Building TPCC database with parallel execution...")
     
-    # Step 1: Restart PostgreSQL services
-    logger.info("Step 1/5: Restarting PostgreSQL services on all hosts...")
+    # Step 1: Restart MSSQL Server services
+    logger.info("Step 1/5: Restarting MSSQL Server services on all hosts...")
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
-            future = pool.submit(manage_postgresql_service, config, executor, host, "restart", "Restarting PostgreSQL service")
+            future = pool.submit(manage_mssql_service, config, executor, host, "restart", "Restarting MSSQL Server service")
             futures.append(future)
         for future in as_completed(futures):
             future.result()
     
     # Step 2: Wait for services to be ready
-    logger.info("Step 2/5: Waiting for PostgreSQL services to be ready...")
-    time.sleep(15)
+    logger.info("Step 2/5: Waiting for MSSQL Server services to be ready...")
+    time.sleep(30)  # MSSQL Server may need more time to start
     
     # Step 3: Clean existing databases
     logger.info("Step 3/5: Cleaning existing databases on all hosts...")
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
+            # MSSQL uses sqlcmd instead of psql
+            # Note: Password is typically set during installation (default: 100yard-)
             cmd = (
-                "echo 'DROP DATABASE IF EXISTS tpcc;' > /tmp/cleanup.sql && "
-                "echo 'DROP ROLE IF EXISTS tpcc;' >> /tmp/cleanup.sql && "
-                "/usr/bin/psql -U postgres -d postgres -h 127.0.0.1 -f /tmp/cleanup.sql"
+                "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P '100yard-' -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
             )
             future = pool.submit(executor.execute_command, host, cmd, "Cleaning existing database")
             futures.append(future)
@@ -840,11 +842,13 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
             vm_number = get_vm_number(host)
             cmd = (
                 f"cd {config.hammerdb_dir} && "
-                f"cp '{config.hammerdb_path}/templates/postgresql/postgresqlsetup/build_pg.tcl' build{vm_number}_pg.tcl && "
-                f"sed -i 's/^diset connection pg_host.*/diset connection pg_host 127.0.0.1/g' build{vm_number}_pg.tcl && "
-                f"sed -i 's/^diset tpcc pg_count_ware.*/diset tpcc pg_count_ware {config.warehouse_count}/g' build{vm_number}_pg.tcl"
+                f"cp '{config.hammerdb_path}/templates/mssql/mssqlsetup/build_mssql.tcl' build{vm_number}_mssql.tcl 2>/dev/null || "
+                f"cp build_mssql.tcl build{vm_number}_mssql.tcl 2>/dev/null || "
+                f"cp build_mssql_mnt.tcl build{vm_number}_mssql.tcl 2>/dev/null && "
+                f"sed -i 's/^diset connection mssql_host.*/diset connection mssql_host 127.0.0.1/g' build{vm_number}_mssql.tcl && "
+                f"sed -i 's/^diset tpcc mssql_count_ware.*/diset tpcc mssql_count_ware {config.warehouse_count}/g' build{vm_number}_mssql.tcl"
             )
-            future = pool.submit(executor.execute_command, host, cmd, f"Preparing build script (build{vm_number}_pg.tcl)")
+            future = pool.submit(executor.execute_command, host, cmd, f"Preparing build script (build{vm_number}_mssql.tcl)")
             futures.append((future, vm_number))
         for future, vm_number in futures:
             success, output = future.result()
@@ -860,14 +864,14 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
         futures = []
         for host in config.db_hosts:
             vm_number = get_vm_number(host)
-            output_file = f"build_pg{vm_number}.out"
+            output_file = f"build_mssql{vm_number}.out"
             # Start the build process and immediately verify it's running
             # This approach ensures we can verify the process even if SSH times out
             cmd = (
                 f"cd {config.hammerdb_dir} && "
-                f"nohup ./hammerdbcli auto build{vm_number}_pg.tcl > {output_file} 2>&1 < /dev/null & "
+                f"nohup ./hammerdbcli auto build{vm_number}_mssql.tcl > {output_file} 2>&1 < /dev/null & "
                 f"sleep 2 && "
-                f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
+                f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_mssql' | grep -v grep | wc -l"
             )
             # Use longer timeout (60s) to account for process startup and verification
             future = pool.submit(executor.execute_command, host, cmd, f"Starting database build (output: {output_file})", timeout=60)
@@ -881,7 +885,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
             if not success:
                 # Even if command timed out, verify the process might still be running
                 logger.warning(f"Command to start database build on {host} may have timed out, verifying process...")
-                verify_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
+                verify_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_mssql' | grep -v grep | wc -l"
                 verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build process on {host}", timeout=30)
                 if verify_success:
                     process_count = int(verify_output.strip()) if verify_output.strip().isdigit() else 0
@@ -929,7 +933,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
             for host in hosts_to_check:
                 vm_number, output_file = host_build_info[host]
                 # Check if hammerdbcli build process is still running
-                check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
+                check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_mssql' | grep -v grep | wc -l"
                 future = pool.submit(executor.execute_command, host, check_cmd, f"Checking build status on {host}", timeout=30)
                 futures.append((future, vm_number, host, output_file))
             
@@ -988,7 +992,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
         futures = []
         for host in config.db_hosts:
             vm_number, output_file = host_build_info[host]
-            check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
+            check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_mssql' | grep -v grep | wc -l"
             future = pool.submit(executor.execute_command, host, check_cmd, f"Final build status check on {host}", timeout=30)
             futures.append((future, vm_number, host, output_file))
         
@@ -1033,8 +1037,8 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
     logger.info("Database building completed successfully on all hosts!")
 
 
-def migrate_vms_during_test(config: PostgreSQLTestConfig, executor: CommandExecutor, user_count: str) -> bool:
-    """Migrate VMs during PostgreSQL test"""
+def migrate_vms_during_test(config: MSSQLTestConfig, executor: CommandExecutor, user_count: str) -> bool:
+    """Migrate VMs during MSSQL Server test"""
     if not config.migrate_user_counts or user_count not in config.migrate_user_counts:
         return True
     
@@ -1174,7 +1178,7 @@ def migrate_vms_during_test(config: PostgreSQLTestConfig, executor: CommandExecu
         return True
 
 
-def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+def run_tests(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     """Run performance tests"""
     logger.info("Running performance tests...")
     
@@ -1192,12 +1196,14 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
                 vm_number = get_vm_number(host)
                 cmd = (
                     f"cd {config.hammerdb_dir} && "
-                    f"cp '{config.hammerdb_path}/templates/postgresql/postgresqlsetup/runtest_pg.tcl' runtest{vm_number}_pg.tcl && "
-                    f"sed -i 's/^diset tpcc pg_count_ware.*/diset tpcc pg_count_ware {config.warehouse_count}/g' runtest{vm_number}_pg.tcl && "
-                    f"sed -i 's/^vuset.*/vuset vu {user_count}/g' runtest{vm_number}_pg.tcl && "
-                    f"sed -i 's/^diset tpcc pg_duration.*/diset tpcc pg_duration {config.test_duration}/g' runtest{vm_number}_pg.tcl"
+                    f"cp '{config.hammerdb_path}/templates/mssql/mssqlsetup/runtest_mssql.tcl' runtest{vm_number}_mssql.tcl 2>/dev/null || "
+                    f"cp runtest_mssql.tcl runtest{vm_number}_mssql.tcl 2>/dev/null || "
+                    f"cp runtest_mssql_mnt.tcl runtest{vm_number}_mssql.tcl 2>/dev/null && "
+                    f"sed -i 's/^diset tpcc mssql_count_ware.*/diset tpcc mssql_count_ware {config.warehouse_count}/g' runtest{vm_number}_mssql.tcl && "
+                    f"sed -i 's/^vuset.*/vuset vu {user_count}/g' runtest{vm_number}_mssql.tcl && "
+                    f"sed -i 's/^diset tpcc mssql_duration.*/diset tpcc mssql_duration {config.test_duration}/g' runtest{vm_number}_mssql.tcl"
                 )
-                future = pool.submit(executor.execute_command, host, cmd, f"Preparing test script (runtest{vm_number}_pg.tcl) for {user_count} users")
+                future = pool.submit(executor.execute_command, host, cmd, f"Preparing test script (runtest{vm_number}_mssql.tcl) for {user_count} users")
                 futures.append(future)
             for future in as_completed(futures):
                 future.result()
@@ -1216,10 +1222,10 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
             futures = []
             for host in config.db_hosts:
                 vm_number = get_vm_number(host)
-                output_file = f"test_postgresql_pg_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"
+                output_file = f"test_mssql_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"
                 # Use nohup with & to truly background the process and return immediately
                 # The command should return quickly, but we use a longer timeout to account for slow SSH connections
-                cmd = f"cd {config.hammerdb_dir} && nohup ./hammerdbcli auto runtest{vm_number}_pg.tcl > '{output_file}' 2>&1 & echo 'Test start command executed'"
+                cmd = f"cd {config.hammerdb_dir} && nohup ./hammerdbcli auto runtest{vm_number}_mssql.tcl > '{output_file}' 2>&1 & echo 'Test start command executed'"
                 # Use longer timeout (60s) to account for slow SSH connections, but verification will confirm actual start
                 future = pool.submit(executor.execute_command, host, cmd, f"Starting performance test (output: {output_file})", timeout=60)
                 futures.append((future, vm_number, host, output_file))
@@ -1252,7 +1258,7 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
                     # Check both process and output file
                     verify_cmd = (
                         f"cd {config.hammerdb_dir} && "
-                        f"process_count=$(ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_pg' | grep -v grep | wc -l) && "
+                        f"process_count=$(ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_mssql' | grep -v grep | wc -l) && "
                         f"file_exists=$(test -f '{output_file}' && echo 'yes' || echo 'no') && "
                         f"file_size=$(test -f '{output_file}' && stat -c%s '{output_file}' 2>/dev/null || echo '0') && "
                         f"echo \"PROCESS:$process_count FILE:$file_exists SIZE:$file_size\""
@@ -1318,7 +1324,7 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
             logger.info("Verifying HammerDB processes are still running after migration...")
             for host in config.db_hosts:
                 vm_number = get_vm_number(host)
-                cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_pg' | grep -v grep | wc -l"
+                cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_mssql' | grep -v grep | wc -l"
                 success, output = executor.execute_command(host, cmd, "Checking HammerDB process status", timeout=30)
                 if success:
                     process_count = int(output.strip()) if output.strip().isdigit() else 0
@@ -1333,9 +1339,9 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
             futures = []
             for host in config.db_hosts:
                 vm_number = get_vm_number(host)
-                output_file = f"test_postgresql_pg_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"
+                output_file = f"test_mssql_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"
                 # Check if test is still running by looking for the process
-                check_cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_pg' | grep -v grep | wc -l"
+                check_cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_mssql' | grep -v grep | wc -l"
                 future = pool.submit(executor.execute_command, host, check_cmd, f"Checking test status on {host}", timeout=30)
                 futures.append((future, vm_number, host, output_file))
             
@@ -1362,7 +1368,7 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
                                 running_count += 1
                     except Exception:
                         # Re-check this host
-                        check_cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_pg' | grep -v grep | wc -l"
+                        check_cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_mssql' | grep -v grep | wc -l"
                         success, output = executor.execute_command(host, check_cmd, f"Rechecking test status on {host}", timeout=30)
                         if success:
                             process_count = int(output.strip()) if output.strip().isdigit() else 0
@@ -1382,15 +1388,15 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
                 futures = []
                 for host in config.db_hosts:
                     vm_number = get_vm_number(host)
-                    check_cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_pg' | grep -v grep | wc -l"
+                    check_cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_mssql' | grep -v grep | wc -l"
                     future = pool.submit(executor.execute_command, host, check_cmd, f"Checking test status on {host}", timeout=30)
-                    futures.append((future, vm_number, host, f"test_postgresql_pg_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"))
+                    futures.append((future, vm_number, host, f"test_mssql_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"))
         
         # Step 3: Collect results
         logger.info(f"Collecting test results for {user_count} users:")
         for host in config.db_hosts:
             vm_number = get_vm_number(host)
-            output_file = f"test_postgresql_pg_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"
+            output_file = f"test_mssql_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"
             if not config.dry_run:
                 cmd = f"cd {config.hammerdb_dir}; grep TPM '{output_file}' | awk '{{print $7}}' || echo 'No results found'"
                 success, result = executor.execute_command(host, cmd, "Collecting TPM results", timeout=30)
@@ -1404,9 +1410,9 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
         logger.info(f"Completed test run with {user_count} users on all hosts")
 
 
-def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, results_dir: str, log_file: str = None) -> None:
+def collect_results(config: MSSQLTestConfig, executor: CommandExecutor, results_dir: str, log_file: str = None) -> None:
     """Collect test results from all VMs"""
-    logger.info("Collecting PostgreSQL test results...")
+    logger.info("Collecting MSSQL Server test results...")
     os.makedirs(results_dir, exist_ok=True)
     
     for host in config.db_hosts:
@@ -1421,8 +1427,8 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
         else:
             cmd = (
                 f"cd {config.hammerdb_dir} && "
-                f"tar czf postgresql-results.tar.gz build_pg*.out test_postgresql_pg_*.out 2>/dev/null || "
-                f"tar czf postgresql-results.tar.gz build_pg*.out 2>/dev/null || "
+                f"tar czf mssql-results.tar.gz build_mssql*.out test_mssql_*.out 2>/dev/null || "
+                f"tar czf mssql-results.tar.gz build_mssql*.out 2>/dev/null || "
                 f"echo 'No result files found'"
             )
             executor.execute_command(host, cmd, "Creating results archive")
@@ -1432,8 +1438,8 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
             logger.info(f"DRY-RUN: Would copy results from {host} to {host_dir}/")
         else:
             logger.info(f"Copying results from {host} to localhost...")
-            source = f"root@vmi/{host}:{config.hammerdb_dir}/postgresql-results.tar.gz"
-            destination = os.path.join(host_dir, "postgresql-results.tar.gz")
+            source = f"root@vmi/{host}:{config.hammerdb_dir}/mssql-results.tar.gz"
+            destination = os.path.join(host_dir, "mssql-results.tar.gz")
             
             try:
                 scp_cmd = executor.get_scp_command(source, destination)
@@ -1461,7 +1467,7 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
                         # Clean up result files on remote host after successful copy
                         cleanup_cmd = (
                             f"cd '{config.hammerdb_dir}' && "
-                            f"rm -f test_postgresql_pg_*.out postgresql-results.tar.gz && "
+                            f"rm -f test_mssql_*.out mssql-results.tar.gz && "
                             f"echo 'Cleaned up test result files and archive'"
                         )
                         cleanup_success, cleanup_output = executor.execute_command(host, cleanup_cmd, "Cleaning up result files", timeout=30)
@@ -1474,7 +1480,7 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
                 else:
                     # Fallback: use virtctl ssh with base64 encoding
                     logger.warning("virtctl scp failed, trying alternative method...")
-                    cmd = f"base64 '{config.hammerdb_dir}/postgresql-results.tar.gz'"
+                    cmd = f"base64 '{config.hammerdb_dir}/mssql-results.tar.gz'"
                     success, output = executor.execute_command(host, cmd, "Reading results archive", timeout=300)
                     if success:
                         try:
@@ -1502,7 +1508,7 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
                                 # Clean up result files on remote host after successful copy
                                 cleanup_cmd = (
                                     f"cd {config.hammerdb_dir} && "
-                                    f"rm -f test_postgresql_pg_*.out postgresql-results.tar.gz && "
+                                    f"rm -f test_mssql_*.out mssql-results.tar.gz && "
                                     f"echo 'Cleaned up test result files and archive'"
                                 )
                                 cleanup_success, cleanup_output = executor.execute_command(host, cleanup_cmd, "Cleaning up result files", timeout=30)
@@ -1516,7 +1522,7 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
                             logger.error(f"Failed to save results from {host}: {e}")
                     else:
                         logger.error(f"Failed to copy results from {host} using both methods")
-                        logger.info(f"Results are still available on {host} at {config.hammerdb_dir}/postgresql-results.tar.gz")
+                        logger.info(f"Results are still available on {host} at {config.hammerdb_dir}/mssql-results.tar.gz")
             except Exception as e:
                 logger.error(f"Error copying results from {host}: {e}")
     
@@ -1544,17 +1550,17 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
             pass
         
         # Display summary
-        logger.info("PostgreSQL Test Results Summary:")
+        logger.info("MSSQL Server Test Results Summary:")
         for host_dir in os.listdir(results_dir):
             host_path = os.path.join(results_dir, host_dir)
             if os.path.isdir(host_path):
-                build_files = len([f for f in os.listdir(host_path) if f.startswith("build_pg") and f.endswith(".out")])
-                test_files = len([f for f in os.listdir(host_path) if f.startswith("test_postgresql_pg_") and f.endswith(".out")])
+                build_files = len([f for f in os.listdir(host_path) if f.startswith("build_mssql") and f.endswith(".out")])
+                test_files = len([f for f in os.listdir(host_path) if f.startswith("test_mssql_") and f.endswith(".out")])
                 logger.info(f"  {host_dir}: {build_files} build files, {test_files} test files")
                 
                 # Extract performance metrics if available
                 for test_file in os.listdir(host_path):
-                    if test_file.startswith("test_postgresql_pg_") and test_file.endswith(".out"):
+                    if test_file.startswith("test_mssql_") and test_file.endswith(".out"):
                         test_file_path = os.path.join(host_path, test_file)
                         try:
                             with open(test_file_path, 'r') as f:
@@ -1566,16 +1572,16 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
                             pass
 
 
-def stop_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
-    """Stop PostgreSQL instances"""
-    logger.info("Stopping PostgreSQL instances on all hosts...")
+def stop_mssql(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
+    """Stop MSSQL Server instances"""
+    logger.info("Stopping MSSQL Server instances on all hosts...")
     
-    # Step 1: Stop PostgreSQL services
-    logger.info("Step 1/3: Stopping PostgreSQL services on all hosts...")
+    # Step 1: Stop MSSQL Server services
+    logger.info("Step 1/3: Stopping MSSQL Server services on all hosts...")
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
-            future = pool.submit(manage_postgresql_service, config, executor, host, "stop", "Stopping PostgreSQL service")
+            future = pool.submit(manage_mssql_service, config, executor, host, "stop", "Stopping MSSQL Server service")
             futures.append(future)
         for future in as_completed(futures):
             future.result()
@@ -1594,7 +1600,7 @@ def stop_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> 
                     f"else "
                     f"echo 'Mount point {config.mount_point} is not mounted or does not exist'; "
                     f"fi && "
-                    f"cd {config.hammerdb_dir} && rm -f postgresql-results.tar.gz 2>/dev/null || true"
+                    f"cd {config.hammerdb_dir} && rm -f mssql-results.tar.gz 2>/dev/null || true"
                 )
                 future = pool.submit(executor.execute_command, host, cmd, "Cleaning up storage and temporary files")
                 futures.append(future)
@@ -1613,7 +1619,7 @@ def stop_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> 
                     "else "
                     "echo 'Mount point /perf1 is not mounted or does not exist'; "
                     "fi && "
-                    f"cd {config.hammerdb_dir} && rm -f postgresql-results.tar.gz 2>/dev/null || true"
+                    f"cd {config.hammerdb_dir} && rm -f mssql-results.tar.gz 2>/dev/null || true"
                 )
                 future = pool.submit(executor.execute_command, host, cmd, "Cleaning up disk device mount point and temporary files")
                 futures.append(future)
@@ -1624,7 +1630,7 @@ def stop_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> 
         with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
             futures = []
             for host in config.db_hosts:
-                cmd = f"cd {config.hammerdb_dir} && rm -f postgresql-results.tar.gz 2>/dev/null || true"
+                cmd = f"cd {config.hammerdb_dir} && rm -f mssql-results.tar.gz 2>/dev/null || true"
                 future = pool.submit(executor.execute_command, host, cmd, "Cleaning up temporary files")
                 futures.append(future)
             for future in as_completed(futures):
@@ -1633,11 +1639,11 @@ def stop_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> 
     logger.info("Cleanup completed")
 
 
-def prepare_hosts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+def prepare_hosts(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     """Preparation-only function"""
     logger.info("=== HOST PREPARATION MODE ===")
     logger.info("Starting host preparation phase")
-    logger.info("This will install packages, clone repositories, and setup PostgreSQL")
+    logger.info("This will install packages, clone repositories, and setup MSSQL Server")
     logger.info("Performance tests will NOT be executed")
     
     if config.dry_run:
@@ -1645,14 +1651,14 @@ def prepare_hosts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> No
         logger.info("Would execute the following preparation steps:")
         logger.info("  1. Install dependencies on VMs")
         logger.info("  2. Deploy HammerDB scripts")
-        logger.info("  3. Install PostgreSQL")
+        logger.info("  3. Install MSSQL Server")
         logger.info("Use without --dry-run to execute the actual preparation")
         return
     
     logger.info("Running host preparation steps...")
     install_dependencies(config, executor)
     deploy_scripts(config, executor)
-    install_postgresql(config, executor)
+    install_mssql(config, executor)
     
     logger.info("=== HOST PREPARATION COMPLETED ===")
     logger.info("Host preparation completed successfully")
@@ -1662,22 +1668,22 @@ def prepare_hosts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> No
     logger.info("  1. Run the script without --prepare-hosts to execute performance tests")
     logger.info("  2. Or run with --dry-run to validate the test configuration")
     logger.info("")
-    logger.info(f"Example: python3 postgresql.py -c {config.config_file}  # Run full performance test")
+    logger.info(f"Example: python3 mssqldb.py -c {config.config_file}  # Run full performance test")
 
 
 def main():
     """Main function"""
     parser = argparse.ArgumentParser(
-        description="PostgreSQL HammerDB TPCC Testing Script (YAML Configuration Version)",
+        description="MSSQL Server HammerDB TPCC Testing Script (YAML Configuration Version)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 EXAMPLES:
-    python3 postgresql.py                          # Use default config.yaml
-    python3 postgresql.py -c test-config.yaml      # Use custom configuration file
-    python3 postgresql.py -c config.yaml -v        # Use default config with verbose output
-    python3 postgresql.py --prepare-hosts          # Only prepare hosts (install packages, PostgreSQL)
-    python3 postgresql.py --prepare-hosts -v       # Prepare hosts with verbose output
-    python3 postgresql.py --copy-results           # Only copy results from hosts (skip all other steps)
+    python3 mssqldb.py                          # Use default mssql-config.yaml
+    python3 mssqldb.py -c test-config.yaml      # Use custom configuration file
+    python3 mssqldb.py -c mssql-config.yaml -v        # Use default config with verbose output
+    python3 mssqldb.py --prepare-hosts          # Only prepare hosts (install packages, MSSQL Server)
+    python3 mssqldb.py --prepare-hosts -v       # Prepare hosts with verbose output
+    python3 mssqldb.py --copy-results           # Only copy results from hosts (skip all other steps)
 
 YAML CONFIGURATION:
     See config.yaml for configuration file format and examples.
@@ -1690,21 +1696,21 @@ NOTES:
 
 WORKFLOW:
     For large deployments, you can split the process into phases:
-    1. Preparation: python3 postgresql.py --prepare-hosts    # Install packages, PostgreSQL
-    2. Testing:     python3 postgresql.py                   # Run performance tests
-    3. Copy Results: python3 postgresql.py --copy-results   # Re-copy results without re-running tests
+    1. Preparation: python3 mssqldb.py --prepare-hosts    # Install packages, MSSQL Server
+    2. Testing:     python3 mssqldb.py                   # Run performance tests
+    3. Copy Results: python3 mssqldb.py --copy-results   # Re-copy results without re-running tests
     
     This allows you to prepare all hosts first, then run tests when ready, and copy results later if needed.
         """
     )
-    parser.add_argument('-c', '--config', default='config.yaml',
-                       help='Path to YAML configuration file (default: config.yaml)')
+    parser.add_argument('-c', '--config', default='mssql-config.yaml',
+                       help='Path to YAML configuration file (default: mssql-config.yaml)')
     parser.add_argument('-v', '--verbose', action='store_true',
                        help='Verbose output')
     parser.add_argument('--dry-run', action='store_true',
                        help='Validate configuration and show what would be done without executing')
     parser.add_argument('--prepare-hosts', action='store_true',
-                       help='Only run preparation steps (install packages, git clone, PostgreSQL setup)')
+                       help='Only run preparation steps (install packages, git clone, MSSQL Server setup)')
     parser.add_argument('--copy-results', action='store_true',
                        help='Only copy results from hosts (skip installation, building, and testing)')
     parser.add_argument('--ssh-only', action='store_true',
@@ -1719,12 +1725,12 @@ WORKFLOW:
         logging.getLogger().setLevel(logging.DEBUG)
     
     if args.prepare_hosts:
-        logger.info("Starting PostgreSQL HammerDB TPCC testing script (PREPARATION MODE)")
+        logger.info("Starting MSSQL Server HammerDB TPCC testing script (PREPARATION MODE)")
     else:
-        logger.info("Starting PostgreSQL HammerDB TPCC testing script (FULL TEST MODE)")
+        logger.info("Starting MSSQL Server HammerDB TPCC testing script (FULL TEST MODE)")
     
     # Initialize configuration
-    config = PostgreSQLTestConfig()
+    config = MSSQLTestConfig()
     config.config_file = args.config
     config.dry_run = args.dry_run
     config.verbose = args.verbose
@@ -1742,9 +1748,9 @@ WORKFLOW:
     sanitized_desc = re.sub(r'_+', '_', sanitized_desc).strip('_')
     
     if sanitized_desc:
-        log_file = f"postgresql-{log_date}-{sanitized_desc}.txt"
+        log_file = f"mssql-{log_date}-{sanitized_desc}.txt"
     else:
-        log_file = f"postgresql-{log_date}.txt"
+        log_file = f"mssql-{log_date}.txt"
     
     # Add file handler
     file_handler = logging.FileHandler(log_file)
@@ -1782,16 +1788,16 @@ WORKFLOW:
             logger.info("Would execute the following preparation steps:")
             logger.info("  1. Install dependencies on VMs")
             logger.info("  2. Deploy HammerDB scripts")
-            logger.info("  3. Install PostgreSQL")
+            logger.info("  3. Install MSSQL Server")
         else:
             logger.info("Would execute the following steps:")
             logger.info("  1. Install dependencies on VMs")
             logger.info("  2. Deploy HammerDB scripts")
-            logger.info("  3. Install PostgreSQL")
+            logger.info("  3. Install MSSQL Server")
             logger.info("  4. Build TPCC database")
             logger.info("  5. Run performance tests")
             logger.info("  6. Collect test results from all VMs")
-            logger.info("  7. Stop PostgreSQL instances and cleanup storage")
+            logger.info("  7. Stop MSSQL Server instances and cleanup storage")
         logger.info("Use without --dry-run to execute the actual tests")
         return 0
     
@@ -1809,16 +1815,16 @@ WORKFLOW:
         sanitized_desc = re.sub(r'_+', '_', sanitized_desc).strip('_')
         
         if sanitized_desc:
-            final_results_dir = f"./postgresql-results-{results_timestamp}-{sanitized_desc}"
+            final_results_dir = f"./mssql-results-{results_timestamp}-{sanitized_desc}"
         else:
-            final_results_dir = f"./postgresql-results-{results_timestamp}"
+            final_results_dir = f"./mssql-results-{results_timestamp}"
         
         # Try to find existing log file matching the pattern
         log_file_to_copy = None
         if sanitized_desc:
-            pattern = f"postgresql-*-{sanitized_desc}.txt"
+            pattern = f"mssql-*-{sanitized_desc}.txt"
         else:
-            pattern = f"postgresql-*.txt"
+            pattern = f"mssql-*.txt"
         
         # Look for most recent matching log file
         matching_logs = glob.glob(pattern)
@@ -1841,7 +1847,7 @@ WORKFLOW:
     # Full test execution
     install_dependencies(config, executor)
     deploy_scripts(config, executor)
-    install_postgresql(config, executor)
+    install_mssql(config, executor)
     build_database(config, executor)
     run_tests(config, executor)
     
@@ -1851,14 +1857,14 @@ WORKFLOW:
     sanitized_desc = re.sub(r'_+', '_', sanitized_desc).strip('_')
     
     if sanitized_desc:
-        final_results_dir = f"./postgresql-results-{results_timestamp}-{sanitized_desc}"
+        final_results_dir = f"./mssql-results-{results_timestamp}-{sanitized_desc}"
     else:
-        final_results_dir = f"./postgresql-results-{results_timestamp}"
+        final_results_dir = f"./mssql-results-{results_timestamp}"
     
     collect_results(config, executor, final_results_dir, log_file)
-    stop_postgresql(config, executor)
+    stop_mssql(config, executor)
     
-    logger.info("PostgreSQL performance testing completed successfully")
+    logger.info("MSSQL Server performance testing completed successfully")
     logger.info(f"Results have been copied to localhost: {final_results_dir}")
     logger.info("Each VM's results are in separate subdirectories with extracted files")
     return 0
