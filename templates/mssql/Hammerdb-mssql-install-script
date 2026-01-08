@@ -118,15 +118,11 @@ log_step "Disabling SELinux"
 setenforce 0 || log_info "SELinux already disabled or not available"
 
 # ----------------------------------------------------------------------------
-# Step 2: Stop Existing Database Services
+# Step 2: Stop Existing MSSQL Server Service (if any)
 # ----------------------------------------------------------------------------
-log_step "Stopping Existing Database Services"
+log_step "Stopping Existing MSSQL Server Service"
 log_info "Stopping MSSQL Server..."
 systemctl stop mssql-server || log_info "MSSQL Server was not running"
-log_info "Stopping MariaDB..."
-systemctl stop mariadb || log_info "MariaDB was not running"
-log_info "Stopping PostgreSQL..."
-systemctl stop postgresql || log_info "PostgreSQL was not running"
 
 # ----------------------------------------------------------------------------
 # Step 3: Install HammerDB

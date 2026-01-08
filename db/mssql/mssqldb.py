@@ -322,7 +322,7 @@ class ConfigLoader:
         host_pattern = database.get('host_pattern')
         if host_pattern:
             logger.info(f"Using host pattern: {host_pattern}")
-            # Expand pattern like pg{1..200}
+            # Expand pattern like mssql{1..200}
             if '{' in host_pattern and '..' in host_pattern:
                 match = re.search(r'([\w-]+)\{(\d+)\.\.(\d+)\}', host_pattern)
                 if match:
@@ -360,7 +360,7 @@ class ConfigLoader:
                     logger.warning(f"Failed to query VMs by labels: {e}")
             else:
                 logger.info(f"Dry-run mode: Would query VMs with labels: {host_labels}")
-                return ["example-pg1", "example-pg2"]
+                return ["example-mssql1", "example-mssql2"]
         
         # Method 3: Host file
         host_file = database.get('host_file')
@@ -824,7 +824,7 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
-            # MSSQL uses sqlcmd instead of psql
+            # MSSQL uses sqlcmd for database operations
             # Note: Password is typically set during installation (default: 100yard-)
             cmd = (
                 "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P '100yard-' -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
