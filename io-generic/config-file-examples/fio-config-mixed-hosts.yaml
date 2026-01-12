@@ -34,7 +34,7 @@ storage:
     "storage-node-{1..2}": "sdb"
     
     # Individual hosts (for special cases)
-    "n42-h01-b06-mx750c.rdu3.labs.perfscale.redhat.com": "sda"
+    "ref.test.com": "sda"
   
   # Mount point for the test filesystem
   mount_point: "/root/tests/data"
