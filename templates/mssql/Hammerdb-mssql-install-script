@@ -23,7 +23,7 @@ DISKS="none"
 MOUNTPOINT="none"
 HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts"
 HAMMERDB_INSTALL_DIR="/usr/local/HammerDB"
-MSSQL_SA_PASSWORD="100yard-"
+MSSQL_SA_PASSWORD="mssqlpasswd"
 MSSQL_PID="Evaluation"
 DEFAULT_MOUNTPOINT="/perf1"
 MSSQL_DATA_DIR="/var/opt/mssql"
@@ -185,15 +185,12 @@ log_step "Copying MSSQL Configuration Files"
 
 cd "${HAMMERDB_INSTALL_DIR}" || error_exit "Cannot change to HammerDB install directory"
 
-if [ -d "/tmp/hammerdb-tpcc/mssql" ]; then
-    log_info "Copying MSSQL files from /tmp/hammerdb-tpcc/mssql..."
-    cp -R /tmp/hammerdb-tpcc/mssql/* . || log_info "Warning: Some files may not have been copied"
-elif [ -d "${HAMMERDB_PATH}/templates/mssql/mssqlsetup" ]; then
-    log_info "Copying MSSQL files from templates/mssql/mssqlsetup..."
-    cp -R "${HAMMERDB_PATH}/templates/mssql/mssqlsetup/"* . 2>/dev/null || \
+if [ -d "${HAMMERDB_PATH}/templates/mssql/mssqlsetup" ]; then
+    log_info "Copying mssqlsetup files..."
+    cp "${HAMMERDB_PATH}/templates/mssql/mssqlsetup/"* . 2>/dev/null || \
         log_info "Warning: Some files may not have been copied"
 else
-    log_info "Warning: MSSQL setup files directory not found, continuing without copying"
+    log_info "Warning: mssqlsetup directory not found, skipping file copy"
 fi
 
 # ----------------------------------------------------------------------------
