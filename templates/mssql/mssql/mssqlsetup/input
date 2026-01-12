@@ -1,0 +1,169 @@
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev1;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev1, FILENAME = '/perf1/mssql_data/data/tempdb1.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev2;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev2, FILENAME = '/perf1/mssql_data/data/tempdb2.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev3;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev3, FILENAME = '/perf1/mssql_data/data/tempdb3.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev4;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev4, FILENAME = '/perf1/mssql_data/data/tempdb4.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev5;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev5, FILENAME = '/perf1/mssql_data/data/tempdb5.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev6;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev6, FILENAME = '/perf1/mssql_data/data/tempdb6.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev7;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev7, FILENAME = '/perf1/mssql_data/data/tempdb7.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev8;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev8, FILENAME = '/perf1/mssql_data/data/tempdb8.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev9;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev9, FILENAME = '/perf1/mssql_data/data/tempdb9.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev10;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev10, FILENAME = '/perf1/mssql_data/data/tempdb10.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev11;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev11, FILENAME = '/perf1/mssql_data/data/tempdb11.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev12;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev12, FILENAME = '/perf1/mssql_data/data/tempdb12.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev13;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev13, FILENAME = '/perf1/mssql_data/data/tempdb13.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev14;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev14, FILENAME = '/perf1/mssql_data/data/tempdb14.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev15;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev15, FILENAME = '/perf1/mssql_data/data/tempdb15.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev16;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev16, FILENAME = '/perf1/mssql_data/data/tempdb16.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev17;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev17, FILENAME = '/perf1/mssql_data/data/tempdb17.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev18;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev18, FILENAME = '/perf1/mssql_data/data/tempdb18.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev19;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev19, FILENAME = '/perf1/mssql_data/data/tempdb19.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev20;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev20, FILENAME = '/perf1/mssql_data/data/tempdb20.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev21;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev21, FILENAME = '/perf1/mssql_data/data/tempdb21.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev22;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev22, FILENAME = '/perf1/mssql_data/data/tempdb22.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev23;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev23, FILENAME = '/perf1/mssql_data/data/tempdb23.mdf', SIZE = 256)
+GO
+ 
+ALTER DATABASE tempdb REMOVE FILE tempdev24;
+GO
+ 
+ALTER DATABASE tempdb ADD FILE
+(    NAME = tempdev24, FILENAME = '/perf1/mssql_data/data/tempdb24.mdf', SIZE = 256)
+GO
+ 

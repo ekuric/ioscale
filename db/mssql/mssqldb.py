@@ -600,6 +600,7 @@ def deploy_scripts(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
             # Improved git clone with better error handling and diagnostics
             # Use bash -c with proper quoting to ensure consistent execution for both SSH and virtctl
             # This ensures the same shell behavior regardless of connection method
+            # Check multiple possible locations for templates directory
             hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
             hammerdb_repo_escaped = config.hammerdb_repo.replace("'", "'\"'\"'")
             hammerdb_path_display = config.hammerdb_path.replace("'", "'\"'\"'")
@@ -613,19 +614,33 @@ def deploy_scripts(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
                 f"  echo \"Git clone completed successfully\"; "
                 f"  echo \"Initializing submodules if any...\"; "
                 f"  git submodule update --init --recursive 2>&1 || echo \"No submodules found or already initialized\"; "
+                f"  echo \"Checking for templates directory in various locations...\"; "
                 f"  if [ -d \"templates/mssql\" ]; then "
-                f"    echo \"Clone successful - templates/mssql directory exists\"; "
+                f"    echo \"Found templates/mssql directory\"; "
+                f"  elif [ -d \"scripts/templates/mssql\" ]; then "
+                f"    echo \"Found scripts/templates/mssql directory - creating symlink\"; "
+                f"    mkdir -p templates && ln -sf ../scripts/templates/mssql templates/mssql && echo \"Symlink created\"; "
+                f"  elif [ -d \"scripts/mssql\" ]; then "
+                f"    echo \"Found scripts/mssql directory - creating symlink\"; "
+                f"    mkdir -p templates && ln -sf ../scripts/mssql templates/mssql && echo \"Symlink created\"; "
                 f"  else "
-                f"    echo \"ERROR: Clone completed but templates/mssql directory not found\"; "
+                f"    echo \"ERROR: templates/mssql directory not found in any expected location\"; "
                 f"    echo \"Current branch: $(git branch --show-current 2>&1 || echo 'unknown')\"; "
+                f"    echo \"Available branches: $(git branch -a 2>&1 | head -10)\"; "
                 f"    echo \"Repository structure (top level):\"; "
                 f"    ls -la . 2>&1; "
                 f"    echo \"Checking scripts directory:\"; "
                 f"    ls -la scripts/ 2>&1 | head -20 || echo \"scripts directory does not exist\"; "
-                    f"    echo \"Checking for any mssql-related directories:\"; "
-                    f"    find . -type d -iname '*mssql*' 2>&1 | head -10; "
+                f"    echo \"Checking for any mssql-related directories:\"; "
+                f"    find . -type d -iname '*mssql*' 2>&1 | head -10; "
                 f"    echo \"Checking for templates directories:\"; "
                 f"    find . -type d -iname 'templates' 2>&1 | head -10; "
+                f"    exit 1; "
+                f"  fi; "
+                f"  if [ -d \"templates/mssql\" ]; then "
+                f"    echo \"Clone successful - templates/mssql directory exists\"; "
+                f"  else "
+                f"    echo \"ERROR: Failed to locate or create templates/mssql directory\"; "
                 f"    exit 1; "
                 f"  fi; "
                 f"else "
@@ -685,10 +700,25 @@ def install_mssql(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
+            # Use bash -c with proper quoting to ensure consistent execution for both SSH and virtctl
+            # Redirect stderr to stdout to capture all output, and ensure script runs in proper shell context
+            hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
             if config.mount_point == "none":
-                cmd = f"cd '{config.hammerdb_path}/templates/mssql'; ./Hammerdb-mssql-install-script -d '{config.disk_list}'"
+                disk_list_escaped = config.disk_list.replace("'", "'\"'\"'")
+                cmd = (
+                    f"bash -c '"
+                    f"cd \"{hammerdb_path_escaped}/templates/mssql\" && "
+                    f"./Hammerdb-mssql-install-script -d \"{disk_list_escaped}\" 2>&1"
+                    f"'"
+                )
             else:
-                cmd = f"cd '{config.hammerdb_path}/templates/mssql'; ./Hammerdb-mssql-install-script -m '{config.mount_point}'"
+                mount_point_escaped = config.mount_point.replace("'", "'\"'\"'")
+                cmd = (
+                    f"bash -c '"
+                    f"cd \"{hammerdb_path_escaped}/templates/mssql\" && "
+                    f"./Hammerdb-mssql-install-script -m \"{mount_point_escaped}\" 2>&1"
+                    f"'"
+                )
             future = pool.submit(executor.execute_command, host, cmd, "Installing MSSQL Server", timeout=1800)
             futures.append(future)
         
@@ -696,11 +726,20 @@ def install_mssql(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
         for future in as_completed(futures):
             success, output = future.result()
             if not success:
-                logger.error(f"Failed to install MSSQL Server: {output}")
                 failed += 1
+                # Log detailed error - output should now include both stdout and stderr (via 2>&1)
+                logger.error(f"MSSQL Server installation failed. Error details:")
+                logger.error(f"{output}")
         
         if failed > 0:
             logger.error(f"{failed}/{len(config.db_hosts)} hosts failed to install MSSQL Server")
+            logger.error("Please check the error messages above for details.")
+            logger.error("Common issues:")
+            logger.error("  1. Verify the Hammerdb-mssql-install-script exists and is executable")
+            logger.error("  2. Check that required packages are installed")
+            logger.error("  3. Verify disk device or mount point is accessible")
+            logger.error("  4. Check MSSQL Server installation prerequisites")
+            logger.error("  5. Try running with --verbose flag for more detailed output")
             sys.exit(1)
     
     # Create /etc/fstab entries if persistent mount is enabled
@@ -825,9 +864,9 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
         futures = []
         for host in config.db_hosts:
             # MSSQL uses sqlcmd for database operations
-            # Note: Password is typically set during installation (default: 100yard-)
+            # Note: Password is typically set during installation (default: mssqlpasswd)
             cmd = (
-                "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P '100yard-' -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
+                "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'mssqlpasswd' -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
             )
             future = pool.submit(executor.execute_command, host, cmd, "Cleaning existing database")
             futures.append(future)
