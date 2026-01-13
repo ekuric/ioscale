@@ -15,8 +15,8 @@ dbset db mssqls
 dbset bm TPC-C
 diset connection mssqls_linux_server 127.0.0.1
 diset connection mssqls_pass mssqlpasswd1!
-diset tpcc mssqls_count_ware 500
-diset tpcc mssqls_num_vu 40
+diset tpcc mssqls_count_ware 50
+diset tpcc mssqls_num_vu 50
 
 buildschema
 wait_to_complete
