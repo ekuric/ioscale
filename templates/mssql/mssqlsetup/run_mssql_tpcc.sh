@@ -102,7 +102,7 @@ sed -i "s/^diset tpcc mssqls_count_ware.*/diset tpcc mssqls_count_ware ${whc}/" 
 sed -i "s/^diset connection mssqls_linux_server.*/diset connection mssqls_linux_server ${hostip}/" runtest_mssql.tcl
 
 echo "StartTime,EndTime,Hostname,Kernel,Database,DBVer,Cpus,Memory,StorageType,Users,Tpm" > user-benchmark-result.csv
-mssqlver=`sqlcmd -U sa -P mssqlpasswd -h-1 -Y 15 -Q "set nocount on; SELECT SERVERPROPERTY('productversion')"`
+mssqlver=`sqlcmd -U sa -P 'mssqlpasswd1!' -h-1 -Y 15 -Q "set nocount on; SELECT SERVERPROPERTY('productversion')"`
 
 for uc in ${Usercount}
 do

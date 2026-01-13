@@ -1,5 +1,5 @@
 # Create database files
-/opt/mssql-tools/bin/sqlcmd -U sa -P mssqlpasswd <<! 
+/opt/mssql-tools/bin/sqlcmd -U sa -P 'mssqlpasswd1!' <<! 
 drop database tpcc
 go
 CREATE DATABASE tpcc

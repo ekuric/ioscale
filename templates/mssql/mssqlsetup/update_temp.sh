@@ -17,4 +17,4 @@ do
      echo " " >> input
      ctr=$(( ${ctr} + 1 ))
 done
-/opt/mssql-tools/bin/sqlcmd -U sa -P mssqlpasswd < input
+/opt/mssql-tools/bin/sqlcmd -U sa -P 'mssqlpasswd1!' < input

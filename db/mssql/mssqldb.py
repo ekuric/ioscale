@@ -864,9 +864,10 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
         futures = []
         for host in config.db_hosts:
             # MSSQL uses sqlcmd for database operations
-            # Note: Password is typically set during installation (default: mssqlpasswd)
+            # Note: Password is typically set during installation (default: mssqlpasswd1!)
+            # Password is wrapped in single quotes to protect special characters like "!"
             cmd = (
-                "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'mssqlpasswd' -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
+                "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'mssqlpasswd1!' -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
             )
             future = pool.submit(executor.execute_command, host, cmd, "Cleaning existing database")
             futures.append(future)
