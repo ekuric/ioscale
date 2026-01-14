@@ -1,4 +1,4 @@
-# Database Performance Testing (MariaDB & PostgreSQL)
+# Database Performance Testing (MariaDB, PostgreSQL & MSSQL Server)
 
 Automated database performance testing using [HammerDB](https://www.hammerdb.com) TPCC benchmarks with parallel execution and smart host management.
 
@@ -16,26 +16,70 @@ Automated database performance testing using [HammerDB](https://www.hammerdb.com
 
 ### PostgreSQL Testing
 ```bash
-# Basic test with simple configuration  
+# Basic test with simple configuration (Shell script)
 ./postgresql.sh -c config.yaml
 
+# Basic test with Python script (supports advanced features)
+python3 postgresql.py -c config.yaml
 
 # Verbose output for debugging
-./postgresql.sh -c config.yaml -v
+python3 postgresql.py -c config.yaml -v
 
 # Dry-run to validate configuration
-./postgresql.sh -c config.yaml --dry-run 
+python3 postgresql.py -c config.yaml --dry-run
+
+# Phased execution: Prepare hosts first (install packages, PostgreSQL)
+python3 postgresql.py -c config.yaml --prepare-hosts
+
+# Re-copy results without re-running tests
+python3 postgresql.py -c config.yaml --copy-results
+
+# Force SSH mode (for baremetal/KVM hosts)
+python3 postgresql.py -c config.yaml --ssh-only
+
+# Force virtctl mode (for OpenShift VMs)
+python3 postgresql.py -c config.yaml --virtctl-only
+```
+
+### MSSQL Server Testing
+```bash
+# Basic test with default configuration
+python3 mssqldb.py
+
+# Use custom configuration file
+python3 mssqldb.py -c mssql-config.yaml
+
+# Verbose output for debugging
+python3 mssqldb.py -c mssql-config.yaml -v
+
+# Dry-run to validate configuration
+python3 mssqldb.py -c mssql-config.yaml --dry-run
+
+# Phased execution: Prepare hosts first (install packages, MSSQL Server)
+python3 mssqldb.py -c mssql-config.yaml --prepare-hosts
+
+# Re-copy results without re-running tests
+python3 mssqldb.py -c mssql-config.yaml --copy-results
+
+# Force SSH mode (for baremetal/KVM hosts)
+python3 mssqldb.py -c mssql-config.yaml --ssh-only
+
+# Force virtctl mode (for OpenShift VMs)
+python3 mssqldb.py -c mssql-config.yaml --virtctl-only
 ```
 
 ## 📋 Configuration
 
 ### Basic YAML Configuration
 ```yaml
+# Test Description (optional - MSSQL only)
+description: "my test run"        # Description for log/results naming (MSSQL only)
+
 # Storage Configuration
 storage:
   mount_point: null              # Use existing mount point (e.g., "/perf1")
   disk_list: "/dev/vdc"          # Or use block device (auto-formatted)
-
+  persistent: false              # Create /etc/fstab entries (MSSQL/MariaDB Python scripts)
 
 # Database Configuration  
 database:
@@ -53,6 +97,22 @@ test:
 hammerdb:
   repo: "https://github.com/ekuric/fusion-access.git"
   path: "/root/hammerdb-tpcc-wrapper-scripts"
+  install_dir: "/usr/local/HammerDB"  # HammerDB installation directory (MSSQL/MariaDB Python scripts)
+
+# Retry Configuration (Python scripts: mariadb.py, postgresql.py, mssqldb.py)
+retry:
+  interval: 30                   # Retry interval in seconds
+  max_retries: 10                # Maximum retry attempts
+  skip_connectivity_test: false  # Skip initial connectivity test
+
+# Monitoring Configuration (Python scripts: mariadb.py, postgresql.py, mssqldb.py)
+monitoring:
+  task_monitor_interval: 60      # Check task status every N seconds
+
+# VM Migration Configuration (MSSQL/MariaDB Python scripts)
+migrate:
+  user_counts: "4 8"             # User counts that trigger migration
+  interval: 0                    # Interval between migrations (0 = parallel)
 ```
 When `mount_point` is used it must exist. This script will not create it and it assume it is already properly formated 
 and monted to `/perf1`. 
@@ -155,6 +215,14 @@ postgresql-results-20241201-143052/
 │   └── test_ESX_pg_2024.12.01_3pod_pod1_1.out
 └── pg2/
     └── build_pg2.out
+
+mssql-results-20241201-143052-baseline-test/
+├── vm-1/
+│   ├── build_mssql1.out
+│   ├── test_mssql_2024.12.01_3pod_pod1_1.out
+│   └── test_mssql_2024.12.01_3pod_pod1_4.out
+└── vm-2/
+    └── build_mssql2.out
 ```
 
 ### **Performance Metrics Summary**
@@ -165,6 +233,11 @@ postgresql-results-20241201-143052/
 [INFO]     test_mariadb_2024.12.01_3pod_pod1_5.out: TPM 15780
 [INFO]   vm2: 1 build files, 1 test files
 [INFO]     test_mariadb_2024.12.01_3pod_pod2_1.out: TPM 13250
+
+[INFO] MSSQL Server Test Results Summary:
+[INFO]   vm-1: 1 build files, 2 test files
+[INFO]     test_mssql_2024.12.01_3pod_pod1_1.out: TPM 14230
+[INFO]     test_mssql_2024.12.01_3pod_pod1_4.out: TPM 16890
 ```
 
 ## 🛠️ Requirements
@@ -223,6 +296,47 @@ test:
   user_count: "10 20 50"
 ```
 
+### PostgreSQL with Migration Testing
+```yaml
+description: "migration-resilience-test"
+storage:
+  disk_list: "/dev/vdc"
+  persistent: "true"
+database:
+  host_pattern: "pg{1..50}"
+  namespace: "database-test"
+  warehouse_count: 200
+  test_duration: 30
+test:
+  user_count: "4 8 16"
+migrate:
+  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+  interval: 5           # Sequential migration with 5s interval
+```
+
+### MSSQL Server with Migration Testing
+```yaml
+description: "migration-resilience-test"
+storage:
+  disk_list: "/dev/vdc"
+  persistent: "true"
+database:
+  host_pattern: "mssql{1..50}"
+  namespace: "database-test"
+  warehouse_count: 200
+  test_duration: 30
+test:
+  user_count: "4 8 16"
+migrate:
+  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+  interval: 5           # Sequential migration with 5s interval
+retry:
+  interval: 30
+  max_retries: 10
+monitoring:
+  task_monitor_interval: 60
+```
+
 ## 🔧 Advanced Features
 
 ### **Safe Service Management**
@@ -245,6 +359,7 @@ test:
 # Test configuration without execution
 ./mariadb.sh -c config.yaml --dry-run
 ./postgresql.sh -c config.yaml --dry-run
+python3 mssqldb.py -c mssql-config.yaml --dry-run
 
 # Output shows execution plan:
 [INFO] Would execute the following steps:
@@ -285,16 +400,47 @@ test:
   user_count: "20 40 80"
 ```
 
+### **MSSQL Server Large-Scale Testing (100 VMs)**
+```yaml
+description: "production-baseline-2024"
+storage:
+  mount_point: "/perf1"
+  persistent: "true"
+database:
+  host_pattern: "mssql-{001..100}"
+  namespace: "production"
+  warehouse_count: 500
+  test_duration: 60
+test:
+  user_count: "50 100 200"
+hammerdb:
+  repo: "https://github.com/ekuric/fusion-access.git"
+  path: "/root/hammerdb-tpcc-wrapper-scripts"
+  install_dir: "/usr/local/HammerDB"
+retry:
+  interval: 30
+  max_retries: 10
+monitoring:
+  task_monitor_interval: 60
+```
+
 ## 🎯 Quick Reference
 
-| Feature | MariaDB Script | PostgreSQL Script |
-|---------|----------------|------------------|
-| **Configuration** | `mariadb/config.yaml` | `postgresql/config.yaml` |
-| **Result Files** | `test_mariadb_*.out` | `test_ESX_pg_*.out` |
-| **Build Files** | `build_mariadb*.out` | `build_pg*.out` |
-| **Smart Hosts** | ✅ 4 methods | ✅ 4 methods |
-| **Parallel Execution** | ✅ All functions | ✅ All functions |
-| **Result Collection** | ✅ Automatic | ✅ Automatic |
+| Feature | MariaDB Script | PostgreSQL Script | MSSQL Server Script |
+|---------|----------------|------------------|---------------------|
+| **Script Type** | Shell (`mariadb.sh`) / Python (`mariadb.py`) | Shell (`postgresql.sh`) / Python (`postgresql.py`) | Python (`mssqldb.py`) |
+| **Configuration** | `mariadb/config.yaml` | `postgresql/config.yaml` | `mssql/mssql-config.yaml` |
+| **Result Files** | `test_mariadb_*.out` | `test_ESX_pg_*.out` / `test_postgresql_pg_*.out` | `test_mssql_*.out` |
+| **Build Files** | `build_mariadb*.out` | `build_pg*.out` | `build_mssql*.out` |
+| **Smart Hosts** | ✅ 4 methods | ✅ 4 methods | ✅ 4 methods |
+| **Parallel Execution** | ✅ All functions | ✅ All functions | ✅ All functions |
+| **Result Collection** | ✅ Automatic | ✅ Automatic | ✅ Automatic |
+| **Phased Execution** | ✅ (`mariadb.py`) | ✅ (`postgresql.py`) | ✅ (`--prepare-hosts`, `--copy-results`) |
+| **VM Migration** | ✅ (`mariadb.py`) | ✅ (`postgresql.py`) | ✅ (during test execution) |
+| **Persistent Mounts** | ✅ (`mariadb.py`) | ✅ (`postgresql.py`) | ✅ (`/etc/fstab` entries) |
+| **Retry/Monitoring** | ✅ (`mariadb.py`) | ✅ (`postgresql.py`) | ✅ (configurable retry & monitoring) |
+| **SSH/Virtctl Modes** | ✅ (`mariadb.py`) | ✅ (`postgresql.py`) | ✅ (`--ssh-only`, `--virtctl-only`) |
+| **Test Description** | ✅ (`mariadb.py`) | ✅ (`postgresql.py`) | ✅ (log/results naming) |
 
 ### **Host Selection Quick Reference**
 
@@ -313,6 +459,7 @@ test:
 4. **Execute** tests with full parallelization
 5. **Analyze** automatically collected results
 
+### MariaDB/PostgreSQL (Shell Scripts)
 ```bash
 # Complete workflow
 ./mariadb.sh -c config.yaml --dry-run    # Validate
@@ -320,5 +467,119 @@ test:
 ls -la mariadb-results-*/                # View results
 ```
 
-Both MariaDB and PostgreSQL scripts now support **massive parallel database testing** with intelligent host management and automatic result collection!
+### PostgreSQL (Python Script)
+```bash
+# Complete workflow with phased execution
+python3 postgresql.py -c config.yaml --dry-run        # Validate
+python3 postgresql.py -c config.yaml --prepare-hosts # Prepare hosts
+python3 postgresql.py -c config.yaml                 # Execute tests
+python3 postgresql.py -c config.yaml --copy-results  # Re-copy results if needed
+ls -la postgresql-results-*/                          # View results
+```
+
+### MSSQL Server (Python Script)
+```bash
+# Complete workflow with phased execution
+python3 mssqldb.py -c mssql-config.yaml --dry-run        # Validate
+python3 mssqldb.py -c mssql-config.yaml --prepare-hosts # Prepare hosts
+python3 mssqldb.py -c mssql-config.yaml                 # Execute tests
+python3 mssqldb.py -c mssql-config.yaml --copy-results  # Re-copy results if needed
+ls -la mssql-results-*/                                  # View results
+```
+
+## 🔧 Advanced Features (Python Scripts)
+
+### Phased Execution
+Both PostgreSQL and MSSQL Server Python scripts support phased execution for large deployments:
+
+```bash
+# PostgreSQL Example:
+# Phase 1: Prepare all hosts (install packages, PostgreSQL, HammerDB)
+python3 postgresql.py -c config.yaml --prepare-hosts
+
+# Phase 2: Run performance tests (assumes hosts are already prepared)
+python3 postgresql.py -c config.yaml
+
+# Phase 3: Re-copy results without re-running tests
+python3 postgresql.py -c config.yaml --copy-results
+
+# MSSQL Server Example:
+# Phase 1: Prepare all hosts (install packages, MSSQL Server, HammerDB)
+python3 mssqldb.py -c mssql-config.yaml --prepare-hosts
+
+# Phase 2: Run performance tests (assumes hosts are already prepared)
+python3 mssqldb.py -c mssql-config.yaml
+
+# Phase 3: Re-copy results without re-running tests
+python3 mssqldb.py -c mssql-config.yaml --copy-results
+```
+
+### VM Migration During Tests
+Both PostgreSQL and MSSQL Server Python scripts support testing VM migration resilience by migrating VMs during test execution:
+
+```yaml
+migrate:
+  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+  interval: 0           # 0 = parallel migration, >0 = sequential with interval
+```
+
+Migration occurs at the midpoint of the test duration (after rampup). This feature is available in both `postgresql.py` and `mssqldb.py`.
+
+### Persistent Mounts
+Both PostgreSQL and MSSQL Server Python scripts can automatically create `/etc/fstab` entries for persistent mounts:
+
+```yaml
+storage:
+  disk_list: "/dev/vdc"
+  persistent: "true"    # Creates /etc/fstab entry for automatic mounting
+```
+
+### Retry and Monitoring Configuration
+All Python scripts (MariaDB, PostgreSQL, and MSSQL Server) support configurable retry behavior and task monitoring:
+
+```yaml
+retry:
+  interval: 30                    # Wait 30s between retries
+  max_retries: 10                 # Retry up to 10 times
+  skip_connectivity_test: false   # Skip initial connectivity check
+
+monitoring:
+  task_monitor_interval: 60       # Check long-running tasks every 60s
+```
+
+### Connection Modes
+Both PostgreSQL and MSSQL Server Python scripts support choosing between SSH and virtctl modes:
+
+```bash
+# PostgreSQL Example:
+# Auto-detect (default) - tries virtctl first, falls back to SSH
+python3 postgresql.py -c config.yaml
+
+# Force SSH mode (for baremetal/KVM hosts)
+python3 postgresql.py -c config.yaml --ssh-only
+
+# Force virtctl mode (for OpenShift VMs)
+python3 postgresql.py -c config.yaml --virtctl-only
+
+# MSSQL Server Example:
+# Auto-detect (default) - tries virtctl first, falls back to SSH
+python3 mssqldb.py -c mssql-config.yaml
+
+# Force SSH mode (for baremetal/KVM hosts)
+python3 mssqldb.py -c mssql-config.yaml --ssh-only
+
+# Force virtctl mode (for OpenShift VMs)
+python3 mssqldb.py -c mssql-config.yaml --virtctl-only
+```
+
+### Test Description
+Both PostgreSQL and MSSQL Server Python scripts support adding descriptions to test runs for better organization:
+
+```yaml
+description: "baseline-test-2024"  # Used in log file and results directory naming
+```
+
+Results will be named: `mssql-results-20241201-143052-baseline-test-2024/`
+
+Both MariaDB, PostgreSQL, and MSSQL Server scripts now support **massive parallel database testing** with intelligent host management and automatic result collection!
 
