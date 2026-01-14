@@ -44,6 +44,7 @@ test:
 hammerdb:
   repo: "https://github.com/ekuric/fusion-access.git"  # Git repository URL
   path: "/root/hammerdb-tpcc-wrapper-scripts"          # Scripts directory path
+  install_dir: "/usr/local/HammerDB"                   # HammerDB installation directory
 
 # Retry and Monitoring Configuration
 retry:

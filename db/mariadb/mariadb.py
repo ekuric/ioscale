@@ -70,6 +70,12 @@ class MariaDBTestConfig:
         self.migrate_interval = 0  # Interval between migrations (0 = parallel)
         self.persistent_mount = False  # Whether to create /etc/fstab entries
         self.copy_results = False  # Whether to only copy results (skip all other steps)
+        # Retry configuration
+        self.retry_interval = 30  # Retry interval in seconds
+        self.max_retries = 10  # Maximum number of retry attempts
+        self.skip_connectivity_test = False  # Skip initial connectivity test
+        # Monitoring configuration
+        self.task_monitor_interval = 60  # Check task status every N seconds for long-running tasks
 
 
 class CommandExecutor:
@@ -310,6 +316,34 @@ class ConfigLoader:
         self.config.hammerdb_dir = hammerdb.get('install_dir', '/usr/local/HammerDB')
         if self.config.hammerdb_dir == "null" or not self.config.hammerdb_dir:
             self.config.hammerdb_dir = "/usr/local/HammerDB"
+        
+        # Load retry configuration
+        retry = yaml_data.get('retry', {})
+        self.config.retry_interval = retry.get('interval', 30)
+        if self.config.retry_interval == "null" or not self.config.retry_interval:
+            self.config.retry_interval = 30
+        else:
+            self.config.retry_interval = int(self.config.retry_interval)
+        
+        self.config.max_retries = retry.get('max_retries', 10)
+        if self.config.max_retries == "null" or not self.config.max_retries:
+            self.config.max_retries = 10
+        else:
+            self.config.max_retries = int(self.config.max_retries)
+        
+        skip_connectivity = retry.get('skip_connectivity_test', False)
+        if skip_connectivity == "true" or skip_connectivity is True:
+            self.config.skip_connectivity_test = True
+        else:
+            self.config.skip_connectivity_test = False
+        
+        # Load monitoring configuration
+        monitoring = yaml_data.get('monitoring', {})
+        self.config.task_monitor_interval = monitoring.get('task_monitor_interval', 60)
+        if self.config.task_monitor_interval == "null" or not self.config.task_monitor_interval:
+            self.config.task_monitor_interval = 60
+        else:
+            self.config.task_monitor_interval = int(self.config.task_monitor_interval)
     
     def _get_db_hosts(self, yaml_data: Dict) -> List[str]:
         """Get database hosts from various methods"""
@@ -502,6 +536,10 @@ def display_config(config: MariaDBTestConfig) -> None:
     logger.info(f"Run name: {config.run_name}")
     logger.info(f"Storage type: {config.storage_type}")
     logger.info(f"Log level: {config.log_level}")
+    logger.info(f"Retry interval: {config.retry_interval}s")
+    logger.info(f"Max retries: {config.max_retries}")
+    logger.info(f"Skip connectivity test: {'ENABLED' if config.skip_connectivity_test else 'DISABLED'}")
+    logger.info(f"Task monitor interval: {config.task_monitor_interval}s")
     if config.migrate_user_counts:
         if config.migrate_interval > 0:
             logger.info(f"VM Migration: ENABLED for user_counts: {' '.join(config.migrate_user_counts)} "
