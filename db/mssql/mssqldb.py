@@ -1281,7 +1281,7 @@ def run_tests(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
                     f"cp '{config.hammerdb_path}/templates/mssql/mssqlsetup/runtest_mssql.tcl' runtest{vm_number}_mssql.tcl 2>/dev/null || "
                     f"cp runtest_mssql.tcl runtest{vm_number}_mssql.tcl 2>/dev/null && "
                     f"sed -i 's/^diset tpcc mssqls_count_ware.*/diset tpcc mssqls_count_ware {config.warehouse_count}/g' runtest{vm_number}_mssql.tcl && "
-                    f"sed -i 's/^diset tpcc mssqls_duration.*/diset tpcc mssqls_duration {config.test_duration}/g' runtest{vm_number}_mssql.tcl"
+                    f"sed -i 's/^diset tpcc mssqls_duration.*/diset tpcc mssqls_duration {config.test_duration}/g' runtest{vm_number}_mssql.tcl && "
                     f"sed -i 's/^diset tpcc mssqls_num_vu.*/diset tpcc mssqls_num_vu {user_count}/g' runtest{vm_number}_mssql.tcl"
                 )
                 future = pool.submit(executor.execute_command, host, cmd, f"Preparing test script (runtest{vm_number}_mssql.tcl) for {user_count} users")
