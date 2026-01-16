@@ -31,10 +31,7 @@ python3 mariadb.py -c config.yaml --virtctl-only
 
 ### PostgreSQL Testing
 ```bash
-# Basic test with simple configuration (Shell script)
-./postgresql.sh -c config.yaml
-
-# Basic test with Python script (supports advanced features)
+# Basic test with simple configuration
 python3 postgresql.py -c config.yaml
 
 # Verbose output for debugging
