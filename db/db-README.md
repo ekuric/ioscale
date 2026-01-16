@@ -83,7 +83,8 @@ python3 mssqldb.py -c mssql-config.yaml --virtctl-only
 ## 📋 Configuration
 
 ### Basic YAML Configuration
-<pre><code># Test Description (optional)
+```yaml
+# Test Description (optional)
 description: "my test run"        # Description for log/results naming
 
 # Storage Configuration
@@ -119,12 +120,13 @@ retry:
 # Monitoring Configuration (Python scripts: mariadb.py, postgresql.py, mssqldb.py)
 monitoring:
   task_monitor_interval: 60      # Check task status every N seconds
+```
 
-# VM Migration Configuration (Python scripts)
-<span style="color:red">migrate:</span>
-<span style="color:red">  user_counts: "4 8"             # User counts that trigger migration</span>
-<span style="color:red">  interval: 0                    # Interval between migrations (0 = parallel)</span>
-</code></pre>
+```diff
+- migrate:
+-   user_counts: "4 8"             # User counts that trigger migration
+-   interval: 0                    # Interval between migrations (0 = parallel)
+```
 
 When `mount_point` is used it must exist. This script will not create it and it assume it is already properly formated 
 and monted to `/perf1`. 
@@ -309,7 +311,8 @@ test:
 ```
 
 ### PostgreSQL with Migration Testing
-<pre><code>description: "migration-resilience-test"
+```yaml
+description: "migration-resilience-test"
 storage:
   disk_list: "/dev/vdc"
   persistent: "true"
@@ -320,13 +323,17 @@ database:
   test_duration: 30
 test:
   user_count: "4 8 16"
-<span style="color:red">migrate:</span>
-<span style="color:red">  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users</span>
-<span style="color:red">  interval: 5           # Sequential migration with 5s interval</span>
-</code></pre>
+```
+
+```diff
+- migrate:
+-   user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+-   interval: 5           # Sequential migration with 5s interval
+```
 
 ### MariaDB with Migration Testing
-<pre><code>description: "migration-resilience-test"
+```yaml
+description: "migration-resilience-test"
 storage:
   disk_list: "/dev/vdc"
   persistent: "true"
@@ -337,13 +344,17 @@ database:
   test_duration: 30
 test:
   user_count: "4 8 16"
-<span style="color:red">migrate:</span>
-<span style="color:red">  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users</span>
-<span style="color:red">  interval: 5           # Sequential migration with 5s interval</span>
-</code></pre>
+```
+
+```diff
+- migrate:
+-   user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+-   interval: 5           # Sequential migration with 5s interval
+```
 
 ### MSSQL Server with Migration Testing
-<pre><code>description: "migration-resilience-test"
+```yaml
+description: "migration-resilience-test"
 storage:
   disk_list: "/dev/vdc"
   persistent: "true"
@@ -354,15 +365,18 @@ database:
   test_duration: 30
 test:
   user_count: "4 8 16"
-<span style="color:red">migrate:</span>
-<span style="color:red">  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users</span>
-<span style="color:red">  interval: 5           # Sequential migration with 5s interval</span>
 retry:
   interval: 30
   max_retries: 10
 monitoring:
   task_monitor_interval: 60
-</code></pre>
+```
+
+```diff
+- migrate:
+-   user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+-   interval: 5           # Sequential migration with 5s interval
+```
 
 ## 🔧 Advanced Features
 
@@ -546,10 +560,11 @@ python3 mssqldb.py -c mssql-config.yaml --copy-results
 ### VM Migration During Tests
 Both PostgreSQL and MSSQL Server Python scripts support testing VM migration resilience by migrating VMs during test execution:
 
-<pre><code><span style="color:red">migrate:</span>
-<span style="color:red">  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users</span>
-<span style="color:red">  interval: 0           # 0 = parallel migration, >0 = sequential with interval</span>
-</code></pre>
+```diff
+- migrate:
+-   user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+-   interval: 0           # 0 = parallel migration, >0 = sequential with interval
+```
 
 Migration occurs at the midpoint of the test duration (after rampup). This feature is available for `postgresql.py`, `mssqldb.py` and `mariadb.py` 
 
