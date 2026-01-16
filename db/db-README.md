@@ -120,12 +120,11 @@ retry:
 # Monitoring Configuration (Python scripts: mariadb.py, postgresql.py, mssqldb.py)
 monitoring:
   task_monitor_interval: 60      # Check task status every N seconds
-```
 
-```diff
-- migrate:
--   user_counts: "4 8"             # User counts that trigger migration
--   interval: 0                    # Interval between migrations (0 = parallel)
+# VM Migration Configuration (Python scripts)
+migrate:
+  user_counts: "4 8"             # User counts that trigger migration
+  interval: 0                    # Interval between migrations (0 = parallel)
 ```
 
 When `mount_point` is used it must exist. This script will not create it and it assume it is already properly formated 
@@ -226,7 +225,7 @@ mariadb-results-20241201-143052/
 postgresql-results-20241201-143052/
 ├── pg1/
 │   ├── build_pg1.out
-│   └── test_ESX_pg_2024.12.01_3pod_pod1_1.out
+│   └── test_postgresql_pg_2024.12.01_3pod_pod1_1.out
 └── pg2/
     └── build_pg2.out
 
@@ -323,12 +322,9 @@ database:
   test_duration: 30
 test:
   user_count: "4 8 16"
-```
-
-```diff
-- migrate:
--   user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
--   interval: 5           # Sequential migration with 5s interval
+migrate:
+  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+  interval: 5           # Sequential migration with 5s interval
 ```
 
 ### MariaDB with Migration Testing
@@ -344,12 +340,9 @@ database:
   test_duration: 30
 test:
   user_count: "4 8 16"
-```
-
-```diff
-- migrate:
--   user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
--   interval: 5           # Sequential migration with 5s interval
+migrate:
+  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+  interval: 5           # Sequential migration with 5s interval
 ```
 
 ### MSSQL Server with Migration Testing
@@ -365,17 +358,14 @@ database:
   test_duration: 30
 test:
   user_count: "4 8 16"
+migrate:
+  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+  interval: 5           # Sequential migration with 5s interval
 retry:
   interval: 30
   max_retries: 10
 monitoring:
   task_monitor_interval: 60
-```
-
-```diff
-- migrate:
--   user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
--   interval: 5           # Sequential migration with 5s interval
 ```
 
 ## 🔧 Advanced Features
@@ -560,10 +550,10 @@ python3 mssqldb.py -c mssql-config.yaml --copy-results
 ### VM Migration During Tests
 Both PostgreSQL and MSSQL Server Python scripts support testing VM migration resilience by migrating VMs during test execution:
 
-```diff
-- migrate:
--   user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
--   interval: 0           # 0 = parallel migration, >0 = sequential with interval
+```yaml
+migrate:
+  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
+  interval: 0           # 0 = parallel migration, >0 = sequential with interval
 ```
 
 Migration occurs at the midpoint of the test duration (after rampup). This feature is available for `postgresql.py`, `mssqldb.py` and `mariadb.py` 
