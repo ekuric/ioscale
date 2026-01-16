@@ -17,7 +17,7 @@ Please check these directories for specific information.
 - OpenShift Container Platform setup (tested with v4.19/v4.20) up and running
 - OpenShift Virtualization installed and running on top of OCP
 - A functional storage backend able to allocate PVCs and create test virtual machines
-- An `ssh` key and secret created to enable root SSH access to the virtual machine. An example script for secret generation is in `/templates/secretgen.sh`
+- An `ssh` key and secret created to enable root SSH access to the virtual machine. An example script for secret generation is in [secretgen.sh](https://github.com/ekuric/ioscale/blob/main/templates/secretgen.sh)
 
 
 # Database Testing Setup
