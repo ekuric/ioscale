@@ -457,7 +457,7 @@ monitoring:
 |---------|----------------|------------------|---------------------|
 | **Script Type** | Python (`mariadb.py`) | Python (`postgresql.py`) | Python (`mssqldb.py`) |
 | **Configuration** | `mariadb/config.yaml` | `postgresql/config.yaml` | `mssql/mssql-config.yaml` |
-| **Result Files** | `test_mariadb_*.out` | `test_ESX_pg_*.out` / `test_postgresql_pg_*.out` | `test_mssql_*.out` |
+| **Result Files** | `test_mariadb_*.out` | `test_postgresql_pg_*.out` | `test_mssql_*.out` |
 | **Build Files** | `build_mariadb*.out` | `build_pg*.out` | `build_mssql*.out` |
 | **Smart Hosts** | ✅ 4 methods | ✅ 4 methods | ✅ 4 methods |
 | **Parallel Execution** | ✅ All functions | ✅ All functions | ✅ All functions |
