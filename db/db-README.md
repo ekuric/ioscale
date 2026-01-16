@@ -83,8 +83,7 @@ python3 mssqldb.py -c mssql-config.yaml --virtctl-only
 ## 📋 Configuration
 
 ### Basic YAML Configuration
-```yaml
-# Test Description (optional)
+<pre><code># Test Description (optional)
 description: "my test run"        # Description for log/results naming
 
 # Storage Configuration
@@ -122,10 +121,11 @@ monitoring:
   task_monitor_interval: 60      # Check task status every N seconds
 
 # VM Migration Configuration (Python scripts)
-migrate:
-  user_counts: "4 8"             # User counts that trigger migration
-  interval: 0                    # Interval between migrations (0 = parallel)
-```
+<span style="color:red">migrate:</span>
+<span style="color:red">  user_counts: "4 8"             # User counts that trigger migration</span>
+<span style="color:red">  interval: 0                    # Interval between migrations (0 = parallel)</span>
+</code></pre>
+
 When `mount_point` is used it must exist. This script will not create it and it assume it is already properly formated 
 and monted to `/perf1`. 
 For small scale tests specifing `hosts` as in above example is fine, for large scale testing, using one of below approaches is better.
@@ -309,8 +309,7 @@ test:
 ```
 
 ### PostgreSQL with Migration Testing
-```yaml
-description: "migration-resilience-test"
+<pre><code>description: "migration-resilience-test"
 storage:
   disk_list: "/dev/vdc"
   persistent: "true"
@@ -321,14 +320,30 @@ database:
   test_duration: 30
 test:
   user_count: "4 8 16"
-migrate:
-  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
-  interval: 5           # Sequential migration with 5s interval
-```
+<span style="color:red">migrate:</span>
+<span style="color:red">  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users</span>
+<span style="color:red">  interval: 5           # Sequential migration with 5s interval</span>
+</code></pre>
+
+### MariaDB with Migration Testing
+<pre><code>description: "migration-resilience-test"
+storage:
+  disk_list: "/dev/vdc"
+  persistent: "true"
+database:
+  host_pattern: "mariadb{1..50}"
+  namespace: "database-test"
+  warehouse_count: 200
+  test_duration: 30
+test:
+  user_count: "4 8 16"
+<span style="color:red">migrate:</span>
+<span style="color:red">  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users</span>
+<span style="color:red">  interval: 5           # Sequential migration with 5s interval</span>
+</code></pre>
 
 ### MSSQL Server with Migration Testing
-```yaml
-description: "migration-resilience-test"
+<pre><code>description: "migration-resilience-test"
 storage:
   disk_list: "/dev/vdc"
   persistent: "true"
@@ -339,15 +354,15 @@ database:
   test_duration: 30
 test:
   user_count: "4 8 16"
-migrate:
-  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
-  interval: 5           # Sequential migration with 5s interval
+<span style="color:red">migrate:</span>
+<span style="color:red">  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users</span>
+<span style="color:red">  interval: 5           # Sequential migration with 5s interval</span>
 retry:
   interval: 30
   max_retries: 10
 monitoring:
   task_monitor_interval: 60
-```
+</code></pre>
 
 ## 🔧 Advanced Features
 
@@ -531,13 +546,12 @@ python3 mssqldb.py -c mssql-config.yaml --copy-results
 ### VM Migration During Tests
 Both PostgreSQL and MSSQL Server Python scripts support testing VM migration resilience by migrating VMs during test execution:
 
-```yaml
-migrate:
-  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users
-  interval: 0           # 0 = parallel migration, >0 = sequential with interval
-```
+<pre><code><span style="color:red">migrate:</span>
+<span style="color:red">  user_counts: "4 8"    # Migrate VMs during tests with 4 and 8 users</span>
+<span style="color:red">  interval: 0           # 0 = parallel migration, >0 = sequential with interval</span>
+</code></pre>
 
-Migration occurs at the midpoint of the test duration (after rampup). This feature is available in both `postgresql.py` and `mssqldb.py`.
+Migration occurs at the midpoint of the test duration (after rampup). This feature is available for `postgresql.py`, `mssqldb.py` and `mariadb.py` 
 
 ### Persistent Mounts
 Both PostgreSQL and MSSQL Server Python scripts can automatically create `/etc/fstab` entries for persistent mounts:
@@ -547,6 +561,8 @@ storage:
   disk_list: "/dev/vdc"
   persistent: "true"    # Creates /etc/fstab entry for automatic mounting
 ```
+Persistent mounts are necessary for case when test machines are rebooted during test, for example test case when OpenShift cluster is upgraded between minor/major releases. 
+
 
 ### Retry and Monitoring Configuration
 All Python scripts (MariaDB, PostgreSQL, and MSSQL Server) support configurable retry behavior and task monitoring:
@@ -560,6 +576,7 @@ retry:
 monitoring:
   task_monitor_interval: 60       # Check long-running tasks every 60s
 ```
+If for some reason ( eg. test case OCP cluster upgrade ), test machines are not accessible, we can use `interval` and `max_retries` to configure how long we want for test to retry to connect to machine and continue with testing. 
 
 ### Connection Modes
 Both PostgreSQL and MSSQL Server Python scripts support choosing between SSH and virtctl modes:
