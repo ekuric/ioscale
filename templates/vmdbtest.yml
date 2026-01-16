@@ -15,12 +15,12 @@ spec:
           resources:
             requests:
               storage: 30Gi
-          storageClassName: ibm-spectrum-scale-sample
+          storageClassName: ocs-storagecluster-ceph-rbd
           volumeMode: Filesystem
         source:
           http:
             url: >-
-              https://dl.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2
+              https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
     - metadata:
         name: datavolumedb
       spec:
@@ -29,8 +29,8 @@ spec:
             - ReadWriteOnce
           resources:
             requests:
-              storage: 1000Gi
-          storageClassName: ibm-spectrum-scale-sample
+              storage: 100Gi
+          storageClassName: ocs-storagecluster-ceph-rbd
           volumeMode: Filesystem
         source:
           blank: {}
@@ -58,7 +58,7 @@ spec:
                 secretName: vmkeyroot
       domain:
         cpu:
-          cores: 64
+          cores: 4
           sockets: 2
           threads: 1
         devices:
@@ -85,7 +85,7 @@ spec:
           rng: {}
         resources:
           requests:
-            memory: 200Gi
+            memory: 8Gi
       evictionStrategy: None
       hostname: vm-testvm
       networks:

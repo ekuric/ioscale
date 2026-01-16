@@ -19,9 +19,9 @@ jobs:
     - objectTemplate: templates/dv-source.yml
       replicas: 1
       inputVars:
-        url: https://dl.fedoraproject.org/pub/fedora/linux/releases/42/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-42-1.1.x86_64.qcow2
+        url: https://dl.fedoraproject.org/pub/fedora/linux/releases/43/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-43-1.6.x86_64.qcow2
         storage: 6Gi
-        storageclass: ibm-spectrum-scale-sample-test
+        storageclass: ocs-storagecluster-ceph-rbd
         volumemode: Filesystem
 
   - name: vm-density
@@ -42,6 +42,6 @@ jobs:
         cpuCores: 1
         memory: 100Mi
         storage: 6Gi
-        storageclass: ibm-spectrum-scale-sample-test
+        storageclass: ocs-storagecluster-ceph-rbd
         volumemode: Filesystem
         VMIrunning: true
