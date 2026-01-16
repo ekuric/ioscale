@@ -7,11 +7,26 @@ Automated database performance testing using [HammerDB](https://www.hammerdb.com
 ### MariaDB Testing
 ```bash
 # Basic test with simple configuration
-./mariadb.sh -c config.yaml
+python3 mariadb.py -c config.yaml
 
 
 # Dry-run to validate configuration
-./mariadb.sh -c config.yaml --dry-run
+python3 mariadb.py -c config.yaml --dry-run
+
+# Verbose output for debugging
+python3 mariadb.py -c config.yaml -v
+
+# Phased execution: Prepare hosts first (install packages, MariaDB)
+python3 mariadb.py -c config.yaml --prepare-hosts
+
+# Re-copy results without re-running tests
+python3 mariadb.py -c config.yaml --copy-results
+
+# Force SSH mode (for baremetal/KVM hosts)
+python3 mariadb.py -c config.yaml --ssh-only
+
+# Force virtctl mode (for OpenShift VMs)
+python3 mariadb.py -c config.yaml --virtctl-only
 ```
 
 ### PostgreSQL Testing
@@ -72,14 +87,14 @@ python3 mssqldb.py -c mssql-config.yaml --virtctl-only
 
 ### Basic YAML Configuration
 ```yaml
-# Test Description (optional - MSSQL only)
-description: "my test run"        # Description for log/results naming (MSSQL only)
+# Test Description (optional)
+description: "my test run"        # Description for log/results naming
 
 # Storage Configuration
 storage:
   mount_point: null              # Use existing mount point (e.g., "/perf1")
   disk_list: "/dev/vdc"          # Or use block device (auto-formatted)
-  persistent: false              # Create /etc/fstab entries (MSSQL/MariaDB Python scripts)
+  persistent: false              # Create /etc/fstab entries (Python scripts)
 
 # Database Configuration  
 database:
@@ -97,7 +112,7 @@ test:
 hammerdb:
   repo: "https://github.com/ekuric/fusion-access.git"
   path: "/root/hammerdb-tpcc-wrapper-scripts"
-  install_dir: "/usr/local/HammerDB"  # HammerDB installation directory (MSSQL/MariaDB Python scripts)
+  install_dir: "/usr/local/HammerDB"  # HammerDB installation directory (Python scripts)
 
 # Retry Configuration (Python scripts: mariadb.py, postgresql.py, mssqldb.py)
 retry:
@@ -109,7 +124,7 @@ retry:
 monitoring:
   task_monitor_interval: 60      # Check task status every N seconds
 
-# VM Migration Configuration (MSSQL/MariaDB Python scripts)
+# VM Migration Configuration (Python scripts)
 migrate:
   user_counts: "4 8"             # User counts that trigger migration
   interval: 0                    # Interval between migrations (0 = parallel)
@@ -190,7 +205,7 @@ Host preparation ( packages install, database setup ) is executed in parallel ),
 ## Automatic Result Collection
 
 ### **Smart Result Management**
-Both `mariadb.sh` and `postgresql.sh` scripts automaticaly:
+All Python scripts automatically:
 - **📦 Archive** test results on each VM
 - **📁 Transfer** results to localhost using `virtctl scp`
 - **🔄 Extract** results locally for easy access
@@ -357,8 +372,8 @@ monitoring:
 ### **Dry-Run Mode**
 ```bash
 # Test configuration without execution
-./mariadb.sh -c config.yaml --dry-run
-./postgresql.sh -c config.yaml --dry-run
+python3 mariadb.py -c config.yaml --dry-run
+python3 postgresql.py -c config.yaml --dry-run
 python3 mssqldb.py -c mssql-config.yaml --dry-run
 
 # Output shows execution plan:
@@ -428,7 +443,7 @@ monitoring:
 
 | Feature | MariaDB Script | PostgreSQL Script | MSSQL Server Script |
 |---------|----------------|------------------|---------------------|
-| **Script Type** | Shell (`mariadb.sh`) / Python (`mariadb.py`) | Shell (`postgresql.sh`) / Python (`postgresql.py`) | Python (`mssqldb.py`) |
+| **Script Type** | Python (`mariadb.py`) | Python (`postgresql.py`) | Python (`mssqldb.py`) |
 | **Configuration** | `mariadb/config.yaml` | `postgresql/config.yaml` | `mssql/mssql-config.yaml` |
 | **Result Files** | `test_mariadb_*.out` | `test_ESX_pg_*.out` / `test_postgresql_pg_*.out` | `test_mssql_*.out` |
 | **Build Files** | `build_mariadb*.out` | `build_pg*.out` | `build_mssql*.out` |
@@ -459,12 +474,14 @@ monitoring:
 4. **Execute** tests with full parallelization
 5. **Analyze** automatically collected results
 
-### MariaDB/PostgreSQL (Shell Scripts)
+### MariaDB (Python Script)
 ```bash
-# Complete workflow
-./mariadb.sh -c config.yaml --dry-run    # Validate
-./mariadb.sh -c config.yaml              # Execute  
-ls -la mariadb-results-*/                # View results
+# Complete workflow with phased execution
+python3 mariadb.py -c config.yaml --dry-run        # Validate
+python3 mariadb.py -c config.yaml --prepare-hosts # Prepare hosts
+python3 mariadb.py -c config.yaml                 # Execute tests
+python3 mariadb.py -c config.yaml --copy-results  # Re-copy results if needed
+ls -la mariadb-results-*/                          # View results
 ```
 
 ### PostgreSQL (Python Script)
@@ -571,6 +588,21 @@ python3 mssqldb.py -c mssql-config.yaml --ssh-only
 # Force virtctl mode (for OpenShift VMs)
 python3 mssqldb.py -c mssql-config.yaml --virtctl-only
 ```
+
+### KVM/VMware/Baremetal
+The MariaDB, PostgreSQL, and MSSQL Server Python scripts work the same way on non-OCP hosts (KVM, VMware, baremetal). Use SSH mode and list your hosts in the config file; the workflow is identical to OCP VMs, just without `virtctl`.
+
+```bash
+# Force SSH mode (use this for KVM/VMware/baremetal)
+python3 mariadb.py -c config.yaml --ssh-only
+python3 postgresql.py -c config.yaml --ssh-only
+python3 mssqldb.py -c mssql-config.yaml --ssh-only
+```
+
+Notes:
+- Ensure `database.hosts`, `host_pattern`, or `host_file` points to reachable SSH hosts.
+- `database.namespace` is ignored in SSH-only mode.
+- `oc`/`virtctl` are not required when using `--ssh-only`.
 
 ### Test Description
 Both PostgreSQL and MSSQL Server Python scripts support adding descriptions to test runs for better organization:
