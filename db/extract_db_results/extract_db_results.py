@@ -273,6 +273,12 @@ def get_vm_number(vm_dir_name):
     Returns:
         int: VM number or 0 if not found
     """
+    # If the directory name is an IPv4 address, avoid collapsing different IPs
+    # into the same numeric ID (e.g., 1.2.3.4 and 1.2.3.5 would both map to 1).
+    # Returning 0 lets the caller assign a stable index instead.
+    if re.fullmatch(r'\d{1,3}(?:\.\d{1,3}){3}', vm_dir_name):
+        return 0
+
     # First try to extract number from vm-* pattern
     match = re.search(r'vm-(\d+)', vm_dir_name)
     if match:
