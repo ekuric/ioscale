@@ -7,9 +7,10 @@ from PostgreSQL and MariaDB benchmark result files. It processes all .out files 
 subdirectories (directory name agnostic), creates CSV reports with the extracted data, 
 and generates PNG graphs showing VM numbers vs TPM performance.
 
-Supports both:
+Supports:
 - PostgreSQL: Files containing "test_postgresql_pg" or "test_ESX_pg" and "PostgreSQL TPM" results
 - MariaDB: Files containing "test_mariadb" and "MySQL TPM" results
+- MSSQL Server: Files containing "test_mssql" and "SQL Server TPM" results
 
 Usage:
     # Single directory processing (new recommended syntax)
@@ -225,7 +226,7 @@ def get_distinct_colors(n, colormap_name='tab20'):
 
 def extract_tpm_from_file(file_path):
     """
-    Extract TPM (Transactions Per Minute) value from a PostgreSQL or MariaDB result file.
+    Extract TPM (Transactions Per Minute) value from a PostgreSQL, MariaDB, or MSSQL Server result file.
     
     Args:
         file_path (str): Path to the .out file
@@ -254,6 +255,15 @@ def extract_tpm_from_file(file_path):
             tpm = int(mariadb_match.group(1))
             nopm = int(mariadb_match.group(2))
             return tpm, nopm, 'MariaDB'
+        
+        # Look for MSSQL Server pattern: "System achieved XXXX SQL Server TPM at YYYY NOPM"
+        mssql_pattern = r'System achieved (\d+) SQL Server TPM at (\d+) NOPM'
+        mssql_match = re.search(mssql_pattern, content)
+        
+        if mssql_match:
+            tpm = int(mssql_match.group(1))
+            nopm = int(mssql_match.group(2))
+            return tpm, nopm, 'MSSQL'
         
         return None, None, None
             
@@ -858,6 +868,8 @@ def create_combined_tpm_graph(csv_file_path, output_dir, chart_type='scatter', u
             db_name = 'PostgreSQL'
         elif 'mariadb' in filename.lower():
             db_name = 'MariaDB'
+        elif 'mssql' in filename.lower():
+            db_name = 'MSSQL'
         else:
             db_name = 'Database'
         
@@ -886,7 +898,7 @@ def create_combined_tpm_graph(csv_file_path, output_dir, chart_type='scatter', u
 
 def process_postgresql_results(input_dir, output_dir, chart_type='scatter', user_filter=None, show_values=False):
     """
-    Process all database result files (PostgreSQL and MariaDB) and extract TPM values.
+    Process all database result files (PostgreSQL, MariaDB, and MSSQL Server) and extract TPM values.
     
     Args:
         input_dir (str): Input directory containing subdirectories with .out files
@@ -906,8 +918,17 @@ def process_postgresql_results(input_dir, output_dir, chart_type='scatter', user
     for item in os.listdir(input_dir):
         item_path = os.path.join(input_dir, item)
         if os.path.isdir(item_path):
-            # Check if this directory contains .out files (PostgreSQL or MariaDB)
-            out_files = [f for f in os.listdir(item_path) if f.endswith('.out') and ('test_postgresql_pg' in f or 'test_ESX_pg' in f or 'test_mariadb' in f)]
+            # Check if this directory contains .out files (PostgreSQL, MariaDB, or MSSQL)
+            out_files = [
+                f for f in os.listdir(item_path)
+                if f.endswith('.out')
+                and (
+                    'test_postgresql_pg' in f
+                    or 'test_ESX_pg' in f
+                    or 'test_mariadb' in f
+                    or 'test_mssql' in f
+                )
+            ]
             if out_files:
                 vm_dirs.append(item)
     
@@ -927,8 +948,17 @@ def process_postgresql_results(input_dir, output_dir, chart_type='scatter', user
             vm_number = vm_dirs.index(vm_dir) + 1
         print(f"Processing {vm_dir} (VM {vm_number})...")
         
-        # Find all .out files in the VM directory (PostgreSQL or MariaDB)
-        out_files = [f for f in os.listdir(vm_path) if f.endswith('.out') and ('test_postgresql_pg' in f or 'test_ESX_pg' in f or 'test_mariadb' in f)]
+        # Find all .out files in the VM directory (PostgreSQL, MariaDB, or MSSQL)
+        out_files = [
+            f for f in os.listdir(vm_path)
+            if f.endswith('.out')
+            and (
+                'test_postgresql_pg' in f
+                or 'test_ESX_pg' in f
+                or 'test_mariadb' in f
+                or 'test_mssql' in f
+            )
+        ]
         
         for out_file in out_files:
             file_path = os.path.join(vm_path, out_file)
@@ -1878,7 +1908,7 @@ def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, ch
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Extract PostgreSQL and MariaDB benchmark results')
+    parser = argparse.ArgumentParser(description='Extract PostgreSQL, MariaDB, and MSSQL Server benchmark results')
     parser.add_argument('args', nargs='*', default=[],
                        help='Input directories and optional output directory (deprecated: use --input-dir and --output-dir instead)')
     parser.add_argument('--input-dir', action='append', dest='input_dirs',
@@ -1891,8 +1921,8 @@ def main():
                        help='Type of chart to create: scatter (dots only), line (with connections), or bar (default: scatter)')
     parser.add_argument('--show-values', action='store_true',
                        help='Show TPM values as labels on line graphs (default: values are not shown)')
-    parser.add_argument('--database', choices=['MariaDB', 'PostgreSQL', 'mariadb', 'postgresql'], 
-                       help='Specify database type for graph titles (MariaDB or PostgreSQL). If not set, auto-detected from directory names.')
+    parser.add_argument('--database', choices=['MariaDB', 'PostgreSQL', 'MSSQL', 'mariadb', 'postgresql', 'mssql'], 
+                      help='Specify database type for graph titles (MariaDB, PostgreSQL, MSSQL). If not set, auto-detected from directory names.')
     parser.add_argument('--users', type=str,
                        help='Comma-separated list of user counts to include in graphs (e.g., "1,20" or "1, 20"). Only specified user counts will be shown on graphs.')
     
@@ -1979,6 +2009,8 @@ def main():
                     database_type = 'PostgreSQL'
                 elif database_type.lower() == 'mariadb':
                     database_type = 'MariaDB'
+                elif database_type.lower() == 'mssql':
+                    database_type = 'MSSQL'
             create_comparison_graphs(valid_dirs, comparison_output, args.chart_type, database_type, user_filter, args.show_values)
         else:
             print("\nSkipping comparison graphs (not requested and not automatically triggered)")
