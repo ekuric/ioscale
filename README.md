@@ -29,7 +29,8 @@ It is assumed we already have a test virtual machine up and running with SSH `ro
 
 For I/O generic testing, the virtual machine can be identical to the one used for database tests. However, for the generic I/O FIO workload it is not necessary to have a virtual machine with large CPU/memory allocation. For this purpose, the [geniotest.yml](https://github.com/ekuric/ioscale/blob/main/templates/geniotest.yml) virtual template can be used.
 
-After the test virtual machine is up and running, we can start the test as described in the [io-generic](https://github.com/ekuric/ioscale/blob/main/io-generic/io-README.md) readme.
+After the test virtual machine is up and running, we can start the test as described in the [io-generic](https://github.com/ekuric/ioscale/blob/main/io-generic/io-README.md) readme. 
+Important: we are in process to move all scripts to python, and comprehensive readme document is [here](https://github.com/ekuric/ioscale/blob/main/io-generic/fio-test-README.md)
 
 Image used for virtual machines is Fedora 43. It is possible to use different image. However tools in this repository at this time only support `dnf/yum` install managers so be aware of that. Fedora 43 will give you access to all packages without need for subscription. In case you use image which does not have in base channel db packages, then you have to ensure that you have proper subscriptions assigned to test machines.
 
