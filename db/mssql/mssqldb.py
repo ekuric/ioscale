@@ -995,13 +995,15 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     logger.info("All database build processes started. Monitoring build progress...")
     
     # Monitor build completion by checking if hammerdbcli processes are still running
-    # Database builds can take a very long time (30+ minutes for large warehouses)
-    max_build_time = 3600  # 1 hour maximum (adjust based on warehouse count if needed)
+    # Database builds can take a very long time (30+ minutes for large warehouses),
+    # so we keep waiting and only warn after the soft threshold.
+    soft_max_build_time = 3600  # 1 hour soft warning threshold
     check_interval = 30  # Check every 30 seconds
     start_time = time.time()
+    warned_long_build = False
     completed_hosts = set()  # Track hosts that have completed (successfully or with errors)
     
-    while time.time() - start_time < max_build_time:
+    while True:
         still_building = []
         hosts_to_check = [h for h in config.db_hosts if h not in completed_hosts]
         
@@ -1065,6 +1067,11 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
             break
         
         elapsed = int(time.time() - start_time)
+        if elapsed > soft_max_build_time and not warned_long_build:
+            logger.warning(
+                f"Database builds are taking longer than {soft_max_build_time}s; continuing to wait..."
+            )
+            warned_long_build = True
         logger.info(f"Waiting for database builds to complete... ({len(still_building)} hosts still building: {', '.join(still_building)}, {elapsed}s elapsed)")
         time.sleep(check_interval)
     
@@ -1083,8 +1090,8 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
             if success:
                 process_count = int(output.strip()) if output.strip().isdigit() else 0
                 if process_count > 0:
-                    logger.error(f"Database build on {host} is still running after maximum wait time - check {output_file}")
-                    failed_builds.append(host)
+                    # Build still running; continue waiting rather than failing
+                    logger.info(f"Database build on {host} is still running - continuing to wait (output: {output_file})")
                 else:
                     # Verify build completed successfully by checking output file
                     verify_cmd = (
