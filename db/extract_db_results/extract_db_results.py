@@ -62,6 +62,7 @@ import csv
 import argparse
 import tempfile
 import shutil
+import textwrap
 from pathlib import Path
 from collections import defaultdict
 import matplotlib.pyplot as plt
@@ -222,6 +223,25 @@ def get_distinct_colors(n, colormap_name='tab20'):
             colors.append(hex_color)
     
     return colors
+
+
+def wrap_table_header(text, width=18):
+    """
+    Wrap table header text onto multiple lines for readability.
+    """
+    return textwrap.fill(text, width=width)
+
+
+def build_dir_label_map(dir_names, label_prefix="Run"):
+    """
+    Build short column labels and a readable mapping for long directory names.
+    """
+    labels = [f"{label_prefix} {i + 1}" for i in range(len(dir_names))]
+    mapping_lines = []
+    for i, name in enumerate(dir_names, start=1):
+        wrapped = textwrap.fill(name, width=60, subsequent_indent=" " * 7)
+        mapping_lines.append(f"{label_prefix} {i}: {wrapped}")
+    return labels, "\n".join(mapping_lines)
 
 
 def extract_tpm_from_file(file_path):
@@ -1253,7 +1273,7 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
             for i, (dir_name, dir_averages) in enumerate(comparison_data.items()):
                 values = [dir_averages.get(test_type, 0) for test_type in sorted_test_types]
                 plt.plot(x_pos, values, marker=markers[i % len(markers)], linewidth=2, markersize=8,
-                        label=dir_name, color=colors[i % len(colors)], alpha=0.8)
+                        label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
                 # Add value labels on top of markers if show_values is enabled
                 if show_values and max_value > 0:
                     # Collect all x positions and values for this directory (filter out zeros)
@@ -1266,7 +1286,7 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
             for i, (dir_name, dir_averages) in enumerate(comparison_data.items()):
                 values = [dir_averages.get(test_type, 0) for test_type in sorted_test_types]
                 plt.scatter(x_pos, values, s=100, marker=markers[i % len(markers)],
-                          label=dir_name, color=colors[i % len(colors)], alpha=0.8)
+                          label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
         else:  # bar (default)
             # Plot bars for each directory
             max_bar_value = 0
@@ -1274,7 +1294,7 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
             for i, (dir_name, dir_averages) in enumerate(comparison_data.items()):
                 values = [dir_averages.get(test_type, 0) for test_type in sorted_test_types]
                 bars = plt.bar([x + i * bar_width for x in x_pos], values, 
-                              bar_width, label=dir_name, color=colors[i % len(colors)], alpha=0.8)
+                              bar_width, label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
                 all_bars.append((bars, values))
                 max_bar_value = max(max_bar_value, max(values) if values else 0)
             
@@ -1331,16 +1351,17 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
                 row.append(f'{value:.0f}' if value > 0 else '-')
             table_data.append(row)
         
-        # Create column headers - allow longer directory names (up to 50 chars)
-        table_headers = ['Test Type'] + [name[:50] + '...' if len(name) > 50 else name for name in dir_names_list]
+        # Create column headers with short labels and add a mapping below
+        run_labels, run_mapping = build_dir_label_map(dir_names_list, label_prefix="Run")
+        table_headers = ['Test Type'] + run_labels
         
         # Add table - position it to the right with more width for directory names
         ax = plt.gca()
         table = ax.table(cellText=table_data,
                         colLabels=table_headers,
-                        cellLoc='left',  # Left align for better readability of directory names
+                        cellLoc='left',  # Left align for better readability of labels
                         loc='right',
-                        bbox=[1.08, 0.05, 0.55, 0.92])  # Increased width from 0.42 to 0.55
+                        bbox=[1.02, 0.18, 0.62, 0.79])  # Leave space for mapping below
         
         # Add legend after table to position it at top
         legend = plt.legend(bbox_to_anchor=(1.7, 1), loc='upper left', fontsize=10)
@@ -1357,7 +1378,7 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
         # Color header row
         for i in range(len(table_headers)):
             table[(0, i)].set_facecolor('#4472C4')
-            table[(0, i)].set_text_props(weight='bold', color='white')
+            table[(0, i)].set_text_props(weight='bold', color='white', fontsize=8)
             # Center align header text for better appearance
             table[(0, i)]._loc = 'center'
         
@@ -1377,8 +1398,8 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
                 else:
                     table[(i, j)].set_facecolor('white')
         
-        # Adjust layout to make room for wider table
-        plt.subplots_adjust(right=0.45)  # More space for wider table (reduced from 0.55)
+        # Adjust layout to make room for table and legend
+        plt.subplots_adjust(right=0.42)
         plt.tight_layout()
         
         # Save the graph using atomic write
@@ -1463,7 +1484,7 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
             for i, (dir_name, dir_totals) in enumerate(comparison_data.items()):
                 values = [dir_totals.get(test_type, 0) for test_type in sorted_test_types]
                 plt.plot(x_pos, values, marker=markers[i % len(markers)], linewidth=2, markersize=8,
-                        label=dir_name, color=colors[i % len(colors)], alpha=0.8)
+                        label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
                 # Add value labels on top of markers if show_values is enabled
                 if show_values and max_value > 0:
                     # Collect all x positions and values for this directory (filter out zeros)
@@ -1476,7 +1497,7 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
             for i, (dir_name, dir_totals) in enumerate(comparison_data.items()):
                 values = [dir_totals.get(test_type, 0) for test_type in sorted_test_types]
                 plt.scatter(x_pos, values, s=100, marker=markers[i % len(markers)],
-                          label=dir_name, color=colors[i % len(colors)], alpha=0.8)
+                          label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
         else:  # bar (default)
             # Plot bars for each directory
             max_bar_value = 0
@@ -1484,7 +1505,7 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
             for i, (dir_name, dir_totals) in enumerate(comparison_data.items()):
                 values = [dir_totals.get(test_type, 0) for test_type in sorted_test_types]
                 bars = plt.bar([x + i * bar_width for x in x_pos], values, 
-                              bar_width, label=dir_name, color=colors[i % len(colors)], alpha=0.8)
+                              bar_width, label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
                 all_bars.append((bars, values))
                 max_bar_value = max(max_bar_value, max(values) if values else 0)
             
@@ -1541,16 +1562,17 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
                 row.append(f'{value:.0f}' if value > 0 else '-')
             table_data.append(row)
         
-        # Create column headers - allow longer directory names (up to 50 chars)
-        table_headers = ['Test Type'] + [name[:50] + '...' if len(name) > 50 else name for name in dir_names_list]
+        # Create column headers with short labels and add a mapping below
+        run_labels, run_mapping = build_dir_label_map(dir_names_list, label_prefix="Run")
+        table_headers = ['Test Type'] + run_labels
         
         # Add table - position it to the right with more width for directory names
         ax = plt.gca()
         table = ax.table(cellText=table_data,
                         colLabels=table_headers,
-                        cellLoc='left',  # Left align for better readability of directory names
+                        cellLoc='left',  # Left align for better readability of labels
                         loc='right',
-                        bbox=[1.08, 0.05, 0.55, 0.92])  # Increased width from 0.42 to 0.55
+                        bbox=[1.02, 0.18, 0.62, 0.79])  # Leave space for mapping below
         
         # Add legend after table to position it at top
         legend = plt.legend(bbox_to_anchor=(1.7, 1), loc='upper left', fontsize=10)
@@ -1567,7 +1589,7 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
         # Color header row
         for i in range(len(table_headers)):
             table[(0, i)].set_facecolor('#4472C4')
-            table[(0, i)].set_text_props(weight='bold', color='white')
+            table[(0, i)].set_text_props(weight='bold', color='white', fontsize=8)
             # Center align header text for better appearance
             table[(0, i)]._loc = 'center'
         
@@ -1587,8 +1609,8 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
                 else:
                     table[(i, j)].set_facecolor('white')
         
-        # Adjust layout to make room for wider table
-        plt.subplots_adjust(right=0.45)  # More space for wider table (reduced from 0.55)
+        # Adjust layout to make room for table and legend
+        plt.subplots_adjust(right=0.42)
         plt.tight_layout()
         
         # Save the graph using atomic write
@@ -1699,7 +1721,7 @@ def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, ch
                         
                         bars = plt.bar(x_positions, y_values, 
                                width=bar_width, alpha=0.7,
-                               color=colors[i % len(colors)], label=dir_name)
+                           color=colors[i % len(colors)], label=f"Run {i + 1}: {dir_name}")
                         # Add value labels on top of bars if show_values is enabled
                         if show_values and y_values:
                             max_bar_val = max([v for v in y_values if v > 0] or [0])
@@ -1745,11 +1767,11 @@ def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, ch
                         if chart_type == 'line':
                             plt.plot(sequential_positions, complete_tpm_values, 
                                     marker='o', linewidth=2, markersize=6, 
-                                    color=colors[i % len(colors)], label=dir_name, alpha=0.8)
+                                    color=colors[i % len(colors)], label=f"Run {i + 1}: {dir_name}", alpha=0.8)
                         else:  # scatter (default)
                             plt.scatter(sequential_positions, complete_tpm_values, 
                                        s=50, alpha=0.8, 
-                                       color=colors[i % len(colors)], label=dir_name)
+                                       color=colors[i % len(colors)], label=f"Run {i + 1}: {dir_name}")
             
             # Determine database types being compared - use provided type or auto-detect
             if database_type:
