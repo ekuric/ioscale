@@ -1361,7 +1361,7 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
                         colLabels=table_headers,
                         cellLoc='left',  # Left align for better readability of labels
                         loc='right',
-                        bbox=[1.02, 0.18, 0.62, 0.79])  # Leave space for mapping below
+                        bbox=[1.02, 0.16, 0.68, 0.81])  # Wider/taller table for large values
         
         # Add legend after table to position it at top
         legend = plt.legend(bbox_to_anchor=(1.7, 1), loc='upper left', fontsize=10)
@@ -1369,7 +1369,7 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
         # Style the table
         table.auto_set_font_size(False)
         table.set_fontsize(9)
-        table.scale(1, 1.5)
+        table.scale(1.1, 1.7)
         
         # Auto-adjust column widths based on content
         num_cols = len(table_headers)
@@ -1399,7 +1399,7 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
                     table[(i, j)].set_facecolor('white')
         
         # Adjust layout to make room for table and legend
-        plt.subplots_adjust(right=0.42)
+        plt.subplots_adjust(right=0.38)
         plt.tight_layout()
         
         # Save the graph using atomic write
@@ -1572,7 +1572,7 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
                         colLabels=table_headers,
                         cellLoc='left',  # Left align for better readability of labels
                         loc='right',
-                        bbox=[1.02, 0.18, 0.62, 0.79])  # Leave space for mapping below
+                        bbox=[1.02, 0.16, 0.68, 0.81])  # Wider/taller table for large values
         
         # Add legend after table to position it at top
         legend = plt.legend(bbox_to_anchor=(1.7, 1), loc='upper left', fontsize=10)
@@ -1580,7 +1580,7 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
         # Style the table
         table.auto_set_font_size(False)
         table.set_fontsize(9)
-        table.scale(1, 1.5)
+        table.scale(1.1, 1.7)
         
         # Auto-adjust column widths based on content
         num_cols = len(table_headers)
@@ -1610,7 +1610,7 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
                     table[(i, j)].set_facecolor('white')
         
         # Adjust layout to make room for table and legend
-        plt.subplots_adjust(right=0.42)
+        plt.subplots_adjust(right=0.38)
         plt.tight_layout()
         
         # Save the graph using atomic write
