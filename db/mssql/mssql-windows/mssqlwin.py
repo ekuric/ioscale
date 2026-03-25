@@ -480,7 +480,16 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
     logger.info("Building TPCC database on Windows hosts...")
     windows_path = config.windows_hammerdb_path.rstrip("\\")
     script_path = config.windows_rebuild_script or f"{windows_path}\\rebuild-db.ps1"
+    if config.windows_rebuild_script_local and os.path.exists(config.windows_rebuild_script_local):
+        script_path = f"{windows_path}\\{os.path.basename(config.windows_rebuild_script_local)}"
+    elif script_path and "\\" not in script_path and ":" not in script_path:
+        script_path = f"{windows_path}\\{script_path}"
+
     create_db_sql = config.windows_create_db_sql or f"{windows_path}\\create_db.sql"
+    if config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
+        create_db_sql = f"{windows_path}\\{os.path.basename(config.windows_create_db_sql_local)}"
+    elif create_db_sql and "\\" not in create_db_sql and ":" not in create_db_sql:
+        create_db_sql = f"{windows_path}\\{create_db_sql}"
     output_file = "build_mssql_windows.out"
     ps_parts = [
         f'cd "{windows_path}"',
@@ -497,7 +506,7 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
         futures = []
         for host in config.db_hosts:
             if config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
-                remote_sql = config.windows_create_db_sql or f"{windows_path}\\create_db.sql"
+                remote_sql = f"{windows_path}\\{os.path.basename(config.windows_create_db_sql_local)}"
                 if not config.dry_run:
                     try:
                         scp_cmd = executor.get_scp_put_command(config.windows_create_db_sql_local, host, remote_sql)
@@ -511,7 +520,7 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
                         logger.error(f"Failed to copy create_db.sql to {host}: {e}")
                         raise
             if config.windows_rebuild_script_local and os.path.exists(config.windows_rebuild_script_local):
-                remote_script = config.windows_rebuild_script or f"{windows_path}\\{os.path.basename(config.windows_rebuild_script_local)}"
+                remote_script = f"{windows_path}\\{os.path.basename(config.windows_rebuild_script_local)}"
                 if not config.dry_run:
                     try:
                         scp_cmd = executor.get_scp_put_command(config.windows_rebuild_script_local, host, remote_script)
@@ -521,7 +530,6 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
                             if result.stderr:
                                 logger.error(result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr)
                             raise RuntimeError("SCP failed")
-                        script_path = remote_script
                     except Exception as e:
                         logger.error(f"Failed to copy rebuild script to {host}: {e}")
                         raise
