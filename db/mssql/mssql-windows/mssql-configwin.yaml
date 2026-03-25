@@ -1,0 +1,24 @@
+# Minimal MSSQL HammerDB Windows Configuration (mssqlwin.py)
+
+description: "1-100-0users-hammerdb-2windows-running-parallel"
+
+database:
+  hosts: "192.168.122.201 192.168.122.200"           # Or host_pattern / host_labels / host_file
+  namespace: "default"   # Only used for virtctl mode
+  test_duration: 1              # Test duration in minutes
+  # mssql_total_iterations: 10000000
+  # warehouse_count: 500
+  user_count: "1 100"
+  mssql_pass: "100yard-" 
+
+windows:
+  hammerdb_path: "C:\\tools\\Hammerdb-4.12"
+  test_script: "C:\\tools\\Hammerdb-4.12\\hammertest.ps1"
+  hammerdb_test_script: "C:\\tools\\Hammerdb-4.12\\mssqls_tprocc_run10.tcl"
+  result_dir: "C:\\tools\\Hammerdb-4.12\\results-e"
+  rebuild_script: "C:\\tools\\Hammerdb-4.12\\rebuild-dbelvir.ps1"
+  create_db_sql: "C:\\tools\\Hammerdb-4.12\\create_dbelvir.sql"
+  ssh_user: "Administrator"
+  rebuilddb: false
+  rebuild_only: false
+  test_only: true
