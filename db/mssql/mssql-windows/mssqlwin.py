@@ -480,12 +480,26 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
     logger.info("Building TPCC database on Windows hosts...")
     windows_path = config.windows_hammerdb_path.rstrip("\\")
     script_path = config.windows_rebuild_script or f"{windows_path}\\rebuild-db.ps1"
+    if (config.windows_rebuild_script and not config.windows_rebuild_script_local
+            and "\\" not in config.windows_rebuild_script and ":" not in config.windows_rebuild_script
+            and not os.path.exists(config.windows_rebuild_script)):
+        logger.warning(
+            "Local rebuild script not found; assuming it exists on Windows host: "
+            f"{config.windows_rebuild_script}"
+        )
     if config.windows_rebuild_script_local and os.path.exists(config.windows_rebuild_script_local):
         script_path = f"{windows_path}\\{os.path.basename(config.windows_rebuild_script_local)}"
     elif script_path and "\\" not in script_path and ":" not in script_path:
         script_path = f"{windows_path}\\{script_path}"
 
     create_db_sql = config.windows_create_db_sql or f"{windows_path}\\create_db.sql"
+    if (config.windows_create_db_sql and not config.windows_create_db_sql_local
+            and "\\" not in config.windows_create_db_sql and ":" not in config.windows_create_db_sql
+            and not os.path.exists(config.windows_create_db_sql)):
+        logger.warning(
+            "Local create_db.sql not found; assuming it exists on Windows host: "
+            f"{config.windows_create_db_sql}"
+        )
     if config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
         create_db_sql = f"{windows_path}\\{os.path.basename(config.windows_create_db_sql_local)}"
     elif create_db_sql and "\\" not in create_db_sql and ":" not in create_db_sql:
@@ -576,7 +590,8 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
         f"on hosts: {', '.join(config.db_hosts)}"
     )
 
-    generated_dir = os.path.join(os.getcwd(), ".mssqltestfiles-generated")
+    config_dir = os.path.dirname(os.path.abspath(config.config_file)) if config.config_file else os.getcwd()
+    generated_dir = os.path.join(config_dir, ".mssqltestfiles-generated")
     os.makedirs(generated_dir, exist_ok=True)
 
     local_ps1_files = {}
@@ -625,8 +640,28 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
             local_tcl_path = os.path.join(generated_dir, tcl_name) if tcl_name else ""
             local_ps1_path = os.path.join(generated_dir, ps_name) if ps_name else ""
             if not os.path.exists(local_tcl_path) or not os.path.exists(local_ps1_path):
-                generated_ok = False
-                break
+                # Fallback: if configured base names don't match, try to discover
+                # any generated files for this user_count.
+                ps_pattern = re.compile(rf"^(.*)_{re.escape(str(user_count))}\.ps1$")
+                tcl_pattern = re.compile(rf"^(.*){re.escape(str(user_count))}\.tcl$")
+                for filename in os.listdir(generated_dir):
+                    if not ps_name:
+                        ps_match = ps_pattern.match(filename)
+                        if ps_match:
+                            base_ps_name = ps_match.group(1)
+                            ps_name = filename
+                    if not tcl_name:
+                        tcl_match = tcl_pattern.match(filename)
+                        if tcl_match:
+                            base_tcl_name = tcl_match.group(1)
+                            tcl_name = filename
+                    if ps_name and tcl_name:
+                        break
+                local_tcl_path = os.path.join(generated_dir, tcl_name) if tcl_name else ""
+                local_ps1_path = os.path.join(generated_dir, ps_name) if ps_name else ""
+                if not os.path.exists(local_tcl_path) or not os.path.exists(local_ps1_path):
+                    generated_ok = False
+                    break
             local_tcl_files[user_count] = local_tcl_path
             local_ps1_files[user_count] = local_ps1_path
         if generated_ok:

@@ -60,7 +60,11 @@ Content of configuration file is presented below
 description: "1-100-users-hammerdb-2win-parallel"
 
 database:
-  hosts: "192.168.122.201 192.168.122.200"   # Or host_pattern / host_labels / host_file
+  # Choose ONE of: hosts, host_pattern, host_labels, host_file
+  hosts: "192.168.122.201 192.168.122.200"   # Space-separated list of hosts
+  # host_pattern: "winvm-{1..3}"              # Expands to winvm-1 winvm-2 winvm-3
+  # host_labels: "app=mssql,role=primary"     # OpenShift VM labels (virtctl)
+  # host_file: "mssql_hosts.txt"              # File with one host per line
   namespace: "default"                       # Only used for virtctl mode
   test_duration: 1                           # Test duration in minutes
   # mssql_total_iterations: 10000000         # can be set - we use default from HammerDB
@@ -81,6 +85,19 @@ windows:
   test_only: true                             # only test - no rebuild, assuming rebuild was done before
 
 ```
+
+As shown in above `mssql-configwin.yaml` example we can specify test host on four different ways
+
+1. space separted hosts eg. `hosts: "host1 host2` 
+2. hostname pattern, eg. `host_pattern: "winvm-{1..3}"` this is useful if there are many test hosts
+3. host labels , eg. `host_labels: "app=mssql,role=primary"` useful in OCP environments
+4. host_file: "mssql_hosts.txt" in this case we put hostnames for example 
+```
+host1
+host2 
+host3 
+```
+
 The workflow we follow here is 
 
 1. Build database 
