@@ -22,6 +22,7 @@ windows:
   result_dir: "C:\\tools\\Hammerdb-4.12\\results"
   rebuild_script: "C:\\tools\\Hammerdb-4.12\\rebuild-db.ps1"
   create_db_sql: "C:\\tools\\Hammerdb-4.12\\create_db.sql"
+  disk_id: "1" # data disk id to format and use for testing - pick correct disk!
   ssh_user: "Administrator"
   rebuilddb: true
   rebuild_only: false
