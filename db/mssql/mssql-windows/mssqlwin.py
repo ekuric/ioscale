@@ -48,6 +48,7 @@ class MSSQLWinConfig:
         self.verbose = False
         self.use_virtctl = None  # None = auto-detect, True = force virtctl, False = force SSH
         self.namespace = None
+        self.namespace_from_config = False
         self.db_hosts: List[str] = []
         self.warehouse_count = None
         self.mssql_total_iterations = None
@@ -72,6 +73,7 @@ class MSSQLWinConfig:
         self.windows_test_only = False
         self.generate_only = False
         self.windows_mssql_pass = None
+        self.windows_disk_id = "1"
 
 
 def get_vm_number(hostname: str) -> str:
@@ -255,16 +257,21 @@ class ConfigLoader:
         with open(self.config.config_file, "r") as f:
             yaml_data = yaml.safe_load(f)
 
+        database = yaml_data.get("database", {})
+        namespace_value = database.get("namespace")
         if self.config.use_virtctl is not False:
-            self.config.namespace = yaml_data.get("database", {}).get("namespace", "default")
-            if self.config.namespace == "null" or not self.config.namespace:
+            if namespace_value not in (None, "null", ""):
+                self.config.namespace_from_config = True
+                self.config.namespace = namespace_value
+            else:
+                self.config.namespace = "default"
+            if not self.config.namespace:
                 self.config.namespace = "default"
         else:
             self.config.namespace = "N/A"
 
         self.config.db_hosts = self._get_db_hosts(yaml_data)
 
-        database = yaml_data.get("database", {})
         self.config.warehouse_count = database.get("warehouse_count")
         self.config.mssql_total_iterations = database.get("mssql_total_iterations")
         self.config.test_duration = database.get("test_duration")
@@ -336,6 +343,10 @@ class ConfigLoader:
             windows_mssql_pass = None
         if windows_mssql_pass:
             self.config.windows_mssql_pass = windows_mssql_pass
+        windows_disk_id = windows_cfg.get("disk_id")
+        if windows_disk_id in ("null", "", None):
+            windows_disk_id = "1"
+        self.config.windows_disk_id = str(windows_disk_id)
         windows_rebuild_only = windows_cfg.get("rebuild_only")
         if windows_rebuild_only == "true" or windows_rebuild_only is True:
             self.config.windows_rebuild_only = True
@@ -469,6 +480,7 @@ def display_config(config: MSSQLWinConfig) -> None:
     if config.windows_result_dir:
         logger.info(f"Windows result dir: {config.windows_result_dir}")
     logger.info(f"Windows SSH user: {config.windows_ssh_user}")
+    logger.info(f"Windows disk_id: {config.windows_disk_id}")
     logger.info(f"Windows rebuilddb: {'ENABLED' if config.windows_rebuilddb else 'DISABLED'}")
     logger.info(f"Log level: {config.log_level}")
 
@@ -562,6 +574,58 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
             success, output = future.result()
             if not success:
                 logger.error(f"Windows rebuild failed: {output}")
+                sys.exit(1)
+
+
+def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) -> None:
+    """Prepare Windows machines by formatting the data disk."""
+    logger.info("Preparing Windows machines (formatting data disk)...")
+    """
+    This is delicate task. We have to know in advance on test virtual machines 
+    how many data disks are attached to them. This is done with `disk_id` parameter.
+    Some machines will have CDROM attached and that affects the disk_id value, and test disk will have 
+    disk_id value of 2. Script supports --prepare-machine and safest is to experiment with it. 
+    """
+    disk_id = config.windows_disk_id
+    ps_cmd = f'& "C:\\tools\\setup\\provision-data-disk.ps1" -DiskID {disk_id}'
+    cmd = build_powershell_command(ps_cmd)
+    with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
+        futures = []
+        for host in config.db_hosts:
+            futures.append(pool.submit(
+                executor.execute_command,
+                host,
+                cmd,
+                f"Preparing disk (DiskID={disk_id})",
+                1200
+            ))
+        for future in as_completed(futures):
+            success, output = future.result()
+            if not success:
+                logger.error(f"Windows prepare failed: {output}")
+                sys.exit(1)
+
+    logger.info("Moving HammerDB to D: and creating data directories...")
+    # we have to move D: to be as input parameter in configuration yaml.    
+    move_cmd = build_powershell_command("; ".join([
+        'if (Test-Path "C:\\tools\\hammerdb-4.12") { '
+        'Copy-Item -Path "C:\\tools\\hammerdb-4.12" -Destination "D:\\" -Recurse -Force }',
+        'New-Item -Path "D:\\mssql\\data" -ItemType Directory -Force | Out-Null'
+    ]))
+    with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
+        futures = []
+        for host in config.db_hosts:
+            futures.append(pool.submit(
+                executor.execute_command,
+                host,
+                move_cmd,
+                "Moving HammerDB to D: and creating data directories",
+                1200
+            ))
+        for future in as_completed(futures):
+            success, output = future.result()
+            if not success:
+                logger.error(f"Windows HammerDB move failed: {output}")
                 sys.exit(1)
 
 
@@ -1039,6 +1103,8 @@ EXAMPLES:
                         help="Local HammerDB test script to copy to Windows hosts")
     parser.add_argument("--generate-only", action="store_true",
                         help="Only generate per-user files locally and exit")
+    parser.add_argument("--prepare-machine", action="store_true",
+                        help="Prepare Windows machines by formatting the data disk and exit")
 
     args = parser.parse_args()
 
@@ -1054,6 +1120,7 @@ EXAMPLES:
     config.use_virtctl = None if not (args.ssh_only or args.virtctl_only) else (not args.ssh_only)
     config.copy_results = args.copy_results
     config.generate_only = args.generate_only
+    prepare_machine = args.prepare_machine
     if args.test_script:
         if not os.path.exists(args.test_script):
             logger.error(f"Test script not found: {args.test_script}")
@@ -1093,20 +1160,32 @@ EXAMPLES:
 
     display_config(config)
 
-    if not config.windows_hammerdb_path:
-        logger.error("windows.hammerdb_path is required for Windows testing")
-        sys.exit(1)
-
     executor = CommandExecutor(config)
+    if config.use_virtctl is None and config.namespace_from_config:
+        logger.info(
+            f"Namespace '{config.namespace}' provided in config; forcing virtctl mode."
+        )
+        config.use_virtctl = True
     if config.use_virtctl is None and not config.generate_only:
         non_vm_hosts = [h for h in config.db_hosts if not executor.is_vm_host(h)]
         if non_vm_hosts:
             logger.error(
-                "Detected SSH-only hosts but --ssh-only was not specified: "
+                "Hosts not detected as VMs in the current OpenShift context: "
                 f"{', '.join(non_vm_hosts)}"
             )
-            logger.error("Re-run with --ssh-only for baremetal/KVM hosts.")
+            logger.error(
+                "If these are OpenShift VMs, set database.namespace correctly "
+                "or re-run with --virtctl-only. For baremetal/KVM, use --ssh-only."
+            )
             sys.exit(1)
+    if prepare_machine:
+        prepare_windows_machines(config, executor)
+        logger.info("Prepare-machine mode complete; skipping tests and result collection")
+        return
+
+    if not config.windows_hammerdb_path:
+        logger.error("windows.hammerdb_path is required for Windows testing")
+        sys.exit(1)
     results_date = datetime.now().strftime('%Y%m%d-%H%M%S')
     sanitized_desc = re.sub(r"[^a-z0-9]", "_", config.description.lower()) if config.description else ""
     sanitized_desc = re.sub(r"_+", "_", sanitized_desc).strip("_")
