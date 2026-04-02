@@ -881,10 +881,26 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
             f"{', '.join(config.db_hosts)}"
         )
         with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
-            futures = []
-            for host in config.db_hosts:
-                logger.info(f"Starting test on host {host} (users={user_count})")
-                vm_number = get_vm_number(host)
+            # Phase 1: pre-warm connections to reduce first-connection overhead
+            if not config.dry_run and not config.generate_only:
+                warm_cmd = build_powershell_command('Write-Output "warm"')
+                warm_futures = [
+                    pool.submit(
+                        executor.execute_command,
+                        host,
+                        warm_cmd,
+                        "Pre-warming connection",
+                        30
+                    )
+                    for host in config.db_hosts
+                ]
+                for future in as_completed(warm_futures):
+                    success, output = future.result()
+                    if not success:
+                        logger.warning(f"Pre-warm failed: {output}")
+
+            # Phase 2: stage scripts and ensure result directory exists (parallel)
+            def stage_host(host: str) -> None:
                 if not config.dry_run and not config.generate_only:
                     mkdir_cmd = build_powershell_command(
                         f'New-Item -Path "{result_dir}" -ItemType Directory -Force | Out-Null'
@@ -896,31 +912,35 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                         timeout=60
                     )
                     if not mkdir_success:
-                        logger.error(f"Failed to create result directory on {host}: {mkdir_output}")
-                        raise RuntimeError("Failed to create result directory")
+                        raise RuntimeError(f"Failed to create result directory on {host}: {mkdir_output}")
                 remote_ps1 = config.windows_test_script or f"{windows_path}\\{ntpath.basename(local_ps1_files[user_count])}"
-                # Always use the generated per-user TCL name in HammerDB path to
-                # match what the generated PowerShell script references.
                 remote_tcl = f"{windows_path}\\{ntpath.basename(local_tcl_files[user_count])}"
                 if not config.dry_run:
-                    try:
-                        scp_cmd = executor.get_scp_put_command(local_ps1_files[user_count], host, remote_ps1)
-                        result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
-                        if result.returncode != 0:
-                            logger.error(f"Failed to copy test script to {host}")
-                            if result.stderr:
-                                logger.error(result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr)
-                            raise RuntimeError("SCP failed")
-                        scp_cmd = executor.get_scp_put_command(local_tcl_files[user_count], host, remote_tcl)
-                        result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
-                        if result.returncode != 0:
-                            logger.error(f"Failed to copy hammerdb test script to {host}")
-                            if result.stderr:
-                                logger.error(result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr)
-                            raise RuntimeError("SCP failed")
-                    except Exception as e:
-                        logger.error(f"Failed to copy test files to {host}: {e}")
-                        raise
+                    scp_cmd = executor.get_scp_put_command(local_ps1_files[user_count], host, remote_ps1)
+                    result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
+                    if result.returncode != 0:
+                        stderr = result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr
+                        raise RuntimeError(f"Failed to copy test script to {host}: {stderr}")
+                    scp_cmd = executor.get_scp_put_command(local_tcl_files[user_count], host, remote_tcl)
+                    result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
+                    if result.returncode != 0:
+                        stderr = result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr
+                        raise RuntimeError(f"Failed to copy hammerdb test script to {host}: {stderr}")
+
+            stage_futures = [pool.submit(stage_host, host) for host in config.db_hosts]
+            for future in as_completed(stage_futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Failed to stage test files: {e}")
+                    sys.exit(1)
+
+            # Phase 3: start tests in parallel after staging
+            start_futures = []
+            for host in config.db_hosts:
+                logger.info(f"Starting test on host {host} (users={user_count})")
+                remote_ps1 = config.windows_test_script or f"{windows_path}\\{ntpath.basename(local_ps1_files[user_count])}"
+                remote_tcl = f"{windows_path}\\{ntpath.basename(local_tcl_files[user_count])}"
                 hammerdb_test = remote_tcl
                 ps_cmd = "; ".join([
                     f'cd "{windows_path}"',
@@ -934,15 +954,14 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     f'& "{remote_ps1}"'
                 ])
                 cmd = build_powershell_command(ps_cmd)
-                future = pool.submit(
+                start_futures.append(pool.submit(
                     executor.execute_command,
                     host,
                     cmd,
                     f"Running Windows test for {user_count} users",
                     7200
-                )
-                futures.append(future)
-            for future in as_completed(futures):
+                ))
+            for future in as_completed(start_futures):
                 success, output = future.result()
                 if not success:
                     logger.error(f"Windows test failed: {output}")
@@ -1194,6 +1213,15 @@ EXAMPLES:
     else:
         results_dir = f"mssql-results-{results_date}"
 
+    if config.generate_only:
+        if config.windows_rebuild_only or config.windows_test_only or config.copy_results:
+            logger.warning(
+                "Generate-only mode ignores rebuild_only, test_only, and copy_results flags."
+            )
+        run_tests_windows(config, executor)
+        logger.info("Generate-only mode complete; skipping remote execution")
+        return
+
     if config.windows_rebuild_only and config.windows_test_only:
         logger.error("windows.rebuild_only and windows.test_only cannot both be enabled")
         sys.exit(1)
@@ -1204,11 +1232,6 @@ EXAMPLES:
             sys.exit(1)
         build_database_windows(config, executor)
         logger.info("Rebuild-only mode complete; skipping tests and result collection")
-        return
-
-    if config.generate_only:
-        run_tests_windows(config, executor)
-        logger.info("Generate-only mode complete; skipping remote execution")
         return
 
     if config.copy_results:
