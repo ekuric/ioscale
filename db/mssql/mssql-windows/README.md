@@ -40,6 +40,8 @@ optional arguments:
                         Local create_db.sql to copy to Windows hosts
   --hammerdb-test-script HAMMERDB_TEST_SCRIPT
                         Local HammerDB test script to copy to Windows hosts
+  --build-schema-file BUILD_SCHEMA_FILE
+                        Local build schema TCL to customize and copy to Windows hosts
   --generate-only       Only generate per-user files locally and exit
 
 EXAMPLES:
@@ -117,7 +119,14 @@ We can run test directly without generating files, but this is best practice as 
 
 ` # python  mssqlwin.py -c mssql-configwin.yaml  --test-script hammerdb-sa-test.ps1 --hammerdb-test-script mssqls_tprocc_run.tcl --ssh-only --generate-only` 
 
-`--generate-only`  hammerdb / powershell test scripts will be generated from `hammerdb-sa-test.ps1` and `mssqls_tprocc_run.tcl` and saved locally. 
+`--generate-only` hammerdb / powershell test scripts will be generated from `hammerdb-sa-test.ps1` and `mssqls_tprocc_run.tcl` and saved locally. 
+If `windows.build_schema_file` is set, the build schema TCL is updated with `database.warehouse_count`
+(`diset tpcc mssqls_count_ware <count>`) and saved locally as well. In generate-only mode, if
+`windows.create_db_sql` is provided, a sized `create_db.sql` is generated with:
+- data `SIZE` = `warehouse_count * 150MB`
+- log `SIZE` = `warehouse_count * 75MB`
+- log `MAXSIZE` = data size
+The generated `create_db.sql` is written to `.mssqltestfiles-generated/` as `create_db-wh<COUNT>.sql`.
 
 ```
  ls -l .mssqltestfiles-generated/
@@ -150,6 +159,7 @@ Configuration (mssql-configwin.yaml)
 - `windows.rebuild_script`: optional path to a custom rebuild script on the host.
 - `windows.create_db_sql`: optional path to `create_db.sql` on the host (if provided locally, it is copied to the host).
 - `windows.hammerdb_test_script`: optional HammerDB test TCL path on the host.
+- `windows.build_schema_file`: optional build schema TCL path used for rebuild (local file is patched with `warehouse_count`).
 - `windows.mssql_pass`: Required MSSQL password override used to patch generated TCL files. This is password used to connect to MSSQL database. 
 - `database.warehouse_count`: optional warehouse count override for generated TCL files.
 - `database.mssql_total_iterations`: optional iteration override for generated TCL files.
@@ -174,6 +184,7 @@ Environment variables passed to Windows scripts
 - `CREATE_DB_SQL`: path to `create_db.sql` on the host (rebuild step).
 - `MSSQL_PASS`: MSSQL password used by rebuild script (if set).
 - `HAMMERDB_TEST_SCRIPT`: TCL test file path on the host (test step).
+- `BUILD_SCHEMA_TCL`: build schema TCL path on the host (rebuild step).
 - `HAMMERDB_WAREHOUSE_COUNT`: warehouse count (from config).
 - `HAMMERDB_TEST_DURATION`: test duration in minutes (from config).
 - `HAMMERDB_USER_COUNT`: user count for the current run.

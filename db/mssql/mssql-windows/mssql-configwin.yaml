@@ -17,12 +17,13 @@ database:
 
 windows:
   hammerdb_path: "C:\\tools\\Hammerdb-4.12"
-  test_script: ""  # C:\\tools\\Hammerdb-4.12\\hammerdb-sa-test.ps1"
-  hammerdb_test_script: "" # C:\\tools\\Hammerdb-4.12\\mssqls_tprocc_run.tcl" 
+  test_script: "C:\\tools\\Hammerdb-4.12\\hammertest.ps1"
+  hammerdb_test_script: "C:\\tools\\Hammerdb-4.12\\mssqls_tprocc_run10.tcl"
+  build_schema_file: "C:\\tools\\Hammerdb-4.12\\mssqls_tprocc_buildschema.tcl"
   result_dir: "C:\\tools\\Hammerdb-4.12\\results"
   rebuild_script: "C:\\tools\\Hammerdb-4.12\\rebuild-db.ps1"
   create_db_sql: "C:\\tools\\Hammerdb-4.12\\create_db.sql"
-  disk_id: "1" # data disk id to format and use for testing - pick correct disk!
+  disk_id: "1"  # data disk id to format and use for testing
   ssh_user: "Administrator"
   rebuilddb: true
   rebuild_only: false

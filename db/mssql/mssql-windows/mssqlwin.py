@@ -67,6 +67,8 @@ class MSSQLWinConfig:
         self.windows_rebuild_script_local = None
         self.windows_create_db_sql = None
         self.windows_create_db_sql_local = None
+        self.windows_build_schema_file = None
+        self.windows_build_schema_file_local = None
         self.windows_hammerdb_test_script = None
         self.windows_hammerdb_test_script_local = None
         self.windows_rebuild_only = False
@@ -333,6 +335,11 @@ class ConfigLoader:
             windows_create_db_sql = None
         if not self.config.windows_create_db_sql and windows_create_db_sql:
             self.config.windows_create_db_sql = windows_create_db_sql
+        windows_build_schema_file = windows_cfg.get("build_schema_file")
+        if windows_build_schema_file in ("null", ""):
+            windows_build_schema_file = None
+        if not self.config.windows_build_schema_file and windows_build_schema_file:
+            self.config.windows_build_schema_file = windows_build_schema_file
         windows_hammerdb_test_script = windows_cfg.get("hammerdb_test_script")
         if windows_hammerdb_test_script in ("null", ""):
             windows_hammerdb_test_script = None
@@ -469,6 +476,10 @@ def display_config(config: MSSQLWinConfig) -> None:
         logger.info(f"Windows create_db_sql: {config.windows_create_db_sql}")
     if config.windows_create_db_sql_local:
         logger.info(f"Windows create_db_sql (local override): {config.windows_create_db_sql_local}")
+    if config.windows_build_schema_file:
+        logger.info(f"Windows build schema file: {config.windows_build_schema_file}")
+    if config.windows_build_schema_file_local:
+        logger.info(f"Windows build schema file (local override): {config.windows_build_schema_file_local}")
     if config.windows_hammerdb_test_script:
         logger.info(f"Windows hammerdb_test_script: {config.windows_hammerdb_test_script}")
     if config.windows_hammerdb_test_script_local:
@@ -516,6 +527,46 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
         create_db_sql = f"{windows_path}\\{os.path.basename(config.windows_create_db_sql_local)}"
     elif create_db_sql and "\\" not in create_db_sql and ":" not in create_db_sql:
         create_db_sql = f"{windows_path}\\{create_db_sql}"
+
+    if config.windows_build_schema_file_local and os.path.exists(config.windows_build_schema_file_local):
+        config_dir = os.path.dirname(os.path.abspath(config.config_file)) if config.config_file else os.getcwd()
+        generated_dir = os.path.join(config_dir, ".mssqltestfiles-generated")
+        os.makedirs(generated_dir, exist_ok=True)
+        with open(config.windows_build_schema_file_local, "r", encoding="utf-8") as f:
+            build_schema_content = f.read()
+        if config.warehouse_count:
+            build_schema_content = re.sub(
+                r"^set warehouse .*?$",
+                "",
+                build_schema_content,
+                flags=re.MULTILINE,
+            )
+            build_schema_content = re.sub(
+                r"^diset tpcc mssqls_count_ware .*?$",
+                f"diset tpcc mssqls_count_ware {config.warehouse_count}",
+                build_schema_content,
+                flags=re.MULTILINE,
+            )
+        if config.windows_mssql_pass:
+            build_schema_content = re.sub(
+                r"^diset connection mssqls_pass.*$",
+                f"diset connection mssqls_pass {config.windows_mssql_pass}",
+                build_schema_content,
+                flags=re.MULTILINE,
+            )
+        schema_base = ntpath.splitext(ntpath.basename(config.windows_build_schema_file_local))[0]
+        schema_suffix = f"-wh{config.warehouse_count}" if config.warehouse_count else ""
+        generated_build_schema = os.path.join(generated_dir, f"{schema_base}{schema_suffix}.tcl")
+        with open(generated_build_schema, "w", encoding="utf-8") as f:
+            f.write(build_schema_content)
+        config.windows_build_schema_file_local = generated_build_schema
+
+    build_schema_path = config.windows_build_schema_file or f"{windows_path}\\scripts\\tcl\\mssqls\\tprocc\\mssqls_tprocc_buildschema.tcl"
+    if config.windows_build_schema_file_local and os.path.exists(config.windows_build_schema_file_local):
+        build_schema_path = f"{windows_path}\\{os.path.basename(config.windows_build_schema_file_local)}"
+    elif build_schema_path and "\\" not in build_schema_path and ":" not in build_schema_path:
+        build_schema_path = f"{windows_path}\\{build_schema_path}"
+    logger.info(f"Using build schema TCL: {build_schema_path}")
     output_file = "build_mssql_windows.out"
     ps_parts = [
         f'cd "{windows_path}"',
@@ -524,6 +575,8 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
     ]
     if config.windows_mssql_pass:
         ps_parts.append(f'$env:MSSQL_PASS = "{config.windows_mssql_pass}"')
+    if build_schema_path:
+        ps_parts.append(f'$env:BUILD_SCHEMA_TCL = "{build_schema_path}"')
     ps_parts.append(f'& "{script_path}" 2>&1 | Tee-Object -FilePath "{output_file}"')
     ps_cmd = "; ".join(ps_parts)
     cmd = build_powershell_command(ps_cmd)
@@ -559,13 +612,25 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
                     except Exception as e:
                         logger.error(f"Failed to copy rebuild script to {host}: {e}")
                         raise
+            if config.windows_build_schema_file_local and os.path.exists(config.windows_build_schema_file_local):
+                remote_schema = f"{windows_path}\\{os.path.basename(config.windows_build_schema_file_local)}"
+                if not config.dry_run:
+                    try:
+                        logger.info(f"Copying build schema file to {host}: {remote_schema}")
+                        scp_cmd = executor.get_scp_put_command(config.windows_build_schema_file_local, host, remote_schema)
+                        result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
+                        if result.returncode != 0:
+                            logger.error(f"Failed to copy build schema file to {host}")
+                            if result.stderr:
+                                logger.error(result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr)
+                            raise RuntimeError("SCP failed")
+                    except Exception as e:
+                        logger.error(f"Failed to copy build schema file to {host}: {e}")
+                        raise
             future = pool.submit(
                 executor.execute_command,
                 host,
-                build_powershell_command("; ".join([
-                    f'cd "{windows_path}"',
-                    f'& "{script_path}" 2>&1 | Tee-Object -FilePath "{output_file}"'
-                ])),
+                cmd,
                 "Rebuilding database (Windows)",
                 7200
             )
@@ -656,26 +721,101 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
 
     config_dir = os.path.dirname(os.path.abspath(config.config_file)) if config.config_file else os.getcwd()
     generated_dir = os.path.join(config_dir, ".mssqltestfiles-generated")
+    legacy_generated_dir = os.path.join(config_dir, ".mssqlwin-generated")
     os.makedirs(generated_dir, exist_ok=True)
+
+    generated_build_schema = None
+    if config.windows_build_schema_file_local and os.path.exists(config.windows_build_schema_file_local):
+        with open(config.windows_build_schema_file_local, "r", encoding="utf-8") as f:
+            build_schema_content = f.read()
+        if config.warehouse_count:
+            build_schema_content = re.sub(
+                r"^set warehouse .*?$",
+                "",
+                build_schema_content,
+                flags=re.MULTILINE,
+            )
+            build_schema_content = re.sub(
+                r"^diset tpcc mssqls_count_ware .*?$",
+                f"diset tpcc mssqls_count_ware {config.warehouse_count}",
+                build_schema_content,
+                flags=re.MULTILINE,
+            )
+        else:
+            logger.warning(
+                "warehouse_count is not set; build schema file will not be updated."
+            )
+        schema_base = ntpath.splitext(ntpath.basename(config.windows_build_schema_file_local))[0]
+        schema_suffix = f"-wh{config.warehouse_count}" if config.warehouse_count else ""
+        generated_build_schema = os.path.join(generated_dir, f"{schema_base}{schema_suffix}.tcl")
+        with open(generated_build_schema, "w", encoding="utf-8") as f:
+            f.write(build_schema_content)
+        config.windows_build_schema_file_local = generated_build_schema
+
+    generated_create_db = None
+    if config.generate_only and config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
+        with open(config.windows_create_db_sql_local, "r", encoding="utf-8") as f:
+            create_db_content = f.read()
+        if config.warehouse_count:
+            data_size_mb = int(config.warehouse_count) * 150
+            log_size_mb = int(config.warehouse_count) * 75
+            size_matches = list(re.finditer(r"(?i)^\s*SIZE\s*=\s*\d+MB", create_db_content, flags=re.MULTILINE))
+            if len(size_matches) >= 2:
+                create_db_content = re.sub(
+                    r"(?i)^\s*SIZE\s*=\s*\d+MB",
+                    f"   SIZE       = {data_size_mb}MB",
+                    create_db_content,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+                create_db_content = re.sub(
+                    r"(?i)^\s*SIZE\s*=\s*\d+MB",
+                    f"   SIZE       = {log_size_mb}MB",
+                    create_db_content,
+                    count=1,
+                    flags=re.MULTILINE,
+                )
+            create_db_content = re.sub(
+                r"(?i)^\s*MAXSIZE\s*=\s*\d+MB",
+                f"   MAXSIZE    = {data_size_mb}MB",
+                create_db_content,
+                flags=re.MULTILINE,
+            )
+        else:
+            logger.warning("warehouse_count is not set; create_db.sql will not be updated.")
+        create_db_base = ntpath.splitext(ntpath.basename(config.windows_create_db_sql_local))[0]
+        create_db_suffix = f"-wh{config.warehouse_count}" if config.warehouse_count else ""
+        generated_create_db = os.path.join(generated_dir, f"{create_db_base}{create_db_suffix}.sql")
+        with open(generated_create_db, "w", encoding="utf-8") as f:
+            f.write(create_db_content)
+        config.windows_create_db_sql_local = generated_create_db
 
     local_ps1_files = {}
     local_tcl_files = {}
     base_ps_name = ntpath.splitext(ntpath.basename(test_script_path))[0] if test_script_path else None
     base_tcl_name = ntpath.splitext(ntpath.basename(base_tcl))[0] if base_tcl else "mssqls_tprocc_run"
     use_existing_generated = False
+    used_generated_dir = generated_dir
 
     missing_templates = []
+    base_name_override = None
     if not local_test_script or not os.path.exists(local_test_script):
         missing_templates.append("test_script")
+    else:
+        base_name_override = ntpath.splitext(ntpath.basename(local_test_script))[0]
     if not config.windows_hammerdb_test_script_local or not os.path.exists(config.windows_hammerdb_test_script_local):
         missing_templates.append("hammerdb_test_script")
+    else:
+        base_tcl_name = ntpath.splitext(ntpath.basename(config.windows_hammerdb_test_script_local))[0]
+    if base_name_override:
+        base_ps_name = base_name_override
 
     if missing_templates:
         generated_ok = True
         for user_count in user_counts:
             tcl_name = None
             ps_name = None
-            if base_ps_name and base_tcl_name:
+            if base_tcl_name:
                 if "$user_count" in base_tcl_name:
                     tcl_base = base_tcl_name.replace("$user_count", str(user_count))
                 else:
@@ -684,11 +824,14 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     else:
                         tcl_base = f"{base_tcl_name}{user_count}"
                 tcl_name = f"{tcl_base}.tcl"
+            if base_ps_name:
                 ps_name = f"{base_ps_name}_{user_count}.ps1"
-            else:
+            if not ps_name or not tcl_name:
                 ps_pattern = re.compile(rf"^(.*)_{re.escape(str(user_count))}\.ps1$")
                 tcl_pattern = re.compile(rf"^(.*){re.escape(str(user_count))}\.tcl$")
                 for filename in os.listdir(generated_dir):
+                    if "buildschema" in filename.lower():
+                        continue
                     if not ps_name:
                         ps_match = ps_pattern.match(filename)
                         if ps_match:
@@ -709,6 +852,8 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                 ps_pattern = re.compile(rf"^(.*)_{re.escape(str(user_count))}\.ps1$")
                 tcl_pattern = re.compile(rf"^(.*){re.escape(str(user_count))}\.tcl$")
                 for filename in os.listdir(generated_dir):
+                    if "buildschema" in filename.lower():
+                        continue
                     if not ps_name:
                         ps_match = ps_pattern.match(filename)
                         if ps_match:
@@ -728,9 +873,53 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     break
             local_tcl_files[user_count] = local_tcl_path
             local_ps1_files[user_count] = local_ps1_path
+        if not generated_ok and os.path.isdir(legacy_generated_dir):
+            logger.info(f"Falling back to legacy generated files in {legacy_generated_dir}")
+            generated_ok = True
+            used_generated_dir = legacy_generated_dir
+            for user_count in user_counts:
+                tcl_name = None
+                ps_name = None
+                if base_tcl_name:
+                    if "$user_count" in base_tcl_name:
+                        tcl_base = base_tcl_name.replace("$user_count", str(user_count))
+                    else:
+                        if re.search(r"\d+$", base_tcl_name):
+                            tcl_base = re.sub(r"\d+$", str(user_count), base_tcl_name)
+                        else:
+                            tcl_base = f"{base_tcl_name}{user_count}"
+                    tcl_name = f"{tcl_base}.tcl"
+                if base_ps_name:
+                    ps_name = f"{base_ps_name}_{user_count}.ps1"
+                if not ps_name or not tcl_name:
+                    ps_pattern = re.compile(rf"^(.*)_{re.escape(str(user_count))}\.ps1$")
+                    tcl_pattern = re.compile(rf"^(.*){re.escape(str(user_count))}\.tcl$")
+                    for filename in os.listdir(legacy_generated_dir):
+                        if "buildschema" in filename.lower():
+                            continue
+                        if not ps_name:
+                            ps_match = ps_pattern.match(filename)
+                            if ps_match:
+                                base_ps_name = ps_match.group(1)
+                                ps_name = filename
+                        if not tcl_name:
+                            tcl_match = tcl_pattern.match(filename)
+                            if tcl_match:
+                                base_tcl_name = tcl_match.group(1)
+                                tcl_name = filename
+                        if ps_name and tcl_name:
+                            break
+                local_tcl_path = os.path.join(legacy_generated_dir, tcl_name) if tcl_name else ""
+                local_ps1_path = os.path.join(legacy_generated_dir, ps_name) if ps_name else ""
+                if not os.path.exists(local_tcl_path) or not os.path.exists(local_ps1_path):
+                    generated_ok = False
+                    break
+                local_tcl_files[user_count] = local_tcl_path
+                local_ps1_files[user_count] = local_ps1_path
+
         if generated_ok:
             use_existing_generated = True
-            logger.info(f"Using existing generated files in {generated_dir}")
+            logger.info(f"Using existing generated files in {used_generated_dir}")
         else:
             logger.error(
                 "Local test scripts are missing and generated files were not found. "
@@ -872,6 +1061,10 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
         for user_count in user_counts:
             logger.info(f"  {user_count} users: {local_ps1_files[user_count]}")
             logger.info(f"  {user_count} users: {local_tcl_files[user_count]}")
+        if generated_build_schema:
+            logger.info(f"  build schema: {generated_build_schema}")
+        if generated_create_db:
+            logger.info(f"  create_db.sql: {generated_create_db}")
         if config.generate_only:
             return
 
@@ -938,7 +1131,11 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
             # Phase 3: start tests in parallel after staging
             start_futures = []
             for host in config.db_hosts:
-                logger.info(f"Starting test on host {host} (users={user_count})")
+                duration_label = f"{config.test_duration}m" if config.test_duration else "unspecified"
+                logger.info(
+                    f"Starting test on host {host} (users={user_count}), "
+                    f"test duration: {duration_label}"
+                )
                 remote_ps1 = config.windows_test_script or f"{windows_path}\\{ntpath.basename(local_ps1_files[user_count])}"
                 remote_tcl = f"{windows_path}\\{ntpath.basename(local_tcl_files[user_count])}"
                 hammerdb_test = remote_tcl
@@ -1087,6 +1284,116 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
         except Exception as e:
             logger.error(f"Error copying results from {host}: {e}")
 
+    if config.use_virtctl is not False and config.namespace and config.namespace != "N/A":
+        for host in config.db_hosts:
+            try:
+                host_dump_dir = os.path.join(results_dir, "vm-dump", host)
+                os.makedirs(host_dump_dir, exist_ok=True)
+                pod_cmd = [
+                    "oc", "get", "pod", "-n", config.namespace,
+                    "-l", f"kubevirt.io/domain={host}",
+                    "-o", "jsonpath={.items[0].metadata.name}"
+                ]
+                pod_result = subprocess.run(pod_cmd, capture_output=True, text=True, timeout=15)
+                pod_name = pod_result.stdout.strip()
+                if pod_result.returncode != 0 or not pod_name:
+                    logger.warning(f"VM dump skipped for {host}: virt-launcher pod not found")
+                    continue
+
+                list_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "list", "--state-running", "--name"]
+                list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=15)
+                domain_name = ""
+                if list_result.returncode == 0:
+                    for line in list_result.stdout.splitlines():
+                        if line.strip():
+                            domain_name = line.strip()
+                            break
+                if not domain_name:
+                    logger.warning(f"VM dump skipped for {host}: running domain not found in {pod_name}")
+                    continue
+
+                dump_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dumpxml", domain_name]
+                dump_result = subprocess.run(dump_cmd, capture_output=True, text=True, timeout=30)
+                if dump_result.returncode != 0 or not dump_result.stdout.strip():
+                    logger.warning(f"VM dump failed for {host}: {dump_result.stderr.strip()}")
+                else:
+                    dump_path = os.path.join(host_dump_dir, "dumpxml.xml")
+                    with open(dump_path, "w", encoding="utf-8") as f:
+                        f.write(dump_result.stdout)
+                    logger.info(f"Saved VM dumpxml for {host} to {dump_path}")
+
+                info_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dominfo", domain_name]
+                info_result = subprocess.run(info_cmd, capture_output=True, text=True, timeout=15)
+                if info_result.returncode != 0 or not info_result.stdout.strip():
+                    logger.warning(f"VM dominfo failed for {host}: {info_result.stderr.strip()}")
+                else:
+                    info_path = os.path.join(host_dump_dir, "dominfo.txt")
+                    with open(info_path, "w", encoding="utf-8") as f:
+                        f.write(info_result.stdout)
+                    logger.info(f"Saved VM dominfo for {host} to {info_path}")
+
+                stats_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domstats", domain_name]
+                stats_result = subprocess.run(stats_cmd, capture_output=True, text=True, timeout=15)
+                if stats_result.returncode != 0 or not stats_result.stdout.strip():
+                    logger.warning(f"VM domstats failed for {host}: {stats_result.stderr.strip()}")
+                else:
+                    stats_path = os.path.join(host_dump_dir, "domstats.txt")
+                    with open(stats_path, "w", encoding="utf-8") as f:
+                        f.write(stats_result.stdout)
+                    logger.info(f"Saved VM domstats for {host} to {stats_path}")
+
+                blk_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domblklist", domain_name]
+                blk_result = subprocess.run(blk_cmd, capture_output=True, text=True, timeout=15)
+                if blk_result.returncode != 0 or not blk_result.stdout.strip():
+                    logger.warning(f"VM domblklist failed for {host}: {blk_result.stderr.strip()}")
+                else:
+                    blk_path = os.path.join(host_dump_dir, "domblklist.txt")
+                    with open(blk_path, "w", encoding="utf-8") as f:
+                        f.write(blk_result.stdout)
+                    logger.info(f"Saved VM domblklist for {host} to {blk_path}")
+
+                if_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domiflist", domain_name]
+                if_result = subprocess.run(if_cmd, capture_output=True, text=True, timeout=15)
+                if if_result.returncode != 0 or not if_result.stdout.strip():
+                    logger.warning(f"VM domiflist failed for {host}: {if_result.stderr.strip()}")
+                else:
+                    if_path = os.path.join(host_dump_dir, "domiflist.txt")
+                    with open(if_path, "w", encoding="utf-8") as f:
+                        f.write(if_result.stdout)
+                    logger.info(f"Saved VM domiflist for {host} to {if_path}")
+
+                vmi_cmd = ["oc", "get", "vmi", host, "-n", config.namespace, "-o", "yaml"]
+                vmi_result = subprocess.run(vmi_cmd, capture_output=True, text=True, timeout=15)
+                if vmi_result.returncode != 0 or not vmi_result.stdout.strip():
+                    logger.warning(f"VMI yaml failed for {host}: {vmi_result.stderr.strip()}")
+                else:
+                    vmi_path = os.path.join(host_dump_dir, "vmi.yaml")
+                    with open(vmi_path, "w", encoding="utf-8") as f:
+                        f.write(vmi_result.stdout)
+                    logger.info(f"Saved VMI yaml for {host} to {vmi_path}")
+
+                pod_yaml_cmd = ["oc", "get", "pod", pod_name, "-n", config.namespace, "-o", "yaml"]
+                pod_yaml_result = subprocess.run(pod_yaml_cmd, capture_output=True, text=True, timeout=15)
+                if pod_yaml_result.returncode != 0 or not pod_yaml_result.stdout.strip():
+                    logger.warning(f"virt-launcher pod yaml failed for {host}: {pod_yaml_result.stderr.strip()}")
+                else:
+                    pod_yaml_path = os.path.join(host_dump_dir, "virt-launcher-pod.yaml")
+                    with open(pod_yaml_path, "w", encoding="utf-8") as f:
+                        f.write(pod_yaml_result.stdout)
+                    logger.info(f"Saved virt-launcher pod yaml for {host} to {pod_yaml_path}")
+
+                vmi_desc_cmd = ["oc", "describe", "vmi", host, "-n", config.namespace]
+                vmi_desc_result = subprocess.run(vmi_desc_cmd, capture_output=True, text=True, timeout=15)
+                if vmi_desc_result.returncode != 0 or not vmi_desc_result.stdout.strip():
+                    logger.warning(f"VMI describe failed for {host}: {vmi_desc_result.stderr.strip()}")
+                else:
+                    vmi_desc_path = os.path.join(host_dump_dir, "vmi.describe.txt")
+                    with open(vmi_desc_path, "w", encoding="utf-8") as f:
+                        f.write(vmi_desc_result.stdout)
+                    logger.info(f"Saved VMI describe for {host} to {vmi_desc_path}")
+            except Exception as e:
+                logger.warning(f"VM dump failed for {host}: {e}")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -1114,6 +1421,8 @@ EXAMPLES:
                         help="Force virtctl for all hosts (OpenShift VMs)")
     parser.add_argument("--test-script", dest="test_script", default=None,
                         help="Local test script to copy to Windows hosts and run")
+    parser.add_argument("--build-schema-file", dest="build_schema_file", default=None,
+                        help="Local build schema TCL to customize and copy to Windows hosts")
     parser.add_argument("--rebuild-script", dest="rebuild_script", default=None,
                         help="Local rebuild script to copy to Windows hosts and run")
     parser.add_argument("--create-db", dest="create_db", default=None,
@@ -1146,6 +1455,12 @@ EXAMPLES:
             sys.exit(1)
         config.windows_test_script = args.test_script
         config.windows_test_script_local = args.test_script
+    if args.build_schema_file:
+        if not os.path.exists(args.build_schema_file):
+            logger.error(f"Build schema file not found: {args.build_schema_file}")
+            sys.exit(1)
+        config.windows_build_schema_file = args.build_schema_file
+        config.windows_build_schema_file_local = args.build_schema_file
     if args.rebuild_script:
         if not os.path.exists(args.rebuild_script):
             logger.error(f"Rebuild script not found: {args.rebuild_script}")
@@ -1253,7 +1568,7 @@ def _move_log_to_results(log_file: str, results_dir: str) -> None:
         destination = os.path.join(results_dir, os.path.basename(log_file))
         if os.path.abspath(log_file) != os.path.abspath(destination) and os.path.exists(log_file):
             os.replace(log_file, destination)
-            logger.info(f"Moved log file to results directory: {destination}")
+            logger.info(f"Moved log file to results directory: {results_dir}")
     except Exception as e:
         logger.warning(f"Failed to move log file to results directory: {e}")
 
