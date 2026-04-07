@@ -1297,6 +1297,18 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                 pod_result = subprocess.run(pod_cmd, capture_output=True, text=True, timeout=15)
                 pod_name = pod_result.stdout.strip()
                 if pod_result.returncode != 0 or not pod_name:
+                    prefix = f"virt-launcher-{host}"
+                    list_cmd = [
+                        "oc", "get", "pod", "-n", config.namespace,
+                        "-o", "jsonpath={.items[*].metadata.name}"
+                    ]
+                    list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=15)
+                    if list_result.returncode == 0 and list_result.stdout.strip():
+                        for candidate in list_result.stdout.split():
+                            if candidate.startswith(prefix):
+                                pod_name = candidate
+                                break
+                if not pod_name:
                     logger.warning(f"VM dump skipped for {host}: virt-launcher pod not found")
                     continue
 
