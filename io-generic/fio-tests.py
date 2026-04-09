@@ -1804,11 +1804,6 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
             break
         
         elapsed = time.time() - start_time
-        if elapsed > max_wait_time:
-            logger.warning(f"FIO dataset writing exceeded max wait time ({max_wait_time}s)")
-            logger.warning(f"Completed: {completed_count}/{total_hosts} hosts")
-            break
-        
         remaining = total_hosts - completed_count
         logger.info(f"Waiting for FIO dataset writing... ({remaining} hosts remaining, {completed_count}/{total_hosts} completed, {int(elapsed)}s elapsed)")
         time.sleep(check_interval)
