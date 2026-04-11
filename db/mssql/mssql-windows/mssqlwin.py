@@ -849,6 +849,10 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
             if not os.path.exists(local_tcl_path) or not os.path.exists(local_ps1_path):
                 # Fallback: if configured base names don't match, try to discover
                 # any generated files for this user_count.
+                if not os.path.exists(local_ps1_path):
+                    ps_name = None
+                if not os.path.exists(local_tcl_path):
+                    tcl_name = None
                 ps_pattern = re.compile(rf"^(.*)_{re.escape(str(user_count))}\.ps1$")
                 tcl_pattern = re.compile(rf"^(.*){re.escape(str(user_count))}\.tcl$")
                 for filename in os.listdir(generated_dir):
