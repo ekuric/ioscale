@@ -11,6 +11,7 @@ import glob
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -64,6 +65,7 @@ class MSSQLTestConfig:
         self.test_duration = None
         self.log_level = "INFO"
         self.description = ""  # Test description for logging and output naming
+        self.mssql_pass = "mssqlpasswd1!"
         self.migrate_user_counts = []  # User counts that should trigger migration
         self.migrate_interval = 0  # Interval between migrations (0 = parallel)
         self.persistent_mount = False  # Whether to create /etc/fstab entries
@@ -272,6 +274,9 @@ class ConfigLoader:
         database = yaml_data.get('database', {})
         self.config.warehouse_count = database.get('warehouse_count')
         self.config.test_duration = database.get('test_duration')
+        mssql_pass = database.get('mssql_pass')
+        if mssql_pass and mssql_pass != "null":
+            self.config.mssql_pass = str(mssql_pass)
         
         # Load test configuration
         test = yaml_data.get('test', {})
@@ -883,6 +888,25 @@ def manage_mssql_service(config: MSSQLTestConfig, executor: CommandExecutor,
     executor.execute_command(host, cmd, description)
 
 
+def wait_for_mssql_ready(config: MSSQLTestConfig, executor: CommandExecutor, host: str,
+                         timeout: int = 180, interval: int = 5) -> None:
+    """Wait for MSSQL service and local SQLCMD to respond."""
+    deadline = time.monotonic() + timeout
+    password = shlex.quote(config.mssql_pass)
+    cmd = (
+        "systemctl is-active --quiet mssql-server && "
+        f"/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P {password} "
+        "-Q \"SELECT 1\" -b -l 5 -t 5 >/dev/null 2>&1"
+    )
+    while time.monotonic() < deadline:
+        success, _ = executor.execute_command(host, cmd, f"Checking MSSQL readiness on {host}")
+        if success:
+            logger.info(f"MSSQL Server is ready and running on {host}")
+            return
+        time.sleep(interval)
+    raise RuntimeError(f"MSSQL Server did not become ready on {host} within {timeout}s")
+
+
 def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     """Build TPCC database"""
     logger.info("Building TPCC database with parallel execution...")
@@ -899,10 +923,20 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     
     # Step 2: Wait for services to be ready
     logger.info("Step 2/5: Waiting for MSSQL Server services to be ready...")
-    time.sleep(30)  # MSSQL Server may need more time to start
+    with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
+        futures = []
+        for host in config.db_hosts:
+            futures.append(pool.submit(wait_for_mssql_ready, config, executor, host))
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as exc:
+                logger.error(f"MSSQL readiness check failed: {exc}")
+                sys.exit(1)
     
     # Step 3: Clean existing databases
     logger.info("Step 3/5: Cleaning existing databases on all hosts...")
+    password = shlex.quote(config.mssql_pass)
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
@@ -910,7 +944,7 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
             # Note: Password is typically set during installation (default: mssqlpasswd1!)
             # Password is wrapped in single quotes to protect special characters like "!"
             cmd = (
-                "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 'mssqlpasswd1!' -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
+                f"/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P {password} -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
             )
             future = pool.submit(executor.execute_command, host, cmd, "Cleaning existing database")
             futures.append(future)
@@ -951,6 +985,7 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
             # This approach ensures we can verify the process even if SSH times out
             cmd = (
                 f"cd {config.hammerdb_dir} && "
+                f"export MSSQL_PASS={password} && "
                 f"nohup ./hammerdbcli auto build{vm_number}_mssql.tcl > {output_file} 2>&1 < /dev/null & "
                 f"sleep 2 && "
                 f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_mssql' | grep -v grep | wc -l"
@@ -1270,6 +1305,7 @@ def migrate_vms_during_test(config: MSSQLTestConfig, executor: CommandExecutor, 
 def run_tests(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     """Run performance tests"""
     logger.info("Running performance tests...")
+    password = shlex.quote(config.mssql_pass)
     
     num_hosts = len(config.db_hosts)
     run_date = datetime.now().strftime("%Y.%m.%d")
@@ -1313,7 +1349,12 @@ def run_tests(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
                 output_file = f"test_mssql_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"
                 # Use nohup with & to truly background the process and return immediately
                 # The command should return quickly, but we use a longer timeout to account for slow SSH connections
-                cmd = f"cd {config.hammerdb_dir} && nohup ./hammerdbcli auto runtest{vm_number}_mssql.tcl > '{output_file}' 2>&1 & echo 'Test start command executed'"
+                cmd = (
+                    f"cd {config.hammerdb_dir} && "
+                    f"export MSSQL_PASS={password} && "
+                    f"nohup ./hammerdbcli auto runtest{vm_number}_mssql.tcl > '{output_file}' 2>&1 & "
+                    "echo 'Test start command executed'"
+                )
                 # Use longer timeout (60s) to account for slow SSH connections, but verification will confirm actual start
                 future = pool.submit(executor.execute_command, host, cmd, f"Starting performance test (output: {output_file})", timeout=60)
                 futures.append((future, vm_number, host, output_file))

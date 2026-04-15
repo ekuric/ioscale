@@ -73,6 +73,7 @@ class MSSQLWinConfig:
         self.windows_hammerdb_test_script_local = None
         self.windows_rebuild_only = False
         self.windows_test_only = False
+        self.windows_rebuild_always = False
         self.generate_only = False
         self.windows_mssql_pass = None
         self.windows_disk_id = "1"
@@ -357,6 +358,9 @@ class ConfigLoader:
         windows_rebuild_only = windows_cfg.get("rebuild_only")
         if windows_rebuild_only == "true" or windows_rebuild_only is True:
             self.config.windows_rebuild_only = True
+        windows_rebuild_always = windows_cfg.get("rebuild_always")
+        if windows_rebuild_always == "true" or windows_rebuild_always is True:
+            self.config.windows_rebuild_always = True
         windows_test_only = windows_cfg.get("test_only")
         if windows_test_only == "true" or windows_test_only is True:
             self.config.windows_test_only = True
@@ -487,6 +491,7 @@ def display_config(config: MSSQLWinConfig) -> None:
     if config.windows_mssql_pass:
         logger.info("Windows mssql_pass: [SET]")
     logger.info(f"Windows rebuild_only: {'ENABLED' if config.windows_rebuild_only else 'DISABLED'}")
+    logger.info(f"Windows rebuild_always: {'ENABLED' if config.windows_rebuild_always else 'DISABLED'}")
     logger.info(f"Windows test_only: {'ENABLED' if config.windows_test_only else 'DISABLED'}")
     if config.windows_result_dir:
         logger.info(f"Windows result dir: {config.windows_result_dir}")
@@ -684,7 +689,7 @@ def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) 
                 executor.execute_command,
                 host,
                 move_cmd,
-                "Moving HammerDB to D: and creating data directories",
+                f"Moving HammerDB to D: on {host} and creating data directories",
                 1200
             ))
         for future in as_completed(futures):
@@ -1072,7 +1077,19 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
         if config.generate_only:
             return
 
+    if config.windows_rebuild_always is True:
+        if config.windows_test_only:
+            logger.error("rebuild_always requires windows.test_only to be disabled")
+            return
+        if not config.windows_rebuilddb:
+            logger.error("rebuild_always requires windows.rebuilddb to be enabled")
+            return
+
     for user_count in user_counts:
+        if config.windows_rebuild_always is True:
+            logger.info(f"Rebuilding database before {user_count} user test...")
+            if not config.dry_run:
+                build_database_windows(config, executor)
         logger.info(
             f"Starting Windows test run for {user_count} users on hosts: "
             f"{', '.join(config.db_hosts)}"
@@ -1447,6 +1464,8 @@ EXAMPLES:
                         help="Local HammerDB test script to copy to Windows hosts")
     parser.add_argument("--generate-only", action="store_true",
                         help="Only generate per-user files locally and exit")
+    parser.add_argument("--rebuild-always", action="store_true",
+                        help="Rebuild database before each user-count test run")
     parser.add_argument("--prepare-machine", action="store_true",
                         help="Prepare Windows machines by formatting the data disk and exit")
 
@@ -1464,6 +1483,8 @@ EXAMPLES:
     config.use_virtctl = None if not (args.ssh_only or args.virtctl_only) else (not args.ssh_only)
     config.copy_results = args.copy_results
     config.generate_only = args.generate_only
+    if args.rebuild_always:
+        config.windows_rebuild_always = True
     prepare_machine = args.prepare_machine
     if args.test_script:
         if not os.path.exists(args.test_script):

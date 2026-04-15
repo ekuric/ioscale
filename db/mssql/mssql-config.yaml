@@ -34,6 +34,7 @@ database:
   namespace: "default"           # Kubernetes namespace for VMs
   warehouse_count: 50            # Number of warehouses for TPCC test
   test_duration: 15              # Test duration in minutes
+  mssql_pass: "mssqlpasswd1!"    # SA password for sqlcmd/ODBC
 
 # Test Configuration
 test:

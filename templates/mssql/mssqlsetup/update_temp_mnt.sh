@@ -22,6 +22,7 @@ numcpu=32
 fi
 
 ctr=1
+MSSQL_PASS="${MSSQL_PASS:-mssqlpasswd1!}"
 echo " " > input
 while [ ${ctr} -le ${numcpu} ]
 do
@@ -34,4 +35,4 @@ do
      echo " " >> input
      ctr=$(( ${ctr} + 1 ))
 done
-/opt/mssql-tools/bin/sqlcmd -U sa -P 'mssqlpasswd1!' < input
+/opt/mssql-tools/bin/sqlcmd -U sa -P "$MSSQL_PASS" < input
