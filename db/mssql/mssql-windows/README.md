@@ -19,7 +19,7 @@ The Tool will build database ( assuming MSSQL server process is up and running )
 ```
 # python mssqlwin.py -h
 usage: mssqlwin.py [-h] [-c CONFIG] [-v] [--dry-run] [--copy-results] [--ssh-only] [--virtctl-only] [--test-script TEST_SCRIPT] [--rebuild-script REBUILD_SCRIPT] [--create-db CREATE_DB]
-                   [--hammerdb-test-script HAMMERDB_TEST_SCRIPT] [--generate-only]
+                   [--hammerdb-test-script HAMMERDB_TEST_SCRIPT] [--build-schema-file BUILD_SCHEMA_FILE] [--generate-only] [--rebuild-always] [--prepare-machine]
 
 MSSQL HammerDB Windows Testing Script (YAML Configuration Version)
 
@@ -43,6 +43,8 @@ optional arguments:
   --build-schema-file BUILD_SCHEMA_FILE
                         Local build schema TCL to customize and copy to Windows hosts
   --generate-only       Only generate per-user files locally and exit
+  --rebuild-always      Rebuild database before each user-count test run
+  --prepare-machine     Prepare Windows machines by formatting the data disk and exit
 
 EXAMPLES:
     python3 mssqlwin.py                          # Use default mssql-config.yaml
@@ -83,6 +85,7 @@ windows:
   create_db_sql: ""
   ssh_user: "Administrator"
   rebuilddb: false                            # rebuild database prior testing
+  rebuild_always: false                       # rebuild database before each user count
   rebuild_only: false                         # only rebuild db 
   test_only: true                             # only test - no rebuild, assuming rebuild was done before
 
@@ -156,6 +159,7 @@ Configuration (mssql-configwin.yaml)
 - `windows.result_dir`: directory on Windows where test outputs are written.
 - `windows.ssh_user`: SSH user for Windows hosts (default `Administrator`).
 - `windows.rebuilddb`: `true` to run `rebuild-db.ps1` before tests, `false` to skip.
+- `windows.rebuild_always`: `true` to rebuild before each user-count test run.
 - `windows.rebuild_script`: optional path to a custom rebuild script on the host.
 - `windows.create_db_sql`: optional path to `create_db.sql` on the host (if provided locally, it is copied to the host).
 - `windows.hammerdb_test_script`: optional HammerDB test TCL path on the host.
@@ -168,6 +172,8 @@ Configuration (mssql-configwin.yaml)
 - CLI override: `mssqlwin.py --hammerdb-test-script <local.tcl>` copies the test file to the host.
 - `windows.rebuild_only`: `true` to run rebuild only and exit.
 - CLI override: `mssqlwin.py --create-db <local.sql>` copies `create_db.sql` to the host.
+- CLI override: `mssqlwin.py --rebuild-always` rebuilds before each user count.
+- `--prepare-machine` formats the data disk (per `windows.disk_id`) and exits.
 
 What the script does in Windows mode
 
@@ -177,6 +183,8 @@ What the script does in Windows mode
 - Runs per-user tests in parallel across hosts.
 - Collects results back to the bastion from `windows.result_dir` and extracts them locally.
 - Cleans up result files in `windows.result_dir` on each host after a successful copy.
+- Copies `.mssqltestfiles-generated` into results as `mssqltestfiles-generated`.
+- When using virtctl, collects VM domain details under `vm-dump/<host>/` (dumpxml, dominfo, domstats, etc.).
 
 Environment variables passed to Windows scripts
 
