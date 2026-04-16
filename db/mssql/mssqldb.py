@@ -66,6 +66,9 @@ class MSSQLTestConfig:
         self.log_level = "INFO"
         self.description = ""  # Test description for logging and output naming
         self.mssql_pass = "mssqlpasswd1!"
+        self.rebuilddb = True
+        self.rebuild_only = False
+        self.test_only = False
         self.migrate_user_counts = []  # User counts that should trigger migration
         self.migrate_interval = 0  # Interval between migrations (0 = parallel)
         self.persistent_mount = False  # Whether to create /etc/fstab entries
@@ -277,6 +280,15 @@ class ConfigLoader:
         mssql_pass = database.get('mssql_pass')
         if mssql_pass and mssql_pass != "null":
             self.config.mssql_pass = str(mssql_pass)
+        rebuilddb = database.get('rebuilddb')
+        if rebuilddb == "false" or rebuilddb is False:
+            self.config.rebuilddb = False
+        rebuild_only = database.get('rebuild_only')
+        if rebuild_only == "true" or rebuild_only is True:
+            self.config.rebuild_only = True
+        test_only = database.get('test_only')
+        if test_only == "true" or test_only is True:
+            self.config.test_only = True
         
         # Load test configuration
         test = yaml_data.get('test', {})
@@ -546,6 +558,9 @@ def display_config(config: MSSQLTestConfig) -> None:
     logger.info(f"HammerDB repo: {config.hammerdb_repo}")
     logger.info(f"HammerDB path: {config.hammerdb_path}")
     logger.info(f"HammerDB install dir: {config.hammerdb_dir}")
+    logger.info(f"Rebuilddb: {'ENABLED' if config.rebuilddb else 'DISABLED'}")
+    logger.info(f"Rebuild only: {'ENABLED' if config.rebuild_only else 'DISABLED'}")
+    logger.info(f"Test only: {'ENABLED' if config.test_only else 'DISABLED'}")
     logger.info(f"Log level: {config.log_level}")
     logger.info(f"Retry interval: {config.retry_interval}s")
     logger.info(f"Max retries: {config.max_retries}")
@@ -748,6 +763,7 @@ def install_mssql(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
+            logger.info(f"Installing MSSQL Server on {host}...")
             # Use bash -c with proper quoting to ensure consistent execution for both SSH and virtctl
             # Redirect stderr to stdout to capture all output, and ensure script runs in proper shell context
             hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
@@ -767,7 +783,7 @@ def install_mssql(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
                     f"./Hammerdb-mssql-install-script -m \"{mount_point_escaped}\" 2>&1"
                     f"'"
                 )
-            future = pool.submit(executor.execute_command, host, cmd, "Installing MSSQL Server", timeout=1800)
+            future = pool.submit(executor.execute_command, host, cmd, f"Installing MSSQL Server on {host}", timeout=1800)
             futures.append(future)
         
         failed = 0
@@ -1655,6 +1671,128 @@ def collect_results(config: MSSQLTestConfig, executor: CommandExecutor, results_
             except Exception as e:
                 logger.error(f"Error copying results from {host}: {e}")
     
+    if config.use_virtctl is not False and config.namespace and config.namespace != "N/A":
+        for host in config.db_hosts:
+            try:
+                host_dump_dir = os.path.join(results_dir, "vm-dump", host)
+                os.makedirs(host_dump_dir, exist_ok=True)
+                pod_cmd = [
+                    "oc", "get", "pod", "-n", config.namespace,
+                    "-l", f"kubevirt.io/domain={host}",
+                    "-o", "jsonpath={.items[0].metadata.name}"
+                ]
+                pod_result = subprocess.run(pod_cmd, capture_output=True, text=True, timeout=15)
+                pod_name = pod_result.stdout.strip()
+                if pod_result.returncode != 0 or not pod_name:
+                    prefix = f"virt-launcher-{host}"
+                    list_cmd = [
+                        "oc", "get", "pod", "-n", config.namespace,
+                        "-o", "jsonpath={.items[*].metadata.name}"
+                    ]
+                    list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=15)
+                    if list_result.returncode == 0 and list_result.stdout.strip():
+                        for candidate in list_result.stdout.split():
+                            if candidate.startswith(prefix):
+                                pod_name = candidate
+                                break
+                if not pod_name:
+                    logger.warning(f"VM dump skipped for {host}: virt-launcher pod not found")
+                    continue
+
+                list_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "list", "--state-running", "--name"]
+                list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=15)
+                domain_name = ""
+                if list_result.returncode == 0:
+                    for line in list_result.stdout.splitlines():
+                        if line.strip():
+                            domain_name = line.strip()
+                            break
+                if not domain_name:
+                    logger.warning(f"VM dump skipped for {host}: running domain not found in {pod_name}")
+                    continue
+
+                dump_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dumpxml", domain_name]
+                dump_result = subprocess.run(dump_cmd, capture_output=True, text=True, timeout=30)
+                if dump_result.returncode != 0 or not dump_result.stdout.strip():
+                    logger.warning(f"VM dump failed for {host}: {dump_result.stderr.strip()}")
+                else:
+                    dump_path = os.path.join(host_dump_dir, "dumpxml.xml")
+                    with open(dump_path, "w", encoding="utf-8") as f:
+                        f.write(dump_result.stdout)
+                    logger.info(f"Saved VM dumpxml for {host} to {dump_path}")
+
+                info_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dominfo", domain_name]
+                info_result = subprocess.run(info_cmd, capture_output=True, text=True, timeout=15)
+                if info_result.returncode != 0 or not info_result.stdout.strip():
+                    logger.warning(f"VM dominfo failed for {host}: {info_result.stderr.strip()}")
+                else:
+                    info_path = os.path.join(host_dump_dir, "dominfo.txt")
+                    with open(info_path, "w", encoding="utf-8") as f:
+                        f.write(info_result.stdout)
+                    logger.info(f"Saved VM dominfo for {host} to {info_path}")
+
+                stats_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domstats", domain_name]
+                stats_result = subprocess.run(stats_cmd, capture_output=True, text=True, timeout=15)
+                if stats_result.returncode != 0 or not stats_result.stdout.strip():
+                    logger.warning(f"VM domstats failed for {host}: {stats_result.stderr.strip()}")
+                else:
+                    stats_path = os.path.join(host_dump_dir, "domstats.txt")
+                    with open(stats_path, "w", encoding="utf-8") as f:
+                        f.write(stats_result.stdout)
+                    logger.info(f"Saved VM domstats for {host} to {stats_path}")
+
+                blk_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domblklist", domain_name]
+                blk_result = subprocess.run(blk_cmd, capture_output=True, text=True, timeout=15)
+                if blk_result.returncode != 0 or not blk_result.stdout.strip():
+                    logger.warning(f"VM domblklist failed for {host}: {blk_result.stderr.strip()}")
+                else:
+                    blk_path = os.path.join(host_dump_dir, "domblklist.txt")
+                    with open(blk_path, "w", encoding="utf-8") as f:
+                        f.write(blk_result.stdout)
+                    logger.info(f"Saved VM domblklist for {host} to {blk_path}")
+
+                if_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domiflist", domain_name]
+                if_result = subprocess.run(if_cmd, capture_output=True, text=True, timeout=15)
+                if if_result.returncode != 0 or not if_result.stdout.strip():
+                    logger.warning(f"VM domiflist failed for {host}: {if_result.stderr.strip()}")
+                else:
+                    if_path = os.path.join(host_dump_dir, "domiflist.txt")
+                    with open(if_path, "w", encoding="utf-8") as f:
+                        f.write(if_result.stdout)
+                    logger.info(f"Saved VM domiflist for {host} to {if_path}")
+
+                vmi_cmd = ["oc", "get", "vmi", host, "-n", config.namespace, "-o", "yaml"]
+                vmi_result = subprocess.run(vmi_cmd, capture_output=True, text=True, timeout=15)
+                if vmi_result.returncode != 0 or not vmi_result.stdout.strip():
+                    logger.warning(f"VMI yaml failed for {host}: {vmi_result.stderr.strip()}")
+                else:
+                    vmi_path = os.path.join(host_dump_dir, "vmi.yaml")
+                    with open(vmi_path, "w", encoding="utf-8") as f:
+                        f.write(vmi_result.stdout)
+                    logger.info(f"Saved VMI yaml for {host} to {vmi_path}")
+
+                pod_yaml_cmd = ["oc", "get", "pod", pod_name, "-n", config.namespace, "-o", "yaml"]
+                pod_yaml_result = subprocess.run(pod_yaml_cmd, capture_output=True, text=True, timeout=15)
+                if pod_yaml_result.returncode != 0 or not pod_yaml_result.stdout.strip():
+                    logger.warning(f"virt-launcher pod yaml failed for {host}: {pod_yaml_result.stderr.strip()}")
+                else:
+                    pod_yaml_path = os.path.join(host_dump_dir, "virt-launcher-pod.yaml")
+                    with open(pod_yaml_path, "w", encoding="utf-8") as f:
+                        f.write(pod_yaml_result.stdout)
+                    logger.info(f"Saved virt-launcher pod yaml for {host} to {pod_yaml_path}")
+
+                vmi_desc_cmd = ["oc", "describe", "vmi", host, "-n", config.namespace]
+                vmi_desc_result = subprocess.run(vmi_desc_cmd, capture_output=True, text=True, timeout=15)
+                if vmi_desc_result.returncode != 0 or not vmi_desc_result.stdout.strip():
+                    logger.warning(f"VMI describe failed for {host}: {vmi_desc_result.stderr.strip()}")
+                else:
+                    vmi_desc_path = os.path.join(host_dump_dir, "vmi-describe.txt")
+                    with open(vmi_desc_path, "w", encoding="utf-8") as f:
+                        f.write(vmi_desc_result.stdout)
+                    logger.info(f"Saved VMI describe for {host} to {vmi_desc_path}")
+            except Exception as exc:
+                logger.warning(f"VM dump collection failed for {host}: {exc}")
+
     # Copy log file to results directory
     if log_file and os.path.exists(log_file):
         try:
@@ -1973,11 +2111,28 @@ WORKFLOW:
         logger.info("Each VM's results are in separate subdirectories with extracted files")
         return 0
     
+    if config.rebuild_only and config.test_only:
+        logger.error("rebuild_only and test_only cannot both be enabled")
+        return 1
+
     # Full test execution
     install_dependencies(config, executor)
     deploy_scripts(config, executor)
     install_mssql(config, executor)
-    build_database(config, executor)
+
+    if config.rebuild_only:
+        if not config.rebuilddb:
+            logger.error("rebuild_only requires rebuilddb to be enabled")
+            return 1
+        build_database(config, executor)
+        logger.info("Rebuild-only mode complete; skipping tests and result collection")
+        return 0
+
+    if config.rebuilddb:
+        build_database(config, executor)
+    else:
+        logger.info("Rebuilddb disabled: skipping database build step")
+
     run_tests(config, executor)
     
     # Collect results
