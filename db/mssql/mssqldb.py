@@ -66,6 +66,7 @@ class MSSQLTestConfig:
         self.log_level = "INFO"
         self.description = ""  # Test description for logging and output naming
         self.mssql_pass = "mssqlpasswd1!"
+        self.build_users = None
         self.rebuilddb = True
         self.rebuild_only = False
         self.test_only = False
@@ -277,6 +278,9 @@ class ConfigLoader:
         database = yaml_data.get('database', {})
         self.config.warehouse_count = database.get('warehouse_count')
         self.config.test_duration = database.get('test_duration')
+        build_users = database.get('build_users')
+        if build_users not in (None, "", "null"):
+            self.config.build_users = str(build_users)
         mssql_pass = database.get('mssql_pass')
         if mssql_pass and mssql_pass != "null":
             self.config.mssql_pass = str(mssql_pass)
@@ -550,6 +554,8 @@ def display_config(config: MSSQLTestConfig) -> None:
     logger.info(f"Warehouse count: {config.warehouse_count}")
     logger.info(f"User counts: {' '.join(config.user_count)}")
     logger.info(f"Test duration: {config.test_duration} minutes")
+    if config.build_users:
+        logger.info(f"Build users: {config.build_users}")
     if config.disk_list != "none":
         logger.info(f"Disk device: {config.disk_list}")
     if config.mount_point != "none":
@@ -969,6 +975,9 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
     
     # Step 4: Copy and configure build scripts
     logger.info("Step 4/5: Preparing build scripts on all hosts...")
+    build_users_label = config.build_users or "template default"
+    warehouse_label = config.warehouse_count or "template default"
+    logger.info(f"Schema build settings: {build_users_label} users, {warehouse_label} warehouses")
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
@@ -980,6 +989,11 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
                 f"sed -i 's/^diset connection mssqls_linux_server.*/diset connection mssqls_linux_server 127.0.0.1/g' build{vm_number}_mssql.tcl && "
                 f"sed -i 's/^diset tpcc mssqls_count_ware.*/diset tpcc mssqls_count_ware {config.warehouse_count}/g' build{vm_number}_mssql.tcl"
             )
+            if config.build_users:
+                cmd += (
+                    f" && sed -i 's/^diset tpcc mssqls_num_vu.*/diset tpcc mssqls_num_vu {config.build_users}/g' "
+                    f"build{vm_number}_mssql.tcl"
+                )
             future = pool.submit(executor.execute_command, host, cmd, f"Preparing build script (build{vm_number}_mssql.tcl)")
             futures.append((future, vm_number))
         for future, vm_number in futures:
