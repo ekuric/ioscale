@@ -11,6 +11,7 @@ import logging
 import os
 import ntpath
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -51,6 +52,7 @@ class MSSQLWinConfig:
         self.namespace_from_config = False
         self.db_hosts: List[str] = []
         self.warehouse_count = None
+        self.build_users = None
         self.mssql_total_iterations = None
         self.user_count: List[str] = []
         self.test_duration = None
@@ -77,6 +79,7 @@ class MSSQLWinConfig:
         self.generate_only = False
         self.windows_mssql_pass = None
         self.windows_disk_id = "1"
+        self.windows_rebuild_timeout = None
 
 
 def get_vm_number(hostname: str) -> str:
@@ -201,6 +204,8 @@ class CommandExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 bufsize=1
             )
             output_lines = []
@@ -276,6 +281,9 @@ class ConfigLoader:
         self.config.db_hosts = self._get_db_hosts(yaml_data)
 
         self.config.warehouse_count = database.get("warehouse_count")
+        build_users = database.get("build_users")
+        if build_users not in (None, "", "null"):
+            self.config.build_users = str(build_users)
         self.config.mssql_total_iterations = database.get("mssql_total_iterations")
         self.config.test_duration = database.get("test_duration")
         db_mssql_pass = database.get("mssql_pass")
@@ -321,6 +329,8 @@ class ConfigLoader:
             windows_test_script = None
         if not self.config.windows_test_script and windows_test_script:
             self.config.windows_test_script = windows_test_script
+        if self.config.windows_test_script and os.path.exists(self.config.windows_test_script):
+            self.config.windows_test_script_local = self.config.windows_test_script
         windows_result_dir = windows_cfg.get("result_dir")
         if windows_result_dir in ("null", ""):
             windows_result_dir = None
@@ -331,21 +341,35 @@ class ConfigLoader:
             windows_rebuild_script = None
         if not self.config.windows_rebuild_script and windows_rebuild_script:
             self.config.windows_rebuild_script = windows_rebuild_script
+        if self.config.windows_rebuild_script and os.path.exists(self.config.windows_rebuild_script):
+            self.config.windows_rebuild_script_local = self.config.windows_rebuild_script
         windows_create_db_sql = windows_cfg.get("create_db_sql")
         if windows_create_db_sql in ("null", ""):
             windows_create_db_sql = None
         if not self.config.windows_create_db_sql and windows_create_db_sql:
             self.config.windows_create_db_sql = windows_create_db_sql
+        if self.config.windows_create_db_sql and os.path.exists(self.config.windows_create_db_sql):
+            self.config.windows_create_db_sql_local = self.config.windows_create_db_sql
+        if self.config.windows_create_db_sql and not self.config.windows_create_db_sql_local:
+            config_dir = os.path.dirname(os.path.abspath(self.config.config_file)) if self.config.config_file else os.getcwd()
+            candidate = os.path.join(config_dir, os.path.basename(self.config.windows_create_db_sql))
+            if os.path.exists(candidate):
+                self.config.windows_create_db_sql_local = candidate
+                logger.info(f"Found local create_db.sql for copy: {candidate}")
         windows_build_schema_file = windows_cfg.get("build_schema_file")
         if windows_build_schema_file in ("null", ""):
             windows_build_schema_file = None
         if not self.config.windows_build_schema_file and windows_build_schema_file:
             self.config.windows_build_schema_file = windows_build_schema_file
+        if self.config.windows_build_schema_file and os.path.exists(self.config.windows_build_schema_file):
+            self.config.windows_build_schema_file_local = self.config.windows_build_schema_file
         windows_hammerdb_test_script = windows_cfg.get("hammerdb_test_script")
         if windows_hammerdb_test_script in ("null", ""):
             windows_hammerdb_test_script = None
         if not self.config.windows_hammerdb_test_script and windows_hammerdb_test_script:
             self.config.windows_hammerdb_test_script = windows_hammerdb_test_script
+        if self.config.windows_hammerdb_test_script and os.path.exists(self.config.windows_hammerdb_test_script):
+            self.config.windows_hammerdb_test_script_local = self.config.windows_hammerdb_test_script
         windows_mssql_pass = windows_cfg.get("mssql_pass")
         if windows_mssql_pass == "null":
             windows_mssql_pass = None
@@ -361,6 +385,13 @@ class ConfigLoader:
         windows_rebuild_always = windows_cfg.get("rebuild_always")
         if windows_rebuild_always == "true" or windows_rebuild_always is True:
             self.config.windows_rebuild_always = True
+        windows_rebuild_timeout = windows_cfg.get("rebuild_timeout")
+        if windows_rebuild_timeout not in (None, "", "null"):
+            try:
+                self.config.windows_rebuild_timeout = int(windows_rebuild_timeout)
+            except (TypeError, ValueError):
+                logger.error(f"Invalid windows.rebuild_timeout: {windows_rebuild_timeout}")
+                sys.exit(1)
         windows_test_only = windows_cfg.get("test_only")
         if windows_test_only == "true" or windows_test_only is True:
             self.config.windows_test_only = True
@@ -464,6 +495,8 @@ def display_config(config: MSSQLWinConfig) -> None:
     else:
         logger.info("Namespace: N/A (SSH-only mode)")
     logger.info(f"Warehouse count: {config.warehouse_count}")
+    if config.build_users:
+        logger.info(f"Build users: {config.build_users}")
     logger.info(f"User counts: {' '.join(config.user_count)}")
     logger.info(f"Test duration: {config.test_duration} minutes")
     if config.windows_hammerdb_path:
@@ -528,10 +561,21 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
             "Local create_db.sql not found; assuming it exists on Windows host: "
             f"{config.windows_create_db_sql}"
         )
+    generated_dir = os.path.join(
+        os.path.dirname(os.path.abspath(config.config_file)) if config.config_file else os.getcwd(),
+        ".mssqltestfiles-generated",
+    )
+    if config.warehouse_count and os.path.isdir(generated_dir):
+        create_db_base = ntpath.splitext(ntpath.basename(config.windows_create_db_sql or "create_db.sql"))[0]
+        create_db_suffix = f"-wh{config.warehouse_count}"
+        generated_create_db = os.path.join(generated_dir, f"{create_db_base}{create_db_suffix}.sql")
+        if os.path.exists(generated_create_db):
+            config.windows_create_db_sql_local = generated_create_db
     if config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
         create_db_sql = f"{windows_path}\\{os.path.basename(config.windows_create_db_sql_local)}"
     elif create_db_sql and "\\" not in create_db_sql and ":" not in create_db_sql:
         create_db_sql = f"{windows_path}\\{create_db_sql}"
+    logger.info(f"Using create_db.sql: {create_db_sql}")
 
     if config.windows_build_schema_file_local and os.path.exists(config.windows_build_schema_file_local):
         config_dir = os.path.dirname(os.path.abspath(config.config_file)) if config.config_file else os.getcwd()
@@ -552,6 +596,13 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
                 build_schema_content,
                 flags=re.MULTILINE,
             )
+        if config.build_users:
+            build_schema_content = re.sub(
+                r"^diset tpcc mssqls_num_vu .*?$",
+                f"diset tpcc mssqls_num_vu {config.build_users}",
+                build_schema_content,
+                flags=re.MULTILINE,
+            )
         if config.windows_mssql_pass:
             build_schema_content = re.sub(
                 r"^diset connection mssqls_pass.*$",
@@ -567,12 +618,49 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
         config.windows_build_schema_file_local = generated_build_schema
 
     build_schema_path = config.windows_build_schema_file or f"{windows_path}\\scripts\\tcl\\mssqls\\tprocc\\mssqls_tprocc_buildschema.tcl"
+    if config.warehouse_count:
+        schema_base = ntpath.splitext(ntpath.basename(config.windows_build_schema_file or "mssqls_tprocc_buildschema.tcl"))[0]
+        schema_suffix = f"-wh{config.warehouse_count}"
+        candidate_dirs = [
+            generated_dir,
+            os.path.join(os.getcwd(), ".mssqltestfiles-generated"),
+        ]
+        generated_schema = None
+        for candidate_dir in dict.fromkeys(candidate_dirs):
+            if not os.path.isdir(candidate_dir):
+                continue
+            candidate_path = os.path.join(candidate_dir, f"{schema_base}{schema_suffix}.tcl")
+            if os.path.exists(candidate_path):
+                generated_schema = candidate_path
+                break
+        if generated_schema:
+            config.windows_build_schema_file_local = generated_schema
+            logger.info(f"Using generated build schema: {generated_schema}")
+        else:
+            logger.info("Generated build schema not found; using configured build schema file")
+    if (config.windows_build_schema_file
+            and not config.windows_build_schema_file_local
+            and not os.path.exists(config.windows_build_schema_file)):
+        fallback_schema = f"{windows_path}\\scripts\\tcl\\mssqls\\tprocc\\mssqls_tprocc_buildschema.tcl"
+        if config.windows_build_schema_file.lower().endswith("\\mssqls_tprocc_buildschema.tcl"):
+            logger.warning(
+                "Build schema TCL not found locally; falling back to default script path on host."
+            )
+            build_schema_path = fallback_schema
     if config.windows_build_schema_file_local and os.path.exists(config.windows_build_schema_file_local):
         build_schema_path = f"{windows_path}\\{os.path.basename(config.windows_build_schema_file_local)}"
     elif build_schema_path and "\\" not in build_schema_path and ":" not in build_schema_path:
         build_schema_path = f"{windows_path}\\{build_schema_path}"
     logger.info(f"Using build schema TCL: {build_schema_path}")
+    build_users_label = config.build_users or "template default"
+    warehouse_label = config.warehouse_count or "template default"
+    logger.info(f"Schema build settings: {build_users_label} users, {warehouse_label} warehouses")
     output_file = "build_mssql_windows.out"
+    rebuild_timeout = config.windows_rebuild_timeout
+    if rebuild_timeout is None:
+        logger.info("Windows rebuild timeout: disabled")
+    else:
+        logger.info(f"Windows rebuild timeout: {rebuild_timeout}s")
     ps_parts = [
         f'cd "{windows_path}"',
         f'$env:HAMMERDB_PATH = "{windows_path}"',
@@ -637,7 +725,7 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
                 host,
                 cmd,
                 "Rebuilding database (Windows)",
-                7200
+                rebuild_timeout
             )
             futures.append(future)
         for future in as_completed(futures):
@@ -743,6 +831,13 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
             build_schema_content = re.sub(
                 r"^diset tpcc mssqls_count_ware .*?$",
                 f"diset tpcc mssqls_count_ware {config.warehouse_count}",
+                build_schema_content,
+                flags=re.MULTILINE,
+            )
+        if config.build_users:
+            build_schema_content = re.sub(
+                r"^diset tpcc mssqls_num_vu .*?$",
+                f"diset tpcc mssqls_num_vu {config.build_users}",
                 build_schema_content,
                 flags=re.MULTILINE,
             )
@@ -1304,6 +1399,15 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                 logger.warning(f"Failed to clean up result files on {host}: {cleanup_output}")
         except Exception as e:
             logger.error(f"Error copying results from {host}: {e}")
+
+    config_dir = os.path.dirname(os.path.abspath(config.config_file)) if config.config_file else os.getcwd()
+    generated_dir = os.path.join(config_dir, ".mssqltestfiles-generated")
+    if os.path.isdir(generated_dir):
+        generated_dest = os.path.join(results_dir, "mssqltestfiles-generated")
+        logger.info(f"Copying generated test files to results: {generated_dest}")
+        shutil.copytree(generated_dir, generated_dest, dirs_exist_ok=True)
+    else:
+        logger.info("Generated test files not found; skipping copy")
 
     if config.use_virtctl is not False and config.namespace and config.namespace != "N/A":
         for host in config.db_hosts:

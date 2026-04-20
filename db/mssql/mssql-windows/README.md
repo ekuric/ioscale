@@ -160,6 +160,7 @@ Configuration (mssql-configwin.yaml)
 - `windows.ssh_user`: SSH user for Windows hosts (default `Administrator`).
 - `windows.rebuilddb`: `true` to run `rebuild-db.ps1` before tests, `false` to skip.
 - `windows.rebuild_always`: `true` to rebuild before each user-count test run.
+- `windows.rebuild_timeout`: optional timeout in seconds for rebuild step (omit to disable).
 - `windows.rebuild_script`: optional path to a custom rebuild script on the host.
 - `windows.create_db_sql`: optional path to `create_db.sql` on the host (if provided locally, it is copied to the host).
 - `windows.hammerdb_test_script`: optional HammerDB test TCL path on the host.
@@ -174,6 +175,7 @@ Configuration (mssql-configwin.yaml)
 - CLI override: `mssqlwin.py --create-db <local.sql>` copies `create_db.sql` to the host.
 - CLI override: `mssqlwin.py --rebuild-always` rebuilds before each user count.
 - `--prepare-machine` formats the data disk (per `windows.disk_id`) and exits.
+- For script paths: if the value points to a local file (e.g., `./rebuild-db.ps1`), it is copied to the Windows host; if it points to a Windows path (e.g., `C:\tools\...`), it is assumed to already exist on the host.
 
 What the script does in Windows mode
 
@@ -206,6 +208,7 @@ Notes on test scripts
 - You can set `database.mssql_pass` in the config to patch `diset connection mssqls_pass` in generated TCL files (Windows-specific override: `windows.mssql_pass`).
 - If `database.warehouse_count` is set, the generator updates the `diset tpcc mssqls_count_ware` line in the TCL template. If it is not set, the template value is left unchanged.
 - If `database.mssql_total_iterations` is set, the generator updates the `diset tpcc mssqls_total_iterations` line in the TCL template; otherwise it keeps the template default.
+- If a cached `create_db-wh<COUNT>.sql` exists in `.mssqltestfiles-generated`, `mssqlwin.py` uses it automatically and logs the selected path.
 
 Generated files cache
 - Generated per-user PowerShell/TCL files are written to `.mssqltestfiles-generated`.
