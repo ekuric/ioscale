@@ -659,6 +659,7 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
     rebuild_timeout = config.windows_rebuild_timeout
     if rebuild_timeout is None:
         logger.info("Windows rebuild timeout: disabled")
+        rebuild_timeout = 0
     else:
         logger.info(f"Windows rebuild timeout: {rebuild_timeout}s")
     ps_parts = [
@@ -1245,7 +1246,7 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     sys.exit(1)
 
             # Phase 3: start tests in parallel after staging
-            start_futures = []
+            start_futures = {}
             for host in config.db_hosts:
                 duration_label = f"{config.test_duration}m" if config.test_duration else "unspecified"
                 logger.info(
@@ -1267,15 +1268,18 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     f'& "{remote_ps1}"'
                 ])
                 cmd = build_powershell_command(ps_cmd)
-                start_futures.append(pool.submit(
+                future = pool.submit(
                     executor.execute_command,
                     host,
                     cmd,
                     f"Running Windows test for {user_count} users",
                     7200
-                ))
+                )
+                start_futures[future] = host
             for future in as_completed(start_futures):
+                host = start_futures[future]
                 success, output = future.result()
+                logger.info(f"Finished test on host {host} (users={user_count})")
                 if not success:
                     logger.error(f"Windows test failed: {output}")
                     sys.exit(1)

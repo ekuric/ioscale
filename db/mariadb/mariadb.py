@@ -63,8 +63,6 @@ class MariaDBTestConfig:
         self.hammerdb_dir = None
         self.test_duration = None
         self.log_level = "INFO"
-        self.run_name = "HDB_MDB"
-        self.storage_type = None
         self.description = ""  # Test description for logging and output naming
         self.migrate_user_counts = []  # User counts that should trigger migration
         self.migrate_interval = 0  # Interval between migrations (0 = parallel)
@@ -273,14 +271,6 @@ class ConfigLoader:
         if self.config.log_level == "null" or not self.config.log_level:
             self.config.log_level = "INFO"
         
-        self.config.run_name = test.get('run_name', 'HDB_MDB')
-        if self.config.run_name == "null" or not self.config.run_name:
-            self.config.run_name = "HDB_MDB"
-        
-        self.config.storage_type = test.get('storage_type')
-        if self.config.storage_type == "null" or not self.config.storage_type:
-            self.config.storage_type = None
-        
         # Load migration configuration
         migrate = yaml_data.get('migrate')
         if migrate is None or migrate == "null":
@@ -304,10 +294,14 @@ class ConfigLoader:
             else:
                 self.config.migrate_interval = int(migrate_interval)
         
-        # Load description (top-level)
+        # Load description (top-level); fall back to deprecated test.run_name
         self.config.description = yaml_data.get('description', '')
         if self.config.description == "null" or not self.config.description:
             self.config.description = ""
+        run_name = test.get('run_name')
+        if run_name and run_name != "null" and not self.config.description:
+            self.config.description = str(run_name)
+            logger.info("Deprecated config 'test.run_name' used for description.")
         
         # Load HammerDB configuration
         hammerdb = yaml_data.get('hammerdb', {})
@@ -533,8 +527,6 @@ def display_config(config: MariaDBTestConfig) -> None:
     logger.info(f"HammerDB repo: {config.hammerdb_repo}")
     logger.info(f"HammerDB path: {config.hammerdb_path}")
     logger.info(f"HammerDB install dir: {config.hammerdb_dir}")
-    logger.info(f"Run name: {config.run_name}")
-    logger.info(f"Storage type: {config.storage_type}")
     logger.info(f"Log level: {config.log_level}")
     logger.info(f"Retry interval: {config.retry_interval}s")
     logger.info(f"Max retries: {config.max_retries}")
