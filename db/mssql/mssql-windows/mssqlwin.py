@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -80,6 +80,7 @@ class MSSQLWinConfig:
         self.windows_mssql_pass = None
         self.windows_disk_id = "1"
         self.windows_rebuild_timeout = None
+        self.windows_mssql_service_name = None
 
 
 def get_vm_number(hostname: str) -> str:
@@ -375,6 +376,11 @@ class ConfigLoader:
             windows_mssql_pass = None
         if windows_mssql_pass:
             self.config.windows_mssql_pass = windows_mssql_pass
+        windows_mssql_service_name = windows_cfg.get("mssql_service_name")
+        if windows_mssql_service_name in ("null", ""):
+            windows_mssql_service_name = None
+        if windows_mssql_service_name:
+            self.config.windows_mssql_service_name = windows_mssql_service_name
         windows_disk_id = windows_cfg.get("disk_id")
         if windows_disk_id in ("null", "", None):
             windows_disk_id = "1"
@@ -1245,12 +1251,93 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     logger.error(f"Failed to stage test files: {e}")
                     sys.exit(1)
 
+            def ensure_mssql_running(host: str) -> None:
+                service_name = config.windows_mssql_service_name
+                ps_lines = [
+                    "$ErrorActionPreference = 'Stop'",
+                ]
+                if service_name:
+                    ps_lines.append(f'$serviceName = "{service_name}"')
+                    ps_lines.append("$svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue")
+                else:
+                    ps_lines.append(
+                        "$svc = Get-Service -Name MSSQLSERVER -ErrorAction SilentlyContinue"
+                    )
+                    ps_lines.append(
+                        "if (-not $svc) { "
+                        "$svc = Get-Service -Name 'MSSQL$*' -ErrorAction SilentlyContinue | "
+                        "Select-Object -First 1 }"
+                    )
+                    ps_lines.append("$serviceName = $svc.Name")
+                ps_lines.append(
+                    "if (-not $svc) { Write-Error 'SQL Server service not found'; exit 1 }"
+                )
+                ps_lines.append('Write-Host "Using SQL Server service: $serviceName"')
+                ps_lines.append(
+                    "if ($svc.Status -ne 'Running') { "
+                    "Write-Host \"Starting SQL Server service $serviceName...\"; "
+                    "Start-Service -Name $serviceName; "
+                    "(Get-Service -Name $serviceName).WaitForStatus('Running','00:02:00') }"
+                )
+                ps_lines.extend([
+                    "$attempts = 24",
+                    "$sleep = 5",
+                    "for ($i = 0; $i -lt $attempts; $i++) {",
+                    "  sqlcmd -S localhost -E -Q \"SELECT 1\" -b -l 5 -t 5 *> $null",
+                    "  if ($LASTEXITCODE -eq 0) { Write-Host 'SQL Server is ready.'; exit 0 }",
+                    "  Start-Sleep -Seconds $sleep",
+                    "}",
+                    "Write-Error 'SQL Server did not become ready in time.'",
+                    "exit 1",
+                ])
+                ps_cmd = build_powershell_command("; ".join(ps_lines))
+                success, output = executor.execute_command(
+                    host,
+                    ps_cmd,
+                    "Ensuring SQL Server service is running",
+                    timeout=300
+                )
+                if not success:
+                    raise RuntimeError(output)
+
+            def run_test_on_host(host: str, user_count: str, cmd: str) -> Tuple[bool, str]:
+                try:
+                    ensure_mssql_running(host)
+                except Exception as exc:
+                    return False, str(exc)
+                duration_label = f"{config.test_duration}m" if config.test_duration else "unspecified"
+                logger.info(
+                    f"Starting test on host {host} (users={user_count}), "
+                    f"test duration: {duration_label}"
+                )
+                success, output = executor.execute_command(
+                    host,
+                    cmd,
+                    f"Running Windows test for {user_count} users",
+                    7200
+                )
+                if success:
+                    return True, output
+                logger.warning(
+                    f"Test failed on {host} (users={user_count}); attempting SQL Server restart and retry."
+                )
+                try:
+                    ensure_mssql_running(host)
+                except Exception as exc:
+                    return False, str(exc)
+                return executor.execute_command(
+                    host,
+                    cmd,
+                    f"Retrying Windows test for {user_count} users",
+                    7200
+                )
+
             # Phase 3: start tests in parallel after staging
             start_futures = {}
             for host in config.db_hosts:
                 duration_label = f"{config.test_duration}m" if config.test_duration else "unspecified"
                 logger.info(
-                    f"Starting test on host {host} (users={user_count}), "
+                    f"Preparing test on host {host} (users={user_count}), "
                     f"test duration: {duration_label}"
                 )
                 remote_ps1 = config.windows_test_script or f"{windows_path}\\{ntpath.basename(local_ps1_files[user_count])}"
@@ -1268,21 +1355,23 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     f'& "{remote_ps1}"'
                 ])
                 cmd = build_powershell_command(ps_cmd)
-                future = pool.submit(
-                    executor.execute_command,
-                    host,
-                    cmd,
-                    f"Running Windows test for {user_count} users",
-                    7200
-                )
+                future = pool.submit(run_test_on_host, host, user_count, cmd)
                 start_futures[future] = host
-            for future in as_completed(start_futures):
-                host = start_futures[future]
-                success, output = future.result()
-                logger.info(f"Finished test on host {host} (users={user_count})")
-                if not success:
-                    logger.error(f"Windows test failed: {output}")
-                    sys.exit(1)
+            pending = set(start_futures.keys())
+            while pending:
+                done, pending = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+                for future in done:
+                    host = start_futures[future]
+                    success, output = future.result()
+                    logger.info(f"Finished test on host {host} (users={user_count})")
+                    if not success:
+                        logger.error(f"Windows test failed: {output}")
+                        sys.exit(1)
+                if pending and not done:
+                    pending_hosts = ", ".join(sorted(start_futures[future] for future in pending))
+                    logger.info(
+                        f"Waiting on test to finish on hosts: {pending_hosts} (users={user_count})"
+                    )
 
 
 def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_dir: str) -> None:

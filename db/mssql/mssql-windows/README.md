@@ -166,6 +166,7 @@ Configuration (mssql-configwin.yaml)
 - `windows.hammerdb_test_script`: optional HammerDB test TCL path on the host.
 - `windows.build_schema_file`: optional build schema TCL path used for rebuild (local file is patched with `warehouse_count`).
 - `windows.mssql_pass`: Required MSSQL password override used to patch generated TCL files. This is password used to connect to MSSQL database. 
+- `windows.mssql_service_name`: optional service name override (defaults to auto-detecting MSSQLSERVER/MSSQL$*).
 - `database.warehouse_count`: optional warehouse count override for generated TCL files.
 - `database.mssql_total_iterations`: optional iteration override for generated TCL files.
 - CLI override: `mssqlwin.py --test-script <local.ps1>` copies the script to the host and runs it.

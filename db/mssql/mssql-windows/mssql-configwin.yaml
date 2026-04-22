@@ -10,6 +10,7 @@ database:
   # host_file: "mssql_hosts.txt"          # File with one host per line
   namespace: "default"  # only used for virtctl mode 
   warehouse_count: 50            # Number of warehouses for TPCC test
+  build_users: 50                # Virtual users for schema build step
   mssql_total_iterations: 10000000              # Number of iterations to run
   test_duration: 15              # Test duration in minutes
   user_count: "1 10 20 50 100"   # Space-separated list of user counts to test, eg "1 2 4 8"
@@ -25,7 +26,10 @@ windows:
   create_db_sql: "C:\\tools\\Hammerdb-4.12\\create_db.sql"
   disk_id: "1"  # data disk id to format and use for testing
   ssh_user: "Administrator"
+  # mssql_service_name: "MSSQLSERVER"  # Optional service name override
   rebuilddb: true
+  # rebuild_timeout: 7200  # Optional timeout in seconds (omit to disable)
+  rebuild_always: false
   rebuild_only: false
   test_only: false
 
