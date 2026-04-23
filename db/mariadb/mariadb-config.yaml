@@ -38,8 +38,6 @@ database:
 # Test Configuration
 test:
   user_count: "1"               # Space-separated list of user counts to test, eg "1 2 4 8"
-  run_name: "HDB_MDB"           # Base name for test runs
-  storage_type: "null"          # Storage type identifier for reporting
   log_level: "INFO"             # Logging level (DEBUG, INFO, WARN, ERROR)
 
 # HammerDB Configuration

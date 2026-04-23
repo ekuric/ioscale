@@ -294,14 +294,11 @@ class ConfigLoader:
             else:
                 self.config.migrate_interval = int(migrate_interval)
         
-        # Load description (top-level); fall back to deprecated test.run_name
+        # Load description (top-level)
         self.config.description = yaml_data.get('description', '')
         if self.config.description == "null" or not self.config.description:
             self.config.description = ""
-        run_name = test.get('run_name')
-        if run_name and run_name != "null" and not self.config.description:
-            self.config.description = str(run_name)
-            logger.info("Deprecated config 'test.run_name' used for description.")
+        # run_name deprecated; description is the single source for labeling
         
         # Load HammerDB configuration
         hammerdb = yaml_data.get('hammerdb', {})
