@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -605,7 +606,19 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
         if config.build_users:
             build_schema_content = re.sub(
                 r"^diset tpcc mssqls_num_vu .*?$",
-                f"diset tpcc mssqls_num_vu {config.build_users}",
+                "",
+                build_schema_content,
+                flags=re.MULTILINE,
+            )
+            build_schema_content = re.sub(
+                r"^vuset\s+vu\s+.*?$",
+                f"vuset vu {config.build_users}",
+                build_schema_content,
+                flags=re.MULTILINE,
+            )
+            build_schema_content = re.sub(
+                r"^set\s+vu\s+.*?$",
+                f"set vu {config.build_users}",
                 build_schema_content,
                 flags=re.MULTILINE,
             )
@@ -1300,6 +1313,43 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                 if not success:
                     raise RuntimeError(output)
 
+            def get_mssql_service_status(host: str) -> Optional[str]:
+                service_name = config.windows_mssql_service_name
+                ps_lines = [
+                    "$ErrorActionPreference = 'Stop'",
+                ]
+                if service_name:
+                    ps_lines.append(f'$serviceName = "{service_name}"')
+                    ps_lines.append("$svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue")
+                else:
+                    ps_lines.append(
+                        "$svc = Get-Service -Name MSSQLSERVER -ErrorAction SilentlyContinue"
+                    )
+                    ps_lines.append(
+                        "if (-not $svc) { "
+                        "$svc = Get-Service -Name 'MSSQL$*' -ErrorAction SilentlyContinue | "
+                        "Select-Object -First 1 }"
+                    )
+                    ps_lines.append("$serviceName = $svc.Name")
+                ps_lines.append(
+                    "if (-not $svc) { Write-Output 'UNKNOWN'; exit 0 }"
+                )
+                ps_lines.append('Write-Output "$serviceName|$($svc.Status)"')
+                ps_cmd = build_powershell_command("; ".join(ps_lines))
+                success, output = executor.execute_command(
+                    host,
+                    ps_cmd,
+                    "Checking SQL Server service status",
+                    timeout=60
+                )
+                if not success:
+                    return None
+                status_line = output.strip().splitlines()[-1] if output else ""
+                if "|" not in status_line:
+                    return None
+                _, status = status_line.split("|", 1)
+                return status.strip()
+
             def run_test_on_host(host: str, user_count: str, cmd: str) -> Tuple[bool, str]:
                 try:
                     ensure_mssql_running(host)
@@ -1332,6 +1382,25 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     7200
                 )
 
+            def run_test_with_watchdog(host: str, user_count: str, cmd: str) -> Tuple[bool, str]:
+                with ThreadPoolExecutor(max_workers=1) as monitor_pool:
+                    future = monitor_pool.submit(run_test_on_host, host, user_count, cmd)
+                    while True:
+                        done, _ = wait([future], timeout=30, return_when=FIRST_COMPLETED)
+                        if done:
+                            return future.result()
+                        status = get_mssql_service_status(host)
+                        if status and status.lower() != "running":
+                            logger.warning(
+                                f"SQL Server service stopped on {host} during test; restarting."
+                            )
+                            try:
+                                ensure_mssql_running(host)
+                            except Exception as exc:
+                                logger.warning(
+                                    f"Failed to restart SQL Server on {host} during test: {exc}"
+                                )
+
             # Phase 3: start tests in parallel after staging
             start_futures = {}
             for host in config.db_hosts:
@@ -1355,7 +1424,7 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     f'& "{remote_ps1}"'
                 ])
                 cmd = build_powershell_command(ps_cmd)
-                future = pool.submit(run_test_on_host, host, user_count, cmd)
+                future = pool.submit(run_test_with_watchdog, host, user_count, cmd)
                 start_futures[future] = host
             pending = set(start_futures.keys())
             while pending:
@@ -1623,6 +1692,21 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     logger.info(f"Saved VMI describe for {host} to {vmi_desc_path}")
             except Exception as e:
                 logger.warning(f"VM dump failed for {host}: {e}")
+
+        try:
+            pods_cmd = ["oc", "get", "pods", "-o", "wide", "-n", config.namespace]
+            pods_result = subprocess.run(pods_cmd, capture_output=True, text=True, timeout=30)
+            if pods_result.returncode != 0 or not pods_result.stdout.strip():
+                logger.warning(
+                    f"Failed to collect pod list for namespace {config.namespace}: {pods_result.stderr.strip()}"
+                )
+            else:
+                pods_path = os.path.join(results_dir, "oc_get_pods_wide.txt")
+                with open(pods_path, "w", encoding="utf-8") as f:
+                    f.write(pods_result.stdout)
+                logger.info(f"Saved pod list to {pods_path}")
+        except Exception as e:
+            logger.warning(f"Failed to collect pod list: {e}")
 
 
 def main() -> None:
