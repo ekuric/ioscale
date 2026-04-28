@@ -1345,10 +1345,14 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                 if not success:
                     return None
                 status_line = output.strip().splitlines()[-1] if output else ""
-                if "|" not in status_line:
-                    return None
-                _, status = status_line.split("|", 1)
-                return status.strip()
+                if "|" in status_line:
+                    _, status = status_line.split("|", 1)
+                    return status.strip()
+                match = re.search(r"^(\S+)\|(Running|Stopped|StopPending|StartPending|Paused)\s*$",
+                                  output or "", flags=re.MULTILINE)
+                if match:
+                    return match.group(2).strip()
+                return None
 
             def run_test_on_host(host: str, user_count: str, cmd: str) -> Tuple[bool, str]:
                 try:
@@ -1392,7 +1396,7 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                         status = get_mssql_service_status(host)
                         if status and status.lower() != "running":
                             logger.warning(
-                                f"SQL Server service stopped on {host} during test; restarting."
+                                f"SQL Server service state on {host} is {status}; restarting."
                             )
                             try:
                                 ensure_mssql_running(host)
