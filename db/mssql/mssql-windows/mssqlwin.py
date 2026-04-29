@@ -605,23 +605,41 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
             )
         if config.build_users:
             build_schema_content = re.sub(
-                r"^diset tpcc mssqls_num_vu .*?$",
-                "",
+                r"(?m)^\s*diset tpcc mssqls_num_vu .*?$",
+                f"diset tpcc mssqls_num_vu {config.build_users}",
                 build_schema_content,
-                flags=re.MULTILINE,
             )
             build_schema_content = re.sub(
-                r"^vuset\s+vu\s+.*?$",
+                r"(?m)^\s*vuset\s+vu\s+.*?$",
                 f"vuset vu {config.build_users}",
                 build_schema_content,
-                flags=re.MULTILINE,
             )
             build_schema_content = re.sub(
-                r"^set\s+vu\s+.*?$",
+                r"(?m)^\s*set\s+vu\s+.*?$",
                 f"set vu {config.build_users}",
                 build_schema_content,
-                flags=re.MULTILINE,
             )
+            logger.info(
+                f"Updated build schema VU settings to {config.build_users} virtual users"
+            )
+            if not re.search(r"(?m)^\s*vuset\s+vu\s+\d+", build_schema_content):
+                build_schema_content = re.sub(
+                    r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
+                    f"vuset vu {config.build_users}\n\n\\1",
+                    build_schema_content,
+                )
+            if not re.search(r"(?m)^\s*set\s+vu\s+\d+", build_schema_content):
+                build_schema_content = re.sub(
+                    r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
+                    f"set vu {config.build_users}\n\n\\1",
+                    build_schema_content,
+                )
+            if not re.search(r"(?m)^\s*diset tpcc mssqls_num_vu\s+\d+", build_schema_content):
+                build_schema_content = re.sub(
+                    r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
+                    f"diset tpcc mssqls_num_vu {config.build_users}\n\n\\1",
+                    build_schema_content,
+                )
         if config.windows_mssql_pass:
             build_schema_content = re.sub(
                 r"^diset connection mssqls_pass.*$",
@@ -856,10 +874,40 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
             )
         if config.build_users:
             build_schema_content = re.sub(
-                r"^diset tpcc mssqls_num_vu .*?$",
+                r"(?m)^\s*diset tpcc mssqls_num_vu .*?$",
                 f"diset tpcc mssqls_num_vu {config.build_users}",
                 build_schema_content,
-                flags=re.MULTILINE,
+            )
+            build_schema_content = re.sub(
+                r"(?m)^\s*vuset\s+vu\s+.*?$",
+                f"vuset vu {config.build_users}",
+                build_schema_content,
+            )
+            build_schema_content = re.sub(
+                r"(?m)^\s*set\s+vu\s+.*?$",
+                f"set vu {config.build_users}",
+                build_schema_content,
+            )
+            if not re.search(r"(?m)^\s*vuset\s+vu\s+\d+", build_schema_content):
+                build_schema_content = re.sub(
+                    r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
+                    f"vuset vu {config.build_users}\n\n\\1",
+                    build_schema_content,
+                )
+            if not re.search(r"(?m)^\s*set\s+vu\s+\d+", build_schema_content):
+                build_schema_content = re.sub(
+                    r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
+                    f"set vu {config.build_users}\n\n\\1",
+                    build_schema_content,
+                )
+            if not re.search(r"(?m)^\s*diset tpcc mssqls_num_vu\s+\d+", build_schema_content):
+                build_schema_content = re.sub(
+                    r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
+                    f"diset tpcc mssqls_num_vu {config.build_users}\n\n\\1",
+                    build_schema_content,
+                )
+            logger.info(
+                f"Updated build schema VU settings to {config.build_users} virtual users"
             )
         else:
             logger.warning(
