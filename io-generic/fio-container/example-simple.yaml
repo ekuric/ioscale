@@ -1,0 +1,59 @@
+# FIO Test Configuration - Simple Example
+# Minimal configuration for quick testing
+
+# VM/Host Configuration
+vm:
+  hosts: "vm-1 vm-2 vm-3"  # Simple host list
+  namespace: "default"
+
+# Storage Configuration
+storage:
+  devices:
+    "vm-1": "vdb"
+    "vm-2": "vdb"
+    "vm-3": "vdb"
+  mount_point: "/root/tests/data"
+  filesystem: "xfs"
+
+# FIO Test Configuration
+fio:
+  test_size: "1G"
+  runtime: 120  # 2 minutes
+  block_sizes: "4k"
+  io_patterns: "write"
+  numjobs: 1
+  iodepth: 16
+  direct_io: 1
+
+# Output Configuration
+output:
+  directory: "/root/fio-results"
+  format: "json+"
+
+# Retry Configuration
+retry:
+  interval: 30
+  max_retries: 10
+
+# Task Monitoring Configuration
+monitoring:
+  task_monitor_interval: 60
+
+# VM Migration Configuration (no migrations for this simple example)
+migrate:
+  workloads: ""
+  interval: 0
+
+# Timeout configuration (all values in seconds)
+# Uncomment to override defaults
+# timeouts:
+#   default: 300          # General SSH command timeout
+#   quick: 60             # Short commands (mkdir, package check)
+#   process_check: 30     # Checking if remote process is running
+#   connectivity: 10      # Initial SSH connectivity test per host
+#   runtime_buffer: 300   # Extra seconds added to FIO runtime for test timeout
+#   nohup_setup: 60       # Setting up nohup background FIO on remote host
+#   scp: 300              # File copy (scp/virtctl scp) timeout
+#   dataset_buffer: 60    # Extra seconds for dataset pre-write to finish
+#   check_interval: 10    # Polling interval for background tasks
+#   migration: 600        # VM live migration timeout per host

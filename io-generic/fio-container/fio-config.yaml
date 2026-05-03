@@ -1,0 +1,219 @@
+# FIO Test Configuration - Mixed Hosts Mode (Auto-detection)
+# This configuration demonstrates the auto-detection capability where the script
+# automatically determines whether to use virtctl or SSH for each host
+
+# VM/Host Configuration
+vm:
+  # Method 1: External host file (recommended for mixed environments)
+  #host_file: "mixed-hosts.txt"
+  
+  # Alternative Method 2: Simple host list with mixed VM and server names
+  #hosts: "vm-1 vm-2 myhost.test.com" 
+  #  vm-3 vm-4 vm-5" 
+  # server1 server2 vm-3"
+  
+  # Alternative Method 3: Host pattern expansion
+  host_pattern: "fed{1..3}" #100}"
+  
+  # Alternative Method 4: Label-based selection (VMs only)
+  #host_labels: "type=vm"
+  
+  # OpenShift/Kubernetes namespace for VMs (ignored for regular servers)
+  namespace: "default"
+
+# Storage Configuration
+storage:
+  # Per-host device configuration (MANDATORY - no global fallback for safety)
+  devices:
+    # OpenShift VMs (typically use virtual devices) - using patterns for efficiency
+    "fed{1..3}": "vdb"
+    
+    # Individual hosts (for special cases)
+    "myhost.test.com": "sdc"
+  
+  # Mount point for the test filesystem
+  mount_point: "/root/tests/data"
+  
+  # Filesystem type to create
+  filesystem: "xfs"
+  
+  # Persistent mount: if set to "true", creates /etc/fstab entry for automatic mounting after reboot
+  # When empty or not set, mount is temporary (current behavior)
+  # When set to "true", the device will be automatically mounted on system reboot
+  persistent: ""  # Set to "true" to enable persistent mounts via /etc/fstab
+
+# FIO Test Configuration
+fio:
+  # Test file size (e.g., "1G", "500M", "10G")
+  test_size: "1G"
+  
+  # Test runtime in seconds
+  runtime: "120"
+  
+  # Block sizes to test (space-separated)
+  block_sizes: "4k" # 8k 128k 1024k 4096k"
+  
+  # I/O patterns to test (space-separated)
+  io_patterns: "write" # read write randread randwrite"
+  
+  # Number of parallel jobs
+  numjobs: "1"
+  
+  # I/O depth
+  iodepth: "16"
+  
+  # Direct I/O (bypass page cache)
+  direct_io: "1"
+
+  # rate_iops  - uncomment if there need to impose rate iops
+  # rate_iops: "1000" 
+
+# Test Description (Optional)
+# Short description for this test run - will be included in log file and results directory names
+# Example: "my new special test" will create files like "fio-results-20231205-120000-my_new_special_test-machines_5"
+# Leave empty or omit to use default naming without description
+description: ""  # Optional: Short description for this test run
+
+# Output Configuration
+output:
+  # Directory to store results on remote hosts
+  directory: "/root/fio-results"
+  
+  # Output format (json+, normal, etc.)
+  format: "json+"
+
+# Retry and Monitoring Configuration
+retry:
+  # Retry interval in seconds (default: 30)
+  interval: 30
+  
+  # Maximum number of retry attempts (default: 10)
+  max_retries: 10
+  
+  # Skip initial connectivity test (default: false)
+  skip_connectivity_test: false
+
+# Task Monitoring Configuration
+monitoring:
+  # Check task status every N seconds for long-running tasks (default: 60)
+  # Only tasks running longer than this interval will be monitored
+  task_monitor_interval: 60
+
+# VM Migration Configuration (OCP CNV environments only)
+migrate:
+  # List of I/O patterns/workloads during which to trigger VM migrations
+  # Migrations will occur at the midpoint of the test runtime (e.g., at 5 min for 10 min test)
+  # Only VMs (not regular hosts) will be migrated
+  # Default: none (no migrations)
+  # Example: workloads: "write randwrite"  # Migrate during write and randwrite tests
+  workloads: ""  # Space-separated list of patterns, or empty string for no migrations
+  
+  # Interval in seconds between VM migrations (default: 0 = migrate all VMs in parallel)
+  # Setting this to a positive value (e.g., 2) will migrate VMs sequentially with the specified delay
+  # This helps avoid overloading CNV when migrating multiple VMs simultaneously
+  # Example: interval: 2  # Migrate one VM, wait 2 seconds, migrate next VM, etc.
+  interval: 0  # Seconds to wait between migrations (0 = parallel, >0 = sequential)
+
+# Timeout configuration (all values in seconds)
+# Uncomment to override defaults
+# timeouts:
+#   default: 300          # General SSH command timeout
+#   quick: 60             # Short commands (mkdir, package check)
+#   process_check: 30     # Checking if remote process is running
+#   connectivity: 10      # Initial SSH connectivity test per host
+#   runtime_buffer: 300   # Extra seconds added to FIO runtime for test timeout
+#   nohup_setup: 60       # Setting up nohup background FIO on remote host
+#   scp: 300              # File copy (scp/virtctl scp) timeout
+#   dataset_buffer: 60    # Extra seconds for dataset pre-write to finish
+#   check_interval: 10    # Polling interval for background tasks
+#   migration: 600        # VM live migration timeout per host
+
+# Windows Host Configuration (Optional - for Windows-only or mixed Linux/Windows testing)
+# If you want to test Windows machines (with or without Linux), add this section
+# Windows hosts are identified by listing them in windows.hosts or windows.host_pattern
+# Windows hosts will use Administrator@vmi instead of root@vmi for SSH access
+# Windows hosts assume FIO is pre-installed (no package installation)
+# 
+# NOTE: For Windows-only testing, you can omit the 'vm', 'storage', 'fio', and 'output' sections
+#       and only configure the 'windows' section below.
+windows:
+  # Windows host list (space-separated) or host pattern
+  # Uncomment one of these to enable Windows hosts:
+  #hosts: "win-vm-1 win-vm-2 win-vm-3"
+  #host_pattern: "win-vm-{1..10}"
+  
+  # Windows Storage Configuration (required if Windows hosts are specified)
+  storage_win:
+    # Per-host device configuration for Windows (use Disk ID, e.g., "1" for Disk 1)
+    devices:
+      # Uncomment and adjust for your Windows hosts:
+      #"win-vm-{1..10}": "1"  # Disk ID 1 for Windows VMs matching pattern
+      #"win-vm-1": "1"        # Individual host configuration
+      #"win-vm-2": "1"
+    # Windows mount point (use Windows path format with backslashes escaped)
+    mount_point: "d\\:/fio/data"  # Windows directory for test data
+  
+  # Windows FIO Configuration (required if Windows hosts are specified)
+  fio_win:
+    # Location of FIO executable on Windows
+    # run_dir: Directory containing fio.exe (e.g., "d:/fio" or "d:/fio/")
+    # root_dir: Root directory where FIO is installed (e.g., "d:/") - if run_dir is not set, defaults to root_dir/fio
+    run_dir: "d:/fio"  # Directory containing fio.exe (preferred)
+    #root_dir: "d:/"    # Alternative: root directory (will use root_dir/fio if run_dir not set)
+    # Test file size
+    test_size: "10GB"
+    # Test runtime in seconds
+    runtime: 600
+    # Block sizes to test (space-separated)
+    block_sizes: "4k 8k 64k 128k 1024k 4096k"
+    # I/O patterns to test (space-separated)
+    io_patterns: "randread randwrite read write"
+    # Number of parallel jobs
+    numjobs: 8
+    # I/O depth
+    iodepth: 16
+    # Direct I/O (1=yes, 0=no)
+    direct_io: 1
+    # rate_iops (optional, uncomment to enable)
+    #rate_iops: 500
+  
+  # Windows Output Configuration (required if Windows hosts are specified)
+  output_win:
+    # Directory to store results on Windows hosts
+    directory: "d:/fio/results"
+    # Output format (json+, json, normal, etc.)
+    format: "json+"
+
+# Example: Mixed Linux and Windows Configuration
+# To test both Linux and Windows machines simultaneously:
+#
+# vm:
+#   host_pattern: "linux-vm-{1..5}"  # Linux VMs
+#   namespace: "default"
+#
+# windows:
+#   host_pattern: "win-vm-{1..5}"   # Windows VMs
+#   storage_win:
+#     devices:
+#       "win-vm-{1..5}": "1"
+#     mount_point: "d\\:/fio/data"
+#   fio_win:
+#     run_dir: "d:/fio"
+#     test_size: "10GB"
+#     runtime: 600
+#     block_sizes: "4k 8k 64k"
+#     io_patterns: "randread randwrite"
+#     numjobs: 8
+#     iodepth: 16
+#     direct_io: 1
+#   output_win:
+#     directory: "d:/fio/results"
+#     format: "json+"
+#
+# The script will automatically:
+# - Use root@vmi for Linux hosts
+# - Use Administrator@vmi for Windows hosts
+# - Skip package installation for Windows hosts (assumes FIO is pre-installed)
+# - Use appropriate commands (bash for Linux, PowerShell for Windows)
+# - Use windowsaio ioengine and fio.exe for Windows
+# - Use standard FIO for Linux

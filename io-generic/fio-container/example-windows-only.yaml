@@ -1,0 +1,74 @@
+# FIO Test Configuration - Windows Only Example
+# This configuration demonstrates Windows-only testing
+# Note: The 'vm' section with 'namespace' is required for virtctl access
+# Omit 'storage', 'fio', and 'output' sections for Windows-only testing (use 'windows' section instead)
+
+# Test Description (Optional)
+description: "windows performance test"
+
+# VM/Host Configuration (required for virtctl access to Windows VMs)
+# Note: Windows hosts are defined in the 'windows' section below
+# The 'vm' section here only needs the namespace for virtctl access
+vm:
+  namespace: "default"  # Namespace where Windows VMs are located
+
+# Windows Hosts Configuration
+windows:
+  hosts: "win-vm-1 win-vm-2"
+  # OR use pattern: 
+  #host_pattern: "win-vm-{1..10}"
+  
+  # Windows Storage Configuration
+  storage_win:
+    devices:
+      # Individual host configuration
+      "win-vm-1": "1"
+      "win-vm-2": "1"
+      # OR use pattern-based configuration (more efficient for many hosts)
+      # Example: "win-vm-{1..10}": "1"  # Disk ID 1 for Windows VMs matching pattern win-vm-1 through win-vm-10
+    mount_point: "d\\:/fio/data"  # Windows path format  
+
+  # Windows FIO Configuration
+  fio_win:
+    run_dir: "d:/fio"  # Directory containing fio.exe
+    test_size: "10GB"
+    runtime: 600
+    block_sizes: "4k 8k 128k 512k 1024k 4096k"
+    io_patterns: "read write randread randwrite randrw"
+    numjobs: 1
+    iodepth: 16
+    direct_io: 1
+  
+  # Windows Output Configuration
+  output_win:
+    directory: "d:/fio/results"
+    format: "json+"
+
+# Retry Configuration
+retry:
+  interval: 30
+  max_retries: 10
+
+# Task Monitoring Configuration
+monitoring:
+  task_monitor_interval: 60
+
+# VM Migration Configuration (optional for Windows VMs)
+migrate:
+  workloads: ""  # No migrations for this example
+  # Migrate during these patterns - example: workloads: "write randwrite randrw read randread" 
+  interval: 0
+
+# Timeout configuration (all values in seconds)
+# Uncomment to override defaults
+# timeouts:
+#   default: 300          # General SSH command timeout
+#   quick: 60             # Short commands (mkdir, package check)
+#   process_check: 30     # Checking if remote process is running
+#   connectivity: 10      # Initial SSH connectivity test per host
+#   runtime_buffer: 300   # Extra seconds added to FIO runtime for test timeout
+#   nohup_setup: 60       # Setting up nohup background FIO on remote host
+#   scp: 300              # File copy (scp/virtctl scp) timeout
+#   dataset_buffer: 60    # Extra seconds for dataset pre-write to finish
+#   check_interval: 10    # Polling interval for background tasks
+#   migration: 600        # VM live migration timeout per host
