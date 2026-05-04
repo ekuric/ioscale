@@ -505,6 +505,99 @@ timeouts:
   migration: 1200
 ```
 
+## VM Live Migration During Tests
+
+The script can live-migrate OpenShift/KubeVirt VMs **while FIO tests are
+running** to measure the impact of VM migration on I/O performance. It uses
+`virtctl migrate` to trigger the migrations.
+
+### Configuration
+
+```yaml
+migrate:
+  workloads: "write randwrite"   # I/O patterns that trigger migration
+  interval: 0                    # 0 = parallel, >0 = sequential with delay (seconds)
+```
+
+- `workloads` -- space-separated list of I/O patterns. Migration only happens
+  during tests matching these patterns. Empty string disables migration.
+- `interval` -- migration strategy:
+  - `0` -- migrate all VMs simultaneously (parallel)
+  - `>0` -- migrate VMs one at a time with this many seconds between each
+    (recommended for large VM counts to avoid overloading CNV)
+
+### When Migration Triggers
+
+Migration occurs at the **midpoint** of the FIO test runtime. For a 600-second
+test, migrations start at 300 seconds. This captures the performance impact
+mid-test while FIO is in steady state.
+
+The flow for each test (block_size x io_pattern):
+
+1. Start FIO on all hosts (background)
+2. If the current I/O pattern is in `migrate.workloads`:
+   - Wait until the midpoint of the test runtime
+   - Migrate all VMs (parallel or sequential per `interval`)
+3. Wait for FIO to complete on all hosts
+4. Proceed to the next test combination
+
+### Migration Strategies
+
+**Parallel (`interval: 0`):**
+
+All VMs are migrated simultaneously using a thread pool. Fast but can strain
+the CNV infrastructure when migrating many VMs at once.
+
+**Sequential (`interval: 2`):**
+
+VMs are migrated one at a time with a delay between each. Safer for large
+deployments (e.g. 50+ VMs) as it avoids overwhelming the cluster.
+
+### Retry Logic
+
+Failed migrations get one automatic retry:
+
+1. First pass: attempt all VMs
+2. Collect failures
+3. Second pass: retry only the failed VMs
+4. If retries also fail, log the error (test continues, results still collected)
+
+### Example
+
+With `workloads: "write randwrite"`, `interval: 2`, `runtime: 600`, 10 VMs:
+
+```
+write test starts on all 10 VMs
+  ├── Wait 300s (midpoint)
+  ├── Migrate vm-1 → 2s → vm-2 → 2s → ... → vm-10
+  │   (failures retried after first pass)
+  └── Wait for FIO to finish
+
+randread test starts (no migration -- not in workloads)
+
+randwrite test starts on all 10 VMs
+  ├── Wait 300s (midpoint)
+  ├── Migrate vm-1 → 2s → vm-2 → 2s → ... → vm-10
+  └── Wait for FIO to finish
+```
+
+### Env var mode
+
+When using env vars (no config file), set:
+
+```bash
+-e MIGRATE_WORKLOADS="write randwrite" \
+-e MIGRATE_INTERVAL=2
+```
+
+### Notes on migration
+
+- Only VMs are migrated -- baremetal/SSH hosts are skipped automatically
+- Requires `--virtctl-only` mode (default in container) and a valid namespace
+- Migration timeout per VM is configurable via `timeouts.migration` (default 600s)
+- Migration does not stop the FIO test -- it runs concurrently
+- Results from migrated VMs are still collected normally after the test
+
 ## Virtual Machine Requirements
 
 ### Linux VMs
