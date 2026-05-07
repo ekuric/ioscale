@@ -146,7 +146,7 @@ chmod +x /usr/local/bin/hammerdbcli
 
 log_info "Verifying HammerDB installation..."
 hammerdbcli <<< "exit" 2>&1 | head -3 || log_info "Warning: HammerDB CLI verification returned non-zero (may still work)"
-log_info "HammerDB ${HAMMERDB_VERSION} installed to ${HAMMERDB_INSTALL_DIR}"
+log_info "HammerDB installed to ${HAMMERDB_INSTALL_DIR}"
 
 # ----------------------------------------------------------------------------
 # Step 3: Stop MariaDB and Install Packages
@@ -216,7 +216,7 @@ fi
 log_step "Creating MariaDB Data Directory"
 
 log_info "Cleaning existing MySQL data directory..."
-rm -rf "${MOUNTPOINT}/mysql/*" 2>/dev/null || true
+rm -rf "${MOUNTPOINT}/mysql" 2>/dev/null || true
 
 log_info "Creating MySQL data directory structure..."
 mkdir -p "${MOUNTPOINT}/mysql/data" || error_exit "Failed to create MySQL data directory"
