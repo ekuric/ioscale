@@ -1,0 +1,145 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP. Each user/team sets their own bastion here.')
+        string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host (e.g. root, admin)')
+        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for this bastion SSH key. Each bastion needs its own key registered in Jenkins (Manage Credentials > Add > SSH Username with private key). Use a unique ID per bastion, e.g. team-a-bastion, lab2-bastion.')
+        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/fio-benchmark:latest', description: 'Container image to run')
+
+        string(name: 'HOST_PATTERN',      defaultValue: 'vml-{1..3}',         description: 'Linux VM host pattern')
+        string(name: 'DEVICES',           defaultValue: 'vml-{1..3}=vdc',     description: 'Linux device mapping (pattern=device, comma-separated)')
+        string(name: 'WIN_HOST_PATTERN',  defaultValue: 'vm-{1..2}',          description: 'Windows VM host pattern (leave empty to skip Windows)')
+        string(name: 'WIN_DEVICES',       defaultValue: 'vm-{1..2}=2',        description: 'Windows device mapping (pattern=diskid, comma-separated)')
+        string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
+
+        string(name: 'TEST_SIZE',         defaultValue: '5G',                  description: 'FIO test file size')
+        string(name: 'RUNTIME',           defaultValue: '300',                 description: 'Linux test runtime in seconds')
+        string(name: 'WIN_RUNTIME',       defaultValue: '300',                 description: 'Windows test runtime in seconds')
+        string(name: 'BLOCK_SIZES',       defaultValue: '4k 1024k',           description: 'Linux block sizes (space-separated)')
+        string(name: 'WIN_BLOCK_SIZES',   defaultValue: '4k 1024k',           description: 'Windows block sizes (space-separated)')
+        string(name: 'IO_PATTERNS',       defaultValue: 'write',              description: 'Linux I/O patterns (space-separated)')
+        string(name: 'WIN_IO_PATTERNS',   defaultValue: 'write',              description: 'Windows I/O patterns (space-separated)')
+
+        string(name: 'MIGRATE_WORKLOADS', defaultValue: '',                    description: 'I/O patterns triggering VM migration (space-separated, empty = no migration)')
+        string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
+        string(name: 'DESCRIPTION',       defaultValue: 'jenkins-fio-test',   description: 'Test run description (included in results directory name)')
+        booleanParam(name: 'PREPARE_MACHINES', defaultValue: true, description: 'Run --prepare-machine before test (format disks, install FIO)')
+    }
+
+    environment {
+        RESULTS_DIR  = '/root/fio-results'
+        BASTION_CONN = "${params.BASTION_USER}@${params.BASTION_HOST}"
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            mkdir -p ${RESULTS_DIR}
+                            podman pull ${params.CONTAINER_IMAGE} || true
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Prepare Machines') {
+            when { expression { params.PREPARE_MACHINES } }
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            podman run --rm \
+                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e DEVICES="${params.DEVICES}" \
+                              -e WIN_HOST_PATTERN="${params.WIN_HOST_PATTERN}" \
+                              -e WIN_DEVICES="${params.WIN_DEVICES}" \
+                              -e NAMESPACE="${params.NAMESPACE}" \
+                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
+                              -v /root/.kube/config:/root/.kube/config \
+                              --privileged \
+                              ${params.CONTAINER_IMAGE} \
+                              --prepare-machine
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Wait for Machines') {
+            when { expression { params.PREPARE_MACHINES } }
+            steps {
+                echo "Waiting 120 seconds for machines to settle after preparation..."
+                sleep time: 120, unit: 'SECONDS'
+            }
+        }
+
+        stage('Run FIO Test') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            podman run --rm \
+                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e DEVICES="${params.DEVICES}" \
+                              -e WIN_HOST_PATTERN="${params.WIN_HOST_PATTERN}" \
+                              -e WIN_DEVICES="${params.WIN_DEVICES}" \
+                              -e NAMESPACE="${params.NAMESPACE}" \
+                              -e TEST_SIZE="${params.TEST_SIZE}" \
+                              -e RUNTIME=${params.RUNTIME} \
+                              -e WIN_RUNTIME=${params.WIN_RUNTIME} \
+                              -e BLOCK_SIZES="${params.BLOCK_SIZES}" \
+                              -e WIN_BLOCK_SIZES="${params.WIN_BLOCK_SIZES}" \
+                              -e IO_PATTERNS="${params.IO_PATTERNS}" \
+                              -e WIN_IO_PATTERNS="${params.WIN_IO_PATTERNS}" \
+                              -e MIGRATE_WORKLOADS="${params.MIGRATE_WORKLOADS}" \
+                              -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
+                              -e DESCRIPTION="${params.DESCRIPTION}" \
+                              -v ${RESULTS_DIR}:/work/results \
+                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
+                              -v /root/.kube/config:/root/.kube/config \
+                              --privileged \
+                              ${params.CONTAINER_IMAGE}
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Collect Results') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        mkdir -p fio-results
+                        scp -o StrictHostKeyChecking=no -r \
+                            ${BASTION_CONN}:${RESULTS_DIR}/ ./fio-results/
+                    """
+                }
+            }
+        }
+
+        stage('Archive') {
+            steps {
+                archiveArtifacts artifacts: 'fio-results/**', allowEmptyArchive: true
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "FIO test completed successfully. Results archived as build artifacts."
+        }
+        failure {
+            echo "FIO test failed. Check the console output for details."
+        }
+        always {
+            echo "Test description: ${params.DESCRIPTION}"
+            echo "Hosts: Linux=${params.HOST_PATTERN}, Windows=${params.WIN_HOST_PATTERN}"
+            echo "Block sizes: Linux=${params.BLOCK_SIZES}, Windows=${params.WIN_BLOCK_SIZES}"
+            echo "I/O patterns: Linux=${params.IO_PATTERNS}, Windows=${params.WIN_IO_PATTERNS}"
+        }
+    }
+}

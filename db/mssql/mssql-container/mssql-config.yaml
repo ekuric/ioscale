@@ -1,0 +1,156 @@
+# MSSQL Server HammerDB TPCC Testing Configuration
+# This YAML file configures all aspects of the MSSQL Server performance testing script
+
+# Test Description (optional)
+# A description of this test run for logging and output file naming
+description: ""  # e.g., "my new test xx tyy" or leave empty for no description
+
+# Storage Configuration
+storage:
+  # Either mount_point or disk_list must be specified (set unused one to null)
+  mount_point: null               # Mount point to use for MSSQL data (e.g., "/perf1") - this mount point is used for data storage and must be present on the test machine.
+  disk_list: "/dev/vdc"          # Block device to use for MSSQL data (e.g., "/dev/vdc")
+  # Persistent mount: if set to "true", creates /etc/fstab entry for automatic mounting after reboot
+  # When empty or not set, mount is temporary (current behavior)
+  # When set to "true", the device will be automatically mounted on system reboot
+  persistent: ""  # Set to "true" to enable persistent mounts via /etc/fstab
+
+# Database Configuration
+database:
+  # Method 1: Simple list (for small numbers)
+  hosts: "vm1"                   # Space-separated list of VM hostnames - eg "vm1 vm2 vm3"
+  
+  # Method 2: Host range expansion (for large numbers)
+  # host_pattern: "mssql{1..200}"     # Bash-style range expansion: mssql1, mssql2, ..., mssql200
+  # host_pattern: "mssql-{001..050}"  # Zero-padded: mssql-001, mssql-002, ..., mssql-050
+  
+  # Method 3: Label-based selection (dynamic discovery)
+  # host_labels: "app=mssql-test"                # Select VMs with label app=mssql-test
+  # host_labels: "env=performance,tier=database"      # Multiple labels (AND condition)
+  
+  # Method 4: External host file
+  # host_file: "/path/to/mssql-hosts.txt"        # File with one hostname per line
+  
+  namespace: "default"           # Kubernetes namespace for VMs
+  warehouse_count: 50            # Number of warehouses for TPCC test
+  build_users: 50                # Virtual users for schema build step
+  test_duration: 15              # Test duration in minutes
+  mssql_pass: "mssqlpasswd1!"    # SA password for sqlcmd/ODBC
+  rebuilddb: true                # Build database before tests
+  rebuild_only: false            # Only rebuild database, skip tests/results
+  test_only: false               # Only run tests on existing database
+
+# Test Configuration
+test:
+  user_count: "1"               # Space-separated list of user counts to test, eg "1 2 4 8"
+  log_level: "INFO"             # Logging level (DEBUG, INFO, WARN, ERROR)
+
+# HammerDB Configuration
+hammerdb:
+  repo: "https://github.com/ekuric/fusion-access.git"  # Git repository URL
+  path: "/root/hammerdb-tpcc-wrapper-scripts"          # Scripts directory path
+
+# Retry and Monitoring Configuration
+retry:
+  # Retry interval in seconds (default: 30)
+  # How long to wait between retry attempts when host is not accessible
+  interval: 30
+  
+  # Maximum number of retry attempts (default: 10)
+  # Total number of times to retry a failed operation before giving up
+  max_retries: 10
+  
+  # Skip initial connectivity test (default: false)
+  # If true, skip connectivity test and proceed directly to command execution
+  # Useful if connectivity test is too strict or causes false failures
+  skip_connectivity_test: false
+
+# Task Monitoring Configuration
+monitoring:
+  # Check task status every N seconds for long-running tasks (default: 60)
+  # Only tasks running longer than 60 seconds will be monitored for reboots
+  # The script will detect if a host reboots during a long-running task and restart it
+  task_monitor_interval: 60
+
+# VM Migration Configuration (optional - virtctl mode only)
+# This allows VMs to be migrated during test execution to test migration resilience
+migrate:
+  # User counts that should trigger VM migration during test execution
+  # Migration will occur at the midpoint of the test duration
+  # Example: "4 8" will migrate VMs during tests with 4 and 8 users
+  # Leave empty or set to null to disable migration
+  user_counts: null  # Space-separated list, e.g., "4 8 16"
+  
+  # Interval between migrations in seconds (0 = parallel migration)
+  # If > 0, VMs will be migrated sequentially with this interval
+  # If 0, all VMs will be migrated in parallel
+  interval: 0
+
+# Example configurations for different environments
+# Uncomment and modify as needed
+
+# Development Environment (smaller scale, faster tests)
+# storage:
+#   disk_list: "/dev/vdb"
+# database:
+#   hosts: "dev-mssql1"
+#   warehouse_count: 10
+#   test_duration: 5
+# test:
+#   user_count: "1 2"
+
+# Production Environment (large scale, comprehensive tests)
+# storage:
+#   mount_point: "/perf1"
+# database:
+#   hosts: "prod-mssql1 prod-mssql2 prod-mssql3"
+#   warehouse_count: 500
+#   test_duration: 60
+# test:
+#   user_count: "50 100 200"
+
+# Large Scale Examples (100+ VMs):
+
+# 200 VMs with pattern expansion
+# storage:
+#   mount_point: "/perf1"
+# database:
+#   host_pattern: "mssql-{001..200}"
+#   namespace: "database-testing"
+#   warehouse_count: 1000
+#   test_duration: 120
+# test:
+#   user_count: "100 200 500"
+
+# Dynamic selection based on labels
+# storage:
+#   disk_list: "/dev/vdc"
+# database:
+#   host_labels: "workload=mssql-performance,env=production"
+#   namespace: "production"
+#   warehouse_count: 500
+#   test_duration: 180
+# test:
+#   user_count: "50 100 200 400"
+
+# Multi-environment testing with external host file
+# storage:
+#   mount_point: "/data"
+# database:
+#   host_file: "/etc/testing/mssql-production-vms.txt"
+#   namespace: "multi-env"
+#   warehouse_count: 750
+#   test_duration: 240
+# test:
+#   user_count: "25 50 100 200 300"
+
+# CI/CD Environment (minimal tests for validation)
+# storage:
+#   disk_list: "/dev/vdc"
+# database:
+#   hosts: "ci-mssql1"
+#   warehouse_count: 5
+#   test_duration: 2
+# test:
+#   user_count: "1"
+

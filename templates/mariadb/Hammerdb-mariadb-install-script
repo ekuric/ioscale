@@ -157,8 +157,17 @@ log_info "Stopping existing MariaDB instances..."
 systemctl stop mariadb || log_info "MariaDB was not running"
 
 log_info "Installing MariaDB packages..."
-dnf -y install mariadb mariadb-server mariadb-server-utils mariadb-errmsg || \
+dnf -y install mariadb mariadb-server mariadb-server-utils mariadb-errmsg mariadb-connector-c || \
     error_exit "Failed to install MariaDB packages"
+
+log_info "Creating libmysqlclient compatibility symlink for HammerDB..."
+if [ -f /usr/lib64/libmariadb.so.3 ] && [ ! -f /usr/lib64/libmysqlclient.so.21 ]; then
+    ln -sf /usr/lib64/libmariadb.so.3 /usr/lib64/libmysqlclient.so.21
+    ldconfig
+    log_info "Created symlink: libmysqlclient.so.21 -> libmariadb.so.3"
+else
+    log_info "libmysqlclient.so.21 already exists or libmariadb.so.3 not found, skipping symlink"
+fi
 
 # ----------------------------------------------------------------------------
 # Step 4: Copy MariaDB Setup Files
@@ -272,6 +281,17 @@ sed -i "s+^datadir=.*+datadir=${MOUNTPOINT}/mysql/data+" my.cnf || \
 sed -i "s/^innodb_buffer_pool_size=.*/innodb_buffer_pool_size=${BUFFER_POOL_SIZE}/" my.cnf || \
     error_exit "Failed to update innodb_buffer_pool_size in my.cnf"
 
+log_info "Ensuring socket path is set to /tmp/mysql.sock in my.cnf..."
+if grep -q "^\[mysqld\]" my.cnf; then
+    if ! grep -q "^socket=" my.cnf; then
+        sed -i '/^\[mysqld\]/a socket=/tmp/mysql.sock' my.cnf
+        log_info "Added socket=/tmp/mysql.sock to [mysqld] section"
+    else
+        sed -i "s+^socket=.*+socket=/tmp/mysql.sock+" my.cnf
+        log_info "Updated socket path to /tmp/mysql.sock"
+    fi
+fi
+
 log_info "Copying my.cnf to /etc/my.cnf..."
 cp my.cnf /etc/my.cnf || error_exit "Failed to copy my.cnf to /etc/"
 
@@ -282,6 +302,18 @@ log_step "Starting MariaDB and Setting Root Password"
 
 log_info "Restarting MariaDB service..."
 systemctl restart mariadb.service || error_exit "Failed to restart MariaDB service"
+
+log_info "Creating socket symlink for HammerDB compatibility..."
+ACTUAL_SOCKET=$(mysql -u root -e "SELECT @@socket;" -s --skip-column-names 2>/dev/null || echo "")
+if [ -n "${ACTUAL_SOCKET}" ] && [ "${ACTUAL_SOCKET}" != "/tmp/mysql.sock" ]; then
+    ln -sf "${ACTUAL_SOCKET}" /tmp/mysql.sock
+    log_info "Created symlink: /tmp/mysql.sock -> ${ACTUAL_SOCKET}"
+elif [ -S /var/lib/mysql/mysql.sock ] && [ ! -S /tmp/mysql.sock ]; then
+    ln -sf /var/lib/mysql/mysql.sock /tmp/mysql.sock
+    log_info "Created symlink: /tmp/mysql.sock -> /var/lib/mysql/mysql.sock"
+else
+    log_info "Socket at /tmp/mysql.sock is already available"
+fi
 
 log_info "Waiting for MariaDB to be ready..."
 sleep 10

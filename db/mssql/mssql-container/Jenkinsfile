@@ -1,0 +1,152 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP. Each user/team sets their own bastion here.')
+        string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host (e.g. root, admin)')
+        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for this bastion SSH key. Each bastion needs its own key registered in Jenkins (Manage Credentials > Add > SSH Username with private key). Use a unique ID per bastion, e.g. team-a-bastion, lab2-bastion.')
+        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/mssqldb-benchmark:latest', description: 'Container image to run')
+
+        string(name: 'HOST_PATTERN',      defaultValue: 'mssql-{1..10}',      description: 'Linux VM host pattern')
+        string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
+        string(name: 'DISK_LIST',         defaultValue: '/dev/vdc',            description: 'Block device for MSSQL data')
+        string(name: 'MOUNT_POINT',       defaultValue: '',                    description: 'Mount point (if set, DISK_LIST is ignored)')
+
+        string(name: 'WAREHOUSE_COUNT',   defaultValue: '50',                  description: 'TPCC warehouse count')
+        string(name: 'BUILD_USERS',       defaultValue: '50',                  description: 'Virtual users for schema build')
+        string(name: 'TEST_DURATION',     defaultValue: '15',                  description: 'Test duration in minutes')
+        string(name: 'USER_COUNT',        defaultValue: '1 10 20 50',          description: 'Space-separated user counts to test')
+        string(name: 'MSSQL_PASS',        defaultValue: 'mssqlpasswd1!',      description: 'SA password for sqlcmd/ODBC')
+
+        string(name: 'REBUILDDB',         defaultValue: 'true',                description: 'Build database before tests (true/false)')
+        string(name: 'REBUILD_ONLY',      defaultValue: 'false',               description: 'Only rebuild database, skip tests (true/false)')
+        string(name: 'TEST_ONLY',         defaultValue: 'false',               description: 'Only run tests on existing database (true/false)')
+
+        string(name: 'HAMMERDB_REPO',     defaultValue: 'https://github.com/ekuric/fusion-access.git', description: 'Git repo with HammerDB wrapper scripts')
+        string(name: 'HAMMERDB_PATH',     defaultValue: '/root/hammerdb-tpcc-wrapper-scripts',          description: 'Clone path on remote hosts')
+
+        string(name: 'MIGRATE_USER_COUNTS', defaultValue: '',                  description: 'User counts triggering VM migration (space-separated, empty = no migration)')
+        string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
+        string(name: 'DESCRIPTION',       defaultValue: 'jenkins-mssqldb-test', description: 'Test run description')
+        booleanParam(name: 'PREPARE_HOSTS', defaultValue: true, description: 'Run --prepare-hosts before test (install packages, clone repo, setup MSSQL)')
+    }
+
+    environment {
+        RESULTS_DIR  = '/root/mssqldb-results'
+        BASTION_CONN = "${params.BASTION_USER}@${params.BASTION_HOST}"
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            mkdir -p ${RESULTS_DIR}
+                            podman pull ${params.CONTAINER_IMAGE} || true
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Prepare Hosts') {
+            when { expression { params.PREPARE_HOSTS } }
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            podman run --rm \
+                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e NAMESPACE="${params.NAMESPACE}" \
+                              -e DISK_LIST="${params.DISK_LIST}" \
+                              -e MOUNT_POINT="${params.MOUNT_POINT}" \
+                              -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
+                              -e HAMMERDB_PATH="${params.HAMMERDB_PATH}" \
+                              -v /root/.ssh:/root/.ssh:ro \
+                              -v /root/.kube/config:/root/.kube/config \
+                              --privileged \
+                              ${params.CONTAINER_IMAGE} \
+                              --prepare-hosts
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Wait for Hosts') {
+            when { expression { params.PREPARE_HOSTS } }
+            steps {
+                echo "Waiting 120 seconds for hosts to settle after preparation..."
+                sleep time: 120, unit: 'SECONDS'
+            }
+        }
+
+        stage('Run MSSQL DB Test') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            podman run --rm \
+                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e NAMESPACE="${params.NAMESPACE}" \
+                              -e DISK_LIST="${params.DISK_LIST}" \
+                              -e MOUNT_POINT="${params.MOUNT_POINT}" \
+                              -e WAREHOUSE_COUNT=${params.WAREHOUSE_COUNT} \
+                              -e BUILD_USERS=${params.BUILD_USERS} \
+                              -e TEST_DURATION=${params.TEST_DURATION} \
+                              -e USER_COUNT="${params.USER_COUNT}" \
+                              -e MSSQL_PASS="${params.MSSQL_PASS}" \
+                              -e REBUILDDB=${params.REBUILDDB} \
+                              -e REBUILD_ONLY=${params.REBUILD_ONLY} \
+                              -e TEST_ONLY=${params.TEST_ONLY} \
+                              -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
+                              -e HAMMERDB_PATH="${params.HAMMERDB_PATH}" \
+                              -e MIGRATE_USER_COUNTS="${params.MIGRATE_USER_COUNTS}" \
+                              -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
+                              -e DESCRIPTION="${params.DESCRIPTION}" \
+                              -v ${RESULTS_DIR}:/work/results \
+                              -v /root/.ssh:/root/.ssh:ro \
+                              -v /root/.kube/config:/root/.kube/config \
+                              --privileged \
+                              ${params.CONTAINER_IMAGE}
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Collect Results') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        mkdir -p mssqldb-results
+                        scp -o StrictHostKeyChecking=no -r \
+                            ${BASTION_CONN}:${RESULTS_DIR}/ ./mssqldb-results/
+                    """
+                }
+            }
+        }
+
+        stage('Archive') {
+            steps {
+                archiveArtifacts artifacts: 'mssqldb-results/**', allowEmptyArchive: true
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "MSSQL DB test completed successfully. Results archived as build artifacts."
+        }
+        failure {
+            echo "MSSQL DB test failed. Check the console output for details."
+        }
+        always {
+            echo "Test description: ${params.DESCRIPTION}"
+            echo "Hosts: ${params.HOST_PATTERN}"
+            echo "Warehouses: ${params.WAREHOUSE_COUNT}, Build users: ${params.BUILD_USERS}"
+            echo "User counts: ${params.USER_COUNT}, Duration: ${params.TEST_DURATION}m"
+        }
+    }
+}
