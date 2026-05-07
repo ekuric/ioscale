@@ -157,17 +157,16 @@ log_info "Stopping existing MariaDB instances..."
 systemctl stop mariadb || log_info "MariaDB was not running"
 
 log_info "Installing MariaDB packages..."
-dnf -y install mariadb mariadb-server mariadb-server-utils mariadb-errmsg mariadb-connector-c || \
+dnf -y install mariadb mariadb-server mariadb-server-utils mariadb-errmsg || \
     error_exit "Failed to install MariaDB packages"
 
-log_info "Creating libmysqlclient compatibility symlink for HammerDB..."
-if [ -f /usr/lib64/libmariadb.so.3 ] && [ ! -f /usr/lib64/libmysqlclient.so.21 ]; then
-    ln -sf /usr/lib64/libmariadb.so.3 /usr/lib64/libmysqlclient.so.21
-    ldconfig
-    log_info "Created symlink: libmysqlclient.so.21 -> libmariadb.so.3"
-else
-    log_info "libmysqlclient.so.21 already exists or libmariadb.so.3 not found, skipping symlink"
+log_info "Installing MySQL client library for HammerDB mysqltcl compatibility..."
+if [ -L /usr/lib64/libmysqlclient.so.21 ]; then
+    log_info "Removing stale symlink at /usr/lib64/libmysqlclient.so.21..."
+    rm -f /usr/lib64/libmysqlclient.so.21
 fi
+dnf -y install mysql-libs || error_exit "Failed to install mysql-libs (required by HammerDB mysqltcl)"
+ldconfig
 
 # ----------------------------------------------------------------------------
 # Step 4: Copy MariaDB Setup Files
