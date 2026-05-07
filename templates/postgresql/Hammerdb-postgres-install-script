@@ -197,8 +197,27 @@ if [[ "$MOUNTPOINT" == *"none"* ]]; then
         error_exit "Disk device ${DISKS} does not exist or is not a block device"
     fi
     
-    log_info "Unmounting existing mount (if any)..."
-    umount /perf1 2>/dev/null || log_info "No existing mount to unmount"
+    log_info "Checking if ${DISKS} is mounted..."
+    MOUNTED_AT=$(findmnt -n -o TARGET --source "${DISKS}" 2>/dev/null || true)
+    if [ -n "${MOUNTED_AT}" ]; then
+        log_info "Device ${DISKS} is mounted at ${MOUNTED_AT}, unmounting..."
+        umount "${MOUNTED_AT}" 2>/dev/null || {
+            log_info "Regular unmount failed, trying lazy unmount..."
+            umount -l "${MOUNTED_AT}" 2>/dev/null || log_info "Lazy unmount also failed, continuing anyway"
+        }
+        sleep 2
+        if findmnt -n -o TARGET --source "${DISKS}" >/dev/null 2>&1; then
+            error_exit "Failed to unmount ${DISKS} - device is still mounted"
+        fi
+        log_info "Successfully unmounted ${DISKS} from ${MOUNTED_AT}"
+    else
+        log_info "Device ${DISKS} is not currently mounted"
+    fi
+
+    if mountpoint -q /perf1 2>/dev/null; then
+        log_info "Unmounting /perf1 (may be a different device)..."
+        umount /perf1 2>/dev/null || log_info "Could not unmount /perf1"
+    fi
     
     log_info "Formatting disk ${DISKS} with XFS..."
     mkfs.xfs -f "${DISKS}" || error_exit "Failed to format disk ${DISKS}"
