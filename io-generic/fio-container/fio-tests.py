@@ -717,6 +717,9 @@ class ConfigLoader:
                         pattern_hosts = [f"{prefix}{i}" for i in range(start, end + 1)]
                         windows_hosts.extend(pattern_hosts)
                         logger.info(f"Expanded Windows host pattern to {len(pattern_hosts)} hosts")
+                else:
+                    windows_hosts.extend(windows_host_pattern.split())
+                    logger.info(f"Using Windows host pattern as literal hostname(s): {windows_host_pattern}")
             
             self.config.windows_hosts = set(windows_hosts)
             

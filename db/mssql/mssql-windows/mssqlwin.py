@@ -14,12 +14,20 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+
+DEFAULT_TIMEOUT = 300
+DEFAULT_SCP_TIMEOUT = 300
+DEFAULT_TEST_TIMEOUT = 7200
+DEFAULT_PREPARE_TIMEOUT = 1200
+WATCHDOG_CHECK_INTERVAL = 30
+VM_LOOKUP_TIMEOUT = 10
+LABEL_QUERY_TIMEOUT = 30
+OC_COMMAND_TIMEOUT = 15
 
 
 # Configure logging early (before dependency checks)
@@ -57,6 +65,7 @@ class MSSQLWinConfig:
         self.mssql_total_iterations = None
         self.user_count: List[str] = []
         self.test_duration = None
+        self.rampup_time = None
         self.log_level = "INFO"
         self.description = ""
         self.copy_results = False
@@ -82,6 +91,13 @@ class MSSQLWinConfig:
         self.windows_disk_id = "1"
         self.windows_rebuild_timeout = None
         self.windows_mssql_service_name = None
+        self.timeout_default = DEFAULT_TIMEOUT
+        self.timeout_scp = DEFAULT_SCP_TIMEOUT
+        self.timeout_test = DEFAULT_TEST_TIMEOUT
+        self.timeout_prepare = DEFAULT_PREPARE_TIMEOUT
+        self.timeout_vm_lookup = VM_LOOKUP_TIMEOUT
+        self.timeout_label_query = LABEL_QUERY_TIMEOUT
+        self.timeout_oc_command = OC_COMMAND_TIMEOUT
 
 
 def get_vm_number(hostname: str) -> str:
@@ -121,14 +137,14 @@ class CommandExecutor:
             result = subprocess.run(
                 ["oc", "get", "vm", host, "-n", self.config.namespace],
                 capture_output=True,
-                timeout=10
+                timeout=self.config.timeout_vm_lookup
             )
             if result.returncode == 0:
                 return True
             result = subprocess.run(
                 ["oc", "get", "vmi", host, "-n", self.config.namespace],
                 capture_output=True,
-                timeout=10
+                timeout=self.config.timeout_vm_lookup
             )
             return result.returncode == 0
         except (subprocess.TimeoutExpired, FileNotFoundError):
@@ -191,10 +207,54 @@ class CommandExecutor:
             local_path, f"{ssh_user}@{host}:{remote_path}"
         ]
 
+    def copy_file_to_host(
+        self,
+        local_path: str,
+        host: str,
+        remote_path: str,
+        description: str = "file",
+        timeout: Optional[int] = None
+    ) -> bool:
+        """Copy a file to a remote host using SCP.
+        
+        Args:
+            local_path: Path to local file
+            host: Target host
+            remote_path: Destination path on remote host
+            description: Description for logging
+            timeout: Timeout in seconds (defaults to config.timeout_scp)
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        if timeout is None:
+            timeout = self.config.timeout_scp
+        if self.config.dry_run:
+            logger.info(f"DRY-RUN: Would copy {local_path} to {host}:{remote_path}")
+            return True
+        
+        try:
+            scp_cmd = self.get_scp_put_command(local_path, host, remote_path)
+            result = subprocess.run(scp_cmd, capture_output=True, timeout=timeout)
+            if result.returncode != 0:
+                logger.error(f"Failed to copy {description} to {host}")
+                if result.stderr:
+                    logger.error(
+                        result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr
+                    )
+                return False
+            return True
+        except subprocess.TimeoutExpired:
+            logger.error(f"Timeout copying {description} to {host} after {timeout}s")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to copy {description} to {host}: {e}")
+            return False
+
     def execute_command(self, host: str, command: str, description: str = "command",
                         timeout: Optional[int] = None) -> Tuple[bool, str]:
         """Execute command on remote host (streaming output)"""
-        cmd_timeout = timeout if timeout is not None else 300
+        cmd_timeout = timeout if timeout is not None else self.config.timeout_default
         if self.config.dry_run:
             logger.info(f"DRY-RUN: Would execute on {host}: {command}")
             return True, ""
@@ -253,13 +313,382 @@ class CommandExecutor:
         return False
 
 
+def modify_build_schema_content(
+    content: str,
+    warehouse_count: Optional[int],
+    build_users: Optional[str],
+    mssql_pass: Optional[str]
+) -> str:
+    """Modify build schema TCL content with configuration values.
+    
+    This function consolidates the duplicated schema modification logic
+    used in both build_database_windows() and run_tests_windows().
+    
+    Args:
+        content: The original TCL schema content
+        warehouse_count: Number of warehouses to configure
+        build_users: Number of virtual users for schema build
+        mssql_pass: MSSQL password
+        
+    Returns:
+        Modified TCL content with applied configuration
+    """
+    if warehouse_count:
+        content = re.sub(
+            r"^set warehouse .*?$",
+            "",
+            content,
+            flags=re.MULTILINE,
+        )
+        content = re.sub(
+            r"^diset tpcc mssqls_count_ware .*?$",
+            f"diset tpcc mssqls_count_ware {warehouse_count}",
+            content,
+            flags=re.MULTILINE,
+        )
+    
+    if build_users:
+        content = re.sub(
+            r"(?m)^\s*diset tpcc mssqls_num_vu .*?$",
+            f"diset tpcc mssqls_num_vu {build_users}",
+            content,
+        )
+        content = re.sub(
+            r"(?m)^\s*vuset\s+vu\s+.*?$",
+            f"vuset vu {build_users}",
+            content,
+        )
+        content = re.sub(
+            r"(?m)^\s*set\s+vu\s+.*?$",
+            f"set vu {build_users}",
+            content,
+        )
+        if not re.search(r"(?m)^\s*vuset\s+vu\s+\d+", content):
+            content = re.sub(
+                r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
+                f"vuset vu {build_users}\n\n\\1",
+                content,
+            )
+        if not re.search(r"(?m)^\s*set\s+vu\s+\d+", content):
+            content = re.sub(
+                r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
+                f"set vu {build_users}\n\n\\1",
+                content,
+            )
+        if not re.search(r"(?m)^\s*diset tpcc mssqls_num_vu\s+\d+", content):
+            content = re.sub(
+                r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
+                f"diset tpcc mssqls_num_vu {build_users}\n\n\\1",
+                content,
+            )
+    
+    if mssql_pass:
+        content = re.sub(
+            r"^diset connection mssqls_pass.*$",
+            f"diset connection mssqls_pass {mssql_pass}",
+            content,
+            flags=re.MULTILINE,
+        )
+    
+    return content
+
+
+def prepare_generated_files(
+    config: MSSQLWinConfig,
+    user_counts: List[str],
+    generated_dir: str,
+    legacy_generated_dir: str
+) -> Tuple[Optional[str], Optional[str], Dict[str, str], Dict[str, str], bool]:
+    """Prepare generated test files for all user counts.
+    
+    Returns:
+        Tuple of (generated_build_schema, generated_create_db, local_tcl_files, local_ps1_files, use_existing)
+    """
+    local_tcl_files: Dict[str, str] = {}
+    local_ps1_files: Dict[str, str] = {}
+    generated_build_schema = None
+    generated_create_db = None
+    use_existing_generated = False
+    used_generated_dir = generated_dir
+    
+    test_script_path = config.windows_test_script
+    local_test_script = config.windows_test_script_local
+    base_tcl = config.windows_hammerdb_test_script
+    
+    base_ps_name = ntpath.splitext(ntpath.basename(test_script_path))[0] if test_script_path else None
+    base_tcl_name = ntpath.splitext(ntpath.basename(base_tcl))[0] if base_tcl else "mssqls_tprocc_run"
+    
+    missing_templates = []
+    base_name_override = None
+    if not local_test_script or not os.path.exists(local_test_script):
+        missing_templates.append("test_script")
+    else:
+        base_name_override = ntpath.splitext(ntpath.basename(local_test_script))[0]
+    
+    if not config.windows_hammerdb_test_script_local or not os.path.exists(config.windows_hammerdb_test_script_local):
+        missing_templates.append("hammerdb_test_script")
+    else:
+        base_tcl_name = ntpath.splitext(ntpath.basename(config.windows_hammerdb_test_script_local))[0]
+    
+    if base_name_override:
+        base_ps_name = base_name_override
+    
+    if missing_templates:
+        generated_ok = True
+        for user_count in user_counts:
+            tcl_name = None
+            ps_name = None
+            if base_tcl_name:
+                if "$user_count" in base_tcl_name:
+                    tcl_base = base_tcl_name.replace("$user_count", str(user_count))
+                else:
+                    if re.search(r"\d+$", base_tcl_name):
+                        tcl_base = re.sub(r"\d+$", str(user_count), base_tcl_name)
+                    else:
+                        tcl_base = f"{base_tcl_name}{user_count}"
+                tcl_name = f"{tcl_base}.tcl"
+            if base_ps_name:
+                ps_name = f"{base_ps_name}_{user_count}.ps1"
+            if not ps_name or not tcl_name:
+                ps_pattern = re.compile(rf"^(.*)_{re.escape(str(user_count))}\.ps1$")
+                tcl_pattern = re.compile(rf"^(.*){re.escape(str(user_count))}\.tcl$")
+                for filename in os.listdir(generated_dir):
+                    if "buildschema" in filename.lower():
+                        continue
+                    if not ps_name:
+                        ps_match = ps_pattern.match(filename)
+                        if ps_match:
+                            base_ps_name = ps_match.group(1)
+                            ps_name = filename
+                    if not tcl_name:
+                        tcl_match = tcl_pattern.match(filename)
+                        if tcl_match:
+                            base_tcl_name = tcl_match.group(1)
+                            tcl_name = filename
+                    if ps_name and tcl_name:
+                        break
+            local_tcl_path = os.path.join(generated_dir, tcl_name) if tcl_name else ""
+            local_ps1_path = os.path.join(generated_dir, ps_name) if ps_name else ""
+            if not os.path.exists(local_tcl_path) or not os.path.exists(local_ps1_path):
+                generated_ok = False
+                break
+            local_tcl_files[user_count] = local_tcl_path
+            local_ps1_files[user_count] = local_ps1_path
+        
+        if not generated_ok and os.path.isdir(legacy_generated_dir):
+            logger.info(f"Falling back to legacy generated files in {legacy_generated_dir}")
+            generated_ok = True
+            used_generated_dir = legacy_generated_dir
+            for user_count in user_counts:
+                tcl_name = None
+                ps_name = None
+                if base_tcl_name:
+                    if "$user_count" in base_tcl_name:
+                        tcl_base = base_tcl_name.replace("$user_count", str(user_count))
+                    else:
+                        if re.search(r"\d+$", base_tcl_name):
+                            tcl_base = re.sub(r"\d+$", str(user_count), base_tcl_name)
+                        else:
+                            tcl_base = f"{base_tcl_name}{user_count}"
+                    tcl_name = f"{tcl_base}.tcl"
+                if base_ps_name:
+                    ps_name = f"{base_ps_name}_{user_count}.ps1"
+                if not ps_name or not tcl_name:
+                    ps_pattern = re.compile(rf"^(.*)_{re.escape(str(user_count))}\.ps1$")
+                    tcl_pattern = re.compile(rf"^(.*){re.escape(str(user_count))}\.tcl$")
+                    for filename in os.listdir(legacy_generated_dir):
+                        if "buildschema" in filename.lower():
+                            continue
+                        if not ps_name:
+                            ps_match = ps_pattern.match(filename)
+                            if ps_match:
+                                base_ps_name = ps_match.group(1)
+                                ps_name = filename
+                        if not tcl_name:
+                            tcl_match = tcl_pattern.match(filename)
+                            if tcl_match:
+                                base_tcl_name = tcl_match.group(1)
+                                tcl_name = filename
+                        if ps_name and tcl_name:
+                            break
+                local_tcl_path = os.path.join(legacy_generated_dir, tcl_name) if tcl_name else ""
+                local_ps1_path = os.path.join(legacy_generated_dir, ps_name) if ps_name else ""
+                if not os.path.exists(local_tcl_path) or not os.path.exists(local_ps1_path):
+                    generated_ok = False
+                    break
+                local_tcl_files[user_count] = local_tcl_path
+                local_ps1_files[user_count] = local_ps1_path
+        
+        if generated_ok:
+            use_existing_generated = True
+            logger.info(f"Using existing generated files in {used_generated_dir}")
+        else:
+            logger.error(
+                "Local test scripts are missing and generated files were not found. "
+                "Re-run with --test-script and --hammerdb-test-script or generate files first."
+            )
+            return None, None, {}, {}, False
+    
+    if not base_ps_name or not base_tcl_name:
+        logger.error("Unable to determine base script names for generated files")
+        return None, None, {}, {}, False
+    
+    return (generated_build_schema, generated_create_db, local_tcl_files, local_ps1_files, use_existing_generated)
+
+
+def generate_test_files_for_user(
+    config: MSSQLWinConfig,
+    user_count: str,
+    local_test_script: str,
+    tcl_template: str,
+    generated_dir: str,
+    base_ps_name: str,
+    base_tcl_name: str
+) -> Tuple[str, str]:
+    """Generate test files for a specific user count.
+    
+    Returns:
+        Tuple of (tcl_path, ps1_path)
+    """
+    if "$user_count" in base_tcl_name:
+        tcl_base = base_tcl_name.replace("$user_count", str(user_count))
+    else:
+        if re.search(r"\d+$", base_tcl_name):
+            tcl_base = re.sub(r"\d+$", str(user_count), base_tcl_name)
+        else:
+            tcl_base = f"{base_tcl_name}{user_count}"
+    tcl_name = f"{tcl_base}.tcl"
+    ps_name = f"{base_ps_name}_{user_count}.ps1"
+    
+    tcl_content = tcl_template
+    if config.windows_mssql_pass:
+        tcl_content = re.sub(
+            r"^diset connection mssqls_pass.*$",
+            f"diset connection mssqls_pass {config.windows_mssql_pass}",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    else:
+        tcl_content = re.sub(
+            r"^diset connection mssqls_pass.*\n?",
+            "",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    if config.test_duration:
+        tcl_content = re.sub(
+            r"^diset tpcc mssqls_duration.*$",
+            f"diset tpcc mssqls_duration {config.test_duration}",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    else:
+        tcl_content = re.sub(
+            r"^diset tpcc mssqls_duration.*\n?",
+            "",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    if config.rampup_time:
+        tcl_content = re.sub(
+            r"^diset tpcc mssqls_rampup.*$",
+            f"diset tpcc mssqls_rampup {config.rampup_time}",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    else:
+        tcl_content = re.sub(
+            r"^diset tpcc mssqls_rampup.*\n?",
+            "",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    if config.mssql_total_iterations:
+        tcl_content = re.sub(
+            r"^diset tpcc mssqls_total_iterations.*$",
+            f"diset tpcc mssqls_total_iterations {config.mssql_total_iterations}",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    else:
+        tcl_content = re.sub(
+            r"^diset tpcc mssqls_total_iterations.*\n?",
+            "",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    tcl_content = re.sub(
+        r"^diset tpcc mssqls_num_vu.*$",
+        f"diset tpcc mssqls_num_vu {user_count}",
+        tcl_content,
+        flags=re.MULTILINE,
+    )
+    tcl_content = re.sub(
+        r"^vuset\s+vu.*$",
+        f"vuset vu {user_count}",
+        tcl_content,
+        flags=re.MULTILINE,
+    )
+    if config.warehouse_count:
+        tcl_content = re.sub(
+            r"^diset tpcc mssqls_count_ware.*$",
+            f"diset tpcc mssqls_count_ware {config.warehouse_count}",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    else:
+        tcl_content = re.sub(
+            r"^diset tpcc mssqls_count_ware.*\n?",
+            "",
+            tcl_content,
+            flags=re.MULTILINE,
+        )
+    
+    windows_path = config.windows_hammerdb_path.rstrip("\\")
+    result_dir = config.windows_result_dir
+    
+    with open(local_test_script, "r", encoding="utf-8") as f:
+        ps_content = f.read()
+    ps_content = ps_content.replace("c:\\hammerdb-4.12", windows_path)
+    ps_content = ps_content.replace("hammerdb_path", windows_path)
+    ps_content = ps_content.replace("$results_dir", "$results")
+    ps_content = ps_content.replace("mssqls_tprocc_run_$user_count.tcl", tcl_name)
+    ps_content = re.sub(r"mssqls_tprocc_run\d+\.tcl", tcl_name, ps_content)
+    ps_content = ps_content.replace("$user_count", str(user_count))
+    vu_label = f"{int(user_count):03d}vu"
+    ps_content = re.sub(
+        r"mssqls_tprocc_\d+vu_run1",
+        f"mssqls_tprocc_{vu_label}_run1",
+        ps_content,
+    )
+    if "$env:HAMMERDB_RESULT_DIR" not in ps_content and "$results" not in ps_content:
+        results_bootstrap = "\n".join([
+            f'$env:HAMMERDB_RESULT_DIR = "{result_dir}"',
+            "$results = $env:HAMMERDB_RESULT_DIR",
+            'if (-not $results) { $results = "results" }',
+            "New-Item -Path $results -ItemType Directory -Force | Out-Null",
+            "",
+        ])
+        ps_content = results_bootstrap + ps_content
+    ps_content = re.sub(r"(?i)(?<!\$)\bresults[\\/]+", r"$results\\", ps_content)
+    
+    local_tcl_path = os.path.join(generated_dir, tcl_name)
+    local_ps1_path = os.path.join(generated_dir, ps_name)
+    with open(local_tcl_path, "w", encoding="utf-8") as f:
+        f.write(tcl_content)
+    with open(local_ps1_path, "w", encoding="utf-8") as f:
+        f.write(ps_content)
+    
+    return local_tcl_path, local_ps1_path
+
+
 class ConfigLoader:
     """Loads and validates configuration from YAML file"""
 
     def __init__(self, config: MSSQLWinConfig):
         self.config = config
 
-    def load_config(self) -> None:
+    def load_config(self) -> None:  # type: ignore[override]
         if not os.path.exists(self.config.config_file):
             logger.error(f"Configuration file '{self.config.config_file}' not found")
             sys.exit(1)
@@ -288,6 +717,7 @@ class ConfigLoader:
             self.config.build_users = str(build_users)
         self.config.mssql_total_iterations = database.get("mssql_total_iterations")
         self.config.test_duration = database.get("test_duration")
+        self.config.rampup_time = database.get("rampup_time")
         db_mssql_pass = database.get("mssql_pass")
         if db_mssql_pass == "null":
             db_mssql_pass = None
@@ -409,6 +839,27 @@ class ConfigLoader:
         if windows_rebuilddb == "false" or windows_rebuilddb is False:
             self.config.windows_rebuilddb = False
 
+        timeouts_cfg = yaml_data.get("timeouts", {})
+        if timeouts_cfg:
+            self.config.timeout_default = self._parse_timeout(timeouts_cfg, "default", self.config.timeout_default)
+            self.config.timeout_scp = self._parse_timeout(timeouts_cfg, "scp", self.config.timeout_scp)
+            self.config.timeout_test = self._parse_timeout(timeouts_cfg, "test", self.config.timeout_test)
+            self.config.timeout_prepare = self._parse_timeout(timeouts_cfg, "prepare", self.config.timeout_prepare)
+            self.config.timeout_vm_lookup = self._parse_timeout(timeouts_cfg, "vm_lookup", self.config.timeout_vm_lookup)
+            self.config.timeout_label_query = self._parse_timeout(timeouts_cfg, "label_query", self.config.timeout_label_query)
+            self.config.timeout_oc_command = self._parse_timeout(timeouts_cfg, "oc_command", self.config.timeout_oc_command)
+
+    @staticmethod
+    def _parse_timeout(timeouts_cfg: Dict, key: str, default: int) -> int:
+        val = timeouts_cfg.get(key)
+        if val in (None, "", "null"):
+            return default
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            logger.warning(f"Invalid timeout.{key}: {val}, using default {default}")
+            return default
+
     def _get_db_hosts(self, yaml_data: Dict) -> List[str]:
         database = yaml_data.get("database", {})
         host_pattern = database.get("host_pattern")
@@ -439,7 +890,7 @@ class ConfigLoader:
                          "-l", host_labels, "-o", "jsonpath={range .items[*]}{.metadata.name}{' '}{end}"],
                         capture_output=True,
                         text=True,
-                        timeout=30
+                        timeout=self.config.timeout_label_query
                     )
                     if result.returncode == 0 and result.stdout.strip():
                         hosts = result.stdout.strip().split()
@@ -539,6 +990,8 @@ def display_config(config: MSSQLWinConfig) -> None:
     logger.info(f"Windows disk_id: {config.windows_disk_id}")
     logger.info(f"Windows rebuilddb: {'ENABLED' if config.windows_rebuilddb else 'DISABLED'}")
     logger.info(f"Log level: {config.log_level}")
+    logger.info(f"Timeouts - default: {config.timeout_default}s, scp: {config.timeout_scp}s, test: {config.timeout_test}s, prepare: {config.timeout_prepare}s")
+    logger.info(f"Timeouts - vm_lookup: {config.timeout_vm_lookup}s, label_query: {config.timeout_label_query}s, oc_command: {config.timeout_oc_command}s")
 
 
 def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None:
@@ -590,63 +1043,18 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
         os.makedirs(generated_dir, exist_ok=True)
         with open(config.windows_build_schema_file_local, "r", encoding="utf-8") as f:
             build_schema_content = f.read()
-        if config.warehouse_count:
-            build_schema_content = re.sub(
-                r"^set warehouse .*?$",
-                "",
-                build_schema_content,
-                flags=re.MULTILINE,
-            )
-            build_schema_content = re.sub(
-                r"^diset tpcc mssqls_count_ware .*?$",
-                f"diset tpcc mssqls_count_ware {config.warehouse_count}",
-                build_schema_content,
-                flags=re.MULTILINE,
-            )
+        
+        build_schema_content = modify_build_schema_content(
+            build_schema_content,
+            config.warehouse_count,
+            config.build_users,
+            config.windows_mssql_pass
+        )
         if config.build_users:
-            build_schema_content = re.sub(
-                r"(?m)^\s*diset tpcc mssqls_num_vu .*?$",
-                f"diset tpcc mssqls_num_vu {config.build_users}",
-                build_schema_content,
-            )
-            build_schema_content = re.sub(
-                r"(?m)^\s*vuset\s+vu\s+.*?$",
-                f"vuset vu {config.build_users}",
-                build_schema_content,
-            )
-            build_schema_content = re.sub(
-                r"(?m)^\s*set\s+vu\s+.*?$",
-                f"set vu {config.build_users}",
-                build_schema_content,
-            )
             logger.info(
                 f"Updated build schema VU settings to {config.build_users} virtual users"
             )
-            if not re.search(r"(?m)^\s*vuset\s+vu\s+\d+", build_schema_content):
-                build_schema_content = re.sub(
-                    r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
-                    f"vuset vu {config.build_users}\n\n\\1",
-                    build_schema_content,
-                )
-            if not re.search(r"(?m)^\s*set\s+vu\s+\d+", build_schema_content):
-                build_schema_content = re.sub(
-                    r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
-                    f"set vu {config.build_users}\n\n\\1",
-                    build_schema_content,
-                )
-            if not re.search(r"(?m)^\s*diset tpcc mssqls_num_vu\s+\d+", build_schema_content):
-                build_schema_content = re.sub(
-                    r"(?m)^(puts\s+\"SCHEMA BUILD STARTED\"\s*)$",
-                    f"diset tpcc mssqls_num_vu {config.build_users}\n\n\\1",
-                    build_schema_content,
-                )
-        if config.windows_mssql_pass:
-            build_schema_content = re.sub(
-                r"^diset connection mssqls_pass.*$",
-                f"diset connection mssqls_pass {config.windows_mssql_pass}",
-                build_schema_content,
-                flags=re.MULTILINE,
-            )
+        
         schema_base = ntpath.splitext(ntpath.basename(config.windows_build_schema_file_local))[0]
         schema_suffix = f"-wh{config.warehouse_count}" if config.warehouse_count else ""
         generated_build_schema = os.path.join(generated_dir, f"{schema_base}{schema_suffix}.tcl")
@@ -717,47 +1125,16 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
         for host in config.db_hosts:
             if config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
                 remote_sql = f"{windows_path}\\{os.path.basename(config.windows_create_db_sql_local)}"
-                if not config.dry_run:
-                    try:
-                        scp_cmd = executor.get_scp_put_command(config.windows_create_db_sql_local, host, remote_sql)
-                        result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
-                        if result.returncode != 0:
-                            logger.error(f"Failed to copy create_db.sql to {host}")
-                            if result.stderr:
-                                logger.error(result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr)
-                            raise RuntimeError("SCP failed")
-                    except Exception as e:
-                        logger.error(f"Failed to copy create_db.sql to {host}: {e}")
-                        raise
+                if not executor.copy_file_to_host(config.windows_create_db_sql_local, host, remote_sql, "create_db.sql"):
+                    raise RuntimeError(f"Failed to copy create_db.sql to {host}")
             if config.windows_rebuild_script_local and os.path.exists(config.windows_rebuild_script_local):
                 remote_script = f"{windows_path}\\{os.path.basename(config.windows_rebuild_script_local)}"
-                if not config.dry_run:
-                    try:
-                        scp_cmd = executor.get_scp_put_command(config.windows_rebuild_script_local, host, remote_script)
-                        result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
-                        if result.returncode != 0:
-                            logger.error(f"Failed to copy rebuild script to {host}")
-                            if result.stderr:
-                                logger.error(result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr)
-                            raise RuntimeError("SCP failed")
-                    except Exception as e:
-                        logger.error(f"Failed to copy rebuild script to {host}: {e}")
-                        raise
+                if not executor.copy_file_to_host(config.windows_rebuild_script_local, host, remote_script, "rebuild script"):
+                    raise RuntimeError(f"Failed to copy rebuild script to {host}")
             if config.windows_build_schema_file_local and os.path.exists(config.windows_build_schema_file_local):
                 remote_schema = f"{windows_path}\\{os.path.basename(config.windows_build_schema_file_local)}"
-                if not config.dry_run:
-                    try:
-                        logger.info(f"Copying build schema file to {host}: {remote_schema}")
-                        scp_cmd = executor.get_scp_put_command(config.windows_build_schema_file_local, host, remote_schema)
-                        result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
-                        if result.returncode != 0:
-                            logger.error(f"Failed to copy build schema file to {host}")
-                            if result.stderr:
-                                logger.error(result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr)
-                            raise RuntimeError("SCP failed")
-                    except Exception as e:
-                        logger.error(f"Failed to copy build schema file to {host}: {e}")
-                        raise
+                if not executor.copy_file_to_host(config.windows_build_schema_file_local, host, remote_schema, "build schema"):
+                    raise RuntimeError(f"Failed to copy build schema to {host}")
             future = pool.submit(
                 executor.execute_command,
                 host,
@@ -793,7 +1170,7 @@ def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) 
                 host,
                 cmd,
                 f"Preparing disk (DiskID={disk_id})",
-                1200
+                config.timeout_prepare
             ))
         for future in as_completed(futures):
             success, output = future.result()
@@ -816,7 +1193,7 @@ def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) 
                 host,
                 move_cmd,
                 f"Moving HammerDB to D: on {host} and creating data directories",
-                1200
+                config.timeout_prepare
             ))
         for future in as_completed(futures):
             success, output = future.result()
@@ -825,37 +1202,13 @@ def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) 
                 sys.exit(1)
 
 
-def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None:
-    logger.info("Running performance tests on Windows hosts...")
-    if not config.windows_test_script:
-        logger.warning("windows.test_script is not set; will try using generated files if present")
-    if not config.windows_result_dir:
-        base_path = config.windows_hammerdb_path.rstrip("\\")
-        config.windows_result_dir = f"{base_path}\\results"
-
-    num_hosts = len(config.db_hosts)
-    run_date = datetime.now().strftime("%Y.%m.%d")
-    windows_path = config.windows_hammerdb_path.rstrip("\\")
-    test_script_path = config.windows_test_script
-    local_test_script = config.windows_test_script_local
-    result_dir = config.windows_result_dir
-    base_tcl = config.windows_hammerdb_test_script
-
-    if not config.user_count:
-        logger.error("test.user_count is not set; cannot generate per-user scripts")
-        return
-    user_counts = config.user_count
-    logger.info(
-        f"Starting Windows test runs for users: {', '.join(user_counts)} "
-        f"on hosts: {', '.join(config.db_hosts)}"
-    )
-
+def generate_test_files(config: MSSQLWinConfig) -> None:
+    """Generate customized build schema and create_db.sql from templates.
+    Must run before build_database_windows() so the DB build uses correct values."""
     config_dir = os.path.dirname(os.path.abspath(config.config_file)) if config.config_file else os.getcwd()
     generated_dir = os.path.join(config_dir, ".mssqltestfiles-generated")
-    legacy_generated_dir = os.path.join(config_dir, ".mssqlwin-generated")
     os.makedirs(generated_dir, exist_ok=True)
 
-    generated_build_schema = None
     if config.windows_build_schema_file_local and os.path.exists(config.windows_build_schema_file_local):
         with open(config.windows_build_schema_file_local, "r", encoding="utf-8") as f:
             build_schema_content = f.read()
@@ -919,36 +1272,44 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
         with open(generated_build_schema, "w", encoding="utf-8") as f:
             f.write(build_schema_content)
         config.windows_build_schema_file_local = generated_build_schema
+        logger.info(f"Generated build schema: {generated_build_schema}")
 
-    generated_create_db = None
-    if config.generate_only and config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
+    if config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
         with open(config.windows_create_db_sql_local, "r", encoding="utf-8") as f:
             create_db_content = f.read()
         if config.warehouse_count:
             data_size_mb = int(config.warehouse_count) * 150
             log_size_mb = int(config.warehouse_count) * 75
             size_matches = list(re.finditer(r"(?i)^\s*SIZE\s*=\s*\d+MB", create_db_content, flags=re.MULTILINE))
+            max_log_size_mb = max(log_size_mb * 2, data_size_mb)
             if len(size_matches) >= 2:
+                sizes = [data_size_mb, log_size_mb]
+                replace_idx = [0]
+
+                def _replace_size(m):
+                    idx = replace_idx[0]
+                    replace_idx[0] += 1
+                    if idx < len(sizes):
+                        return f"   SIZE       = {sizes[idx]}MB"
+                    return m.group(0)
+
                 create_db_content = re.sub(
                     r"(?i)^\s*SIZE\s*=\s*\d+MB",
-                    f"   SIZE       = {data_size_mb}MB",
+                    _replace_size,
                     create_db_content,
-                    count=1,
                     flags=re.MULTILINE,
                 )
                 create_db_content = re.sub(
-                    r"(?i)^\s*SIZE\s*=\s*\d+MB",
-                    f"   SIZE       = {log_size_mb}MB",
+                    r"(?i)^\s*MAXSIZE\s*=\s*\d+MB",
+                    f"   MAXSIZE    = {max_log_size_mb}MB",
                     create_db_content,
-                    count=1,
                     flags=re.MULTILINE,
                 )
-            create_db_content = re.sub(
-                r"(?i)^\s*MAXSIZE\s*=\s*\d+MB",
-                f"   MAXSIZE    = {data_size_mb}MB",
-                create_db_content,
-                flags=re.MULTILINE,
-            )
+            else:
+                logger.warning(
+                    f"Expected 2 SIZE entries in create_db.sql but found {len(size_matches)}; "
+                    "skipping SIZE/MAXSIZE substitution to avoid invalid SQL"
+                )
         else:
             logger.warning("warehouse_count is not set; create_db.sql will not be updated.")
         create_db_base = ntpath.splitext(ntpath.basename(config.windows_create_db_sql_local))[0]
@@ -957,6 +1318,41 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
         with open(generated_create_db, "w", encoding="utf-8") as f:
             f.write(create_db_content)
         config.windows_create_db_sql_local = generated_create_db
+        logger.info(f"Generated create_db.sql: {generated_create_db}")
+
+
+def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None:
+    logger.info("Running performance tests on Windows hosts...")
+    if not config.windows_test_script:
+        logger.warning("windows.test_script is not set; will try using generated files if present")
+    if not config.windows_result_dir:
+        base_path = config.windows_hammerdb_path.rstrip("\\")
+        config.windows_result_dir = f"{base_path}\\results"
+
+    num_hosts = len(config.db_hosts)
+    run_date = datetime.now().strftime("%Y.%m.%d")
+    windows_path = config.windows_hammerdb_path.rstrip("\\")
+    test_script_path = config.windows_test_script
+    local_test_script = config.windows_test_script_local
+    result_dir = config.windows_result_dir
+    base_tcl = config.windows_hammerdb_test_script
+
+    if not config.user_count:
+        logger.error("test.user_count is not set; cannot generate per-user scripts")
+        return
+    user_counts = config.user_count
+    logger.info(
+        f"Starting Windows test runs for users: {', '.join(user_counts)} "
+        f"on hosts: {', '.join(config.db_hosts)}"
+    )
+
+    config_dir = os.path.dirname(os.path.abspath(config.config_file)) if config.config_file else os.getcwd()
+    generated_dir = os.path.join(config_dir, ".mssqltestfiles-generated")
+    legacy_generated_dir = os.path.join(config_dir, ".mssqlwin-generated")
+    os.makedirs(generated_dir, exist_ok=True)
+
+    generated_build_schema = None
+    generated_create_db = None
 
     local_ps1_files = {}
     local_tcl_files = {}
@@ -1151,6 +1547,13 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                 tcl_content,
                 flags=re.MULTILINE,
             )
+        if config.rampup_time:
+            tcl_content = re.sub(
+                r"^diset tpcc mssqls_rampup.*$",
+                f"diset tpcc mssqls_rampup {config.rampup_time}",
+                tcl_content,
+                flags=re.MULTILINE,
+            )
         if config.mssql_total_iterations:
             tcl_content = re.sub(
                 r"^diset tpcc mssqls_total_iterations.*$",
@@ -1293,16 +1696,10 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                 remote_ps1 = config.windows_test_script or f"{windows_path}\\{ntpath.basename(local_ps1_files[user_count])}"
                 remote_tcl = f"{windows_path}\\{ntpath.basename(local_tcl_files[user_count])}"
                 if not config.dry_run:
-                    scp_cmd = executor.get_scp_put_command(local_ps1_files[user_count], host, remote_ps1)
-                    result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
-                    if result.returncode != 0:
-                        stderr = result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr
-                        raise RuntimeError(f"Failed to copy test script to {host}: {stderr}")
-                    scp_cmd = executor.get_scp_put_command(local_tcl_files[user_count], host, remote_tcl)
-                    result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
-                    if result.returncode != 0:
-                        stderr = result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr
-                        raise RuntimeError(f"Failed to copy hammerdb test script to {host}: {stderr}")
+                    if not executor.copy_file_to_host(local_ps1_files[user_count], host, remote_ps1, "test script"):
+                        raise RuntimeError(f"Failed to copy test script to {host}")
+                    if not executor.copy_file_to_host(local_tcl_files[user_count], host, remote_tcl, "hammerdb test script"):
+                        raise RuntimeError(f"Failed to copy hammerdb test script to {host}")
 
             stage_futures = [pool.submit(stage_host, host) for host in config.db_hosts]
             for future in as_completed(stage_futures):
@@ -1356,7 +1753,7 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     host,
                     ps_cmd,
                     "Ensuring SQL Server service is running",
-                    timeout=300
+                    timeout=config.timeout_default
                 )
                 if not success:
                     raise RuntimeError(output)
@@ -1416,7 +1813,7 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     host,
                     cmd,
                     f"Running Windows test for {user_count} users",
-                    7200
+                    config.timeout_test
                 )
                 if success:
                     return True, output
@@ -1431,14 +1828,14 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
                     host,
                     cmd,
                     f"Retrying Windows test for {user_count} users",
-                    7200
+                    config.timeout_test
                 )
 
             def run_test_with_watchdog(host: str, user_count: str, cmd: str) -> Tuple[bool, str]:
                 with ThreadPoolExecutor(max_workers=1) as monitor_pool:
                     future = monitor_pool.submit(run_test_on_host, host, user_count, cmd)
                     while True:
-                        done, _ = wait([future], timeout=30, return_when=FIRST_COMPLETED)
+                        done, _ = wait([future], timeout=WATCHDOG_CHECK_INTERVAL, return_when=FIRST_COMPLETED)
                         if done:
                             return future.result()
                         status = get_mssql_service_status(host)
@@ -1578,7 +1975,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
 
         try:
             scp_cmd = executor.get_scp_command(source, destination)
-            result = subprocess.run(scp_cmd, capture_output=True, timeout=300)
+            result = subprocess.run(scp_cmd, capture_output=True, timeout=config.timeout_scp)
             if result.returncode != 0:
                 logger.warning("SCP failed, trying base64 fallback...")
                 ps_cmd = (
@@ -1587,7 +1984,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     "Write-Output $b64"
                 )
                 cmd = build_powershell_command(ps_cmd)
-                success, output = executor.execute_command(host, cmd, "Reading results archive (base64)", timeout=300)
+                success, output = executor.execute_command(host, cmd, "Reading results archive (base64)", timeout=config.timeout_scp)
                 if success:
                     decoded_data = base64.b64decode(output.strip())
                     with open(destination, "wb") as f:
@@ -1633,7 +2030,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     "-l", f"kubevirt.io/domain={host}",
                     "-o", "jsonpath={.items[0].metadata.name}"
                 ]
-                pod_result = subprocess.run(pod_cmd, capture_output=True, text=True, timeout=15)
+                pod_result = subprocess.run(pod_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 pod_name = pod_result.stdout.strip()
                 if pod_result.returncode != 0 or not pod_name:
                     prefix = f"virt-launcher-{host}"
@@ -1641,7 +2038,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                         "oc", "get", "pod", "-n", config.namespace,
                         "-o", "jsonpath={.items[*].metadata.name}"
                     ]
-                    list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=15)
+                    list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                     if list_result.returncode == 0 and list_result.stdout.strip():
                         for candidate in list_result.stdout.split():
                             if candidate.startswith(prefix):
@@ -1652,7 +2049,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     continue
 
                 list_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "list", "--state-running", "--name"]
-                list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=15)
+                list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 domain_name = ""
                 if list_result.returncode == 0:
                     for line in list_result.stdout.splitlines():
@@ -1664,7 +2061,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     continue
 
                 dump_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dumpxml", domain_name]
-                dump_result = subprocess.run(dump_cmd, capture_output=True, text=True, timeout=30)
+                dump_result = subprocess.run(dump_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 if dump_result.returncode != 0 or not dump_result.stdout.strip():
                     logger.warning(f"VM dump failed for {host}: {dump_result.stderr.strip()}")
                 else:
@@ -1674,7 +2071,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     logger.info(f"Saved VM dumpxml for {host} to {dump_path}")
 
                 info_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dominfo", domain_name]
-                info_result = subprocess.run(info_cmd, capture_output=True, text=True, timeout=15)
+                info_result = subprocess.run(info_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 if info_result.returncode != 0 or not info_result.stdout.strip():
                     logger.warning(f"VM dominfo failed for {host}: {info_result.stderr.strip()}")
                 else:
@@ -1684,7 +2081,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     logger.info(f"Saved VM dominfo for {host} to {info_path}")
 
                 stats_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domstats", domain_name]
-                stats_result = subprocess.run(stats_cmd, capture_output=True, text=True, timeout=15)
+                stats_result = subprocess.run(stats_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 if stats_result.returncode != 0 or not stats_result.stdout.strip():
                     logger.warning(f"VM domstats failed for {host}: {stats_result.stderr.strip()}")
                 else:
@@ -1694,7 +2091,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     logger.info(f"Saved VM domstats for {host} to {stats_path}")
 
                 blk_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domblklist", domain_name]
-                blk_result = subprocess.run(blk_cmd, capture_output=True, text=True, timeout=15)
+                blk_result = subprocess.run(blk_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 if blk_result.returncode != 0 or not blk_result.stdout.strip():
                     logger.warning(f"VM domblklist failed for {host}: {blk_result.stderr.strip()}")
                 else:
@@ -1704,7 +2101,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     logger.info(f"Saved VM domblklist for {host} to {blk_path}")
 
                 if_cmd = ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domiflist", domain_name]
-                if_result = subprocess.run(if_cmd, capture_output=True, text=True, timeout=15)
+                if_result = subprocess.run(if_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 if if_result.returncode != 0 or not if_result.stdout.strip():
                     logger.warning(f"VM domiflist failed for {host}: {if_result.stderr.strip()}")
                 else:
@@ -1714,7 +2111,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     logger.info(f"Saved VM domiflist for {host} to {if_path}")
 
                 vmi_cmd = ["oc", "get", "vmi", host, "-n", config.namespace, "-o", "yaml"]
-                vmi_result = subprocess.run(vmi_cmd, capture_output=True, text=True, timeout=15)
+                vmi_result = subprocess.run(vmi_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 if vmi_result.returncode != 0 or not vmi_result.stdout.strip():
                     logger.warning(f"VMI yaml failed for {host}: {vmi_result.stderr.strip()}")
                 else:
@@ -1724,7 +2121,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     logger.info(f"Saved VMI yaml for {host} to {vmi_path}")
 
                 pod_yaml_cmd = ["oc", "get", "pod", pod_name, "-n", config.namespace, "-o", "yaml"]
-                pod_yaml_result = subprocess.run(pod_yaml_cmd, capture_output=True, text=True, timeout=15)
+                pod_yaml_result = subprocess.run(pod_yaml_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 if pod_yaml_result.returncode != 0 or not pod_yaml_result.stdout.strip():
                     logger.warning(f"virt-launcher pod yaml failed for {host}: {pod_yaml_result.stderr.strip()}")
                 else:
@@ -1734,7 +2131,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
                     logger.info(f"Saved virt-launcher pod yaml for {host} to {pod_yaml_path}")
 
                 vmi_desc_cmd = ["oc", "describe", "vmi", host, "-n", config.namespace]
-                vmi_desc_result = subprocess.run(vmi_desc_cmd, capture_output=True, text=True, timeout=15)
+                vmi_desc_result = subprocess.run(vmi_desc_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
                 if vmi_desc_result.returncode != 0 or not vmi_desc_result.stdout.strip():
                     logger.warning(f"VMI describe failed for {host}: {vmi_desc_result.stderr.strip()}")
                 else:
@@ -1747,7 +2144,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
 
         try:
             pods_cmd = ["oc", "get", "pods", "-o", "wide", "-n", config.namespace]
-            pods_result = subprocess.run(pods_cmd, capture_output=True, text=True, timeout=30)
+            pods_result = subprocess.run(pods_cmd, capture_output=True, text=True, timeout=config.timeout_oc_command)
             if pods_result.returncode != 0 or not pods_result.stdout.strip():
                 logger.warning(
                     f"Failed to collect pod list for namespace {config.namespace}: {pods_result.stderr.strip()}"
@@ -1823,31 +2220,26 @@ EXAMPLES:
         if not os.path.exists(args.test_script):
             logger.error(f"Test script not found: {args.test_script}")
             sys.exit(1)
-        config.windows_test_script = args.test_script
         config.windows_test_script_local = args.test_script
     if args.build_schema_file:
         if not os.path.exists(args.build_schema_file):
             logger.error(f"Build schema file not found: {args.build_schema_file}")
             sys.exit(1)
-        config.windows_build_schema_file = args.build_schema_file
         config.windows_build_schema_file_local = args.build_schema_file
     if args.rebuild_script:
         if not os.path.exists(args.rebuild_script):
             logger.error(f"Rebuild script not found: {args.rebuild_script}")
             sys.exit(1)
-        config.windows_rebuild_script = args.rebuild_script
         config.windows_rebuild_script_local = args.rebuild_script
     if args.create_db:
         if not os.path.exists(args.create_db):
             logger.error(f"create_db.sql not found: {args.create_db}")
             sys.exit(1)
-        config.windows_create_db_sql = args.create_db
         config.windows_create_db_sql_local = args.create_db
     if args.hammerdb_test_script:
         if not os.path.exists(args.hammerdb_test_script):
             logger.error(f"HammerDB test script not found: {args.hammerdb_test_script}")
             sys.exit(1)
-        config.windows_hammerdb_test_script = args.hammerdb_test_script
         config.windows_hammerdb_test_script_local = args.hammerdb_test_script
 
     loader = ConfigLoader(config)
@@ -1897,6 +2289,10 @@ EXAMPLES:
         results_dir = f"mssql-results-{results_date}-{sanitized_desc}"
     else:
         results_dir = f"mssql-results-{results_date}"
+
+    # Always generate customized test files (create_db.sql, build schema)
+    # before any build or test step
+    generate_test_files(config)
 
     if config.generate_only:
         if config.windows_rebuild_only or config.windows_test_only or config.copy_results:

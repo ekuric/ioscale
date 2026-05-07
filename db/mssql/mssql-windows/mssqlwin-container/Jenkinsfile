@@ -1,0 +1,143 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP. Each user/team sets their own bastion here.')
+        string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host (e.g. root, admin)')
+        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for this bastion SSH key. Each bastion needs its own key registered in Jenkins (Manage Credentials > Add > SSH Username with private key). Use a unique ID per bastion, e.g. team-a-bastion, lab2-bastion.')
+        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/benchmark:latest', description: 'Container image to run')
+
+        string(name: 'HOST_PATTERN',      defaultValue: 'vm-{1..2}',          description: 'Windows VM host pattern')
+        string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
+
+        string(name: 'WAREHOUSE_COUNT',   defaultValue: '500',                 description: 'TPCC warehouse count')
+        string(name: 'BUILD_USERS',       defaultValue: '100',                 description: 'Virtual users for schema build')
+        string(name: 'USER_COUNT',        defaultValue: '1 10',               description: 'Space-separated user counts to test')
+        string(name: 'TEST_DURATION',     defaultValue: '1',                   description: 'Test duration in minutes')
+        string(name: 'MSSQL_TOTAL_ITERATIONS', defaultValue: '10000000',       description: 'Iteration limit')
+        string(name: 'RAMPUP_TIME',       defaultValue: '1',                   description: 'Ramp-up time in minutes (empty = use template default)')
+        string(name: 'MSSQL_PASS',        defaultValue: '',                    description: 'MSSQL server password (empty = Windows auth)')
+
+        string(name: 'DISK_ID',           defaultValue: '2',                   description: 'Data disk ID to format')
+        string(name: 'REBUILDDB',         defaultValue: 'true',                description: 'Rebuild database before test (true/false)')
+        string(name: 'REBUILD_ALWAYS',    defaultValue: 'false',               description: 'Rebuild before every user-count iteration (true/false)')
+        string(name: 'TEST_ONLY',         defaultValue: 'false',               description: 'Skip rebuild, only run tests (true/false)')
+
+        string(name: 'DESCRIPTION',       defaultValue: 'jenkins-mssql-test',  description: 'Test run description')
+        booleanParam(name: 'PREPARE_MACHINES', defaultValue: true, description: 'Run --prepare-machine before test (format data disk)')
+    }
+
+    environment {
+        RESULTS_DIR  = '/root/mssqlwin-results'
+        BASTION_CONN = "${params.BASTION_USER}@${params.BASTION_HOST}"
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            mkdir -p ${RESULTS_DIR}
+                            podman pull ${params.CONTAINER_IMAGE} || true
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Prepare Machines') {
+            when { expression { params.PREPARE_MACHINES } }
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            podman run --rm \
+                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e NAMESPACE="${params.NAMESPACE}" \
+                              -e DISK_ID="${params.DISK_ID}" \
+                              -e DESCRIPTION="${params.DESCRIPTION}" \
+                              -v /root/.ssh:/root/.ssh:ro \
+                              -v /root/.kube/config:/root/.kube/config \
+                              --privileged \
+                              ${params.CONTAINER_IMAGE} \
+                              --prepare-machine
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Wait for Machines') {
+            when { expression { params.PREPARE_MACHINES } }
+            steps {
+                echo "Waiting 120 seconds for machines to settle after preparation..."
+                sleep time: 120, unit: 'SECONDS'
+            }
+        }
+
+        stage('Run MSSQL Test') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            podman run --rm \
+                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e NAMESPACE="${params.NAMESPACE}" \
+                              -e WAREHOUSE_COUNT=${params.WAREHOUSE_COUNT} \
+                              -e BUILD_USERS=${params.BUILD_USERS} \
+                              -e USER_COUNT="${params.USER_COUNT}" \
+                              -e TEST_DURATION=${params.TEST_DURATION} \
+                              -e MSSQL_TOTAL_ITERATIONS=${params.MSSQL_TOTAL_ITERATIONS} \
+                              -e RAMPUP_TIME="${params.RAMPUP_TIME}" \
+                              -e MSSQL_PASS="${params.MSSQL_PASS}" \
+                              -e DISK_ID="${params.DISK_ID}" \
+                              -e REBUILDDB=${params.REBUILDDB} \
+                              -e REBUILD_ALWAYS=${params.REBUILD_ALWAYS} \
+                              -e TEST_ONLY=${params.TEST_ONLY} \
+                              -e DESCRIPTION="${params.DESCRIPTION}" \
+                              -v ${RESULTS_DIR}:/work/results \
+                              -v /root/.ssh:/root/.ssh:ro \
+                              -v /root/.kube/config:/root/.kube/config \
+                              --privileged \
+                              ${params.CONTAINER_IMAGE}
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Collect Results') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        mkdir -p mssql-results
+                        scp -o StrictHostKeyChecking=no -r \
+                            ${BASTION_CONN}:${RESULTS_DIR}/ ./mssql-results/
+                    """
+                }
+            }
+        }
+
+        stage('Archive') {
+            steps {
+                archiveArtifacts artifacts: 'mssql-results/**', allowEmptyArchive: true
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "MSSQL test completed successfully. Results archived as build artifacts."
+        }
+        failure {
+            echo "MSSQL test failed. Check the console output for details."
+        }
+        always {
+            echo "Test description: ${params.DESCRIPTION}"
+            echo "Hosts: ${params.HOST_PATTERN}"
+            echo "Warehouses: ${params.WAREHOUSE_COUNT}, Build users: ${params.BUILD_USERS}"
+            echo "User counts: ${params.USER_COUNT}, Duration: ${params.TEST_DURATION}m"
+        }
+    }
+}

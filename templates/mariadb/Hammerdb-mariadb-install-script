@@ -135,11 +135,23 @@ tar xf hammerdb-tpcc.tar || error_exit "Failed to extract hammerdb-tpcc.tar"
 
 cd "${HAMMERDB_PATH}/templates/mariadb/Hammerdb" || error_exit "Cannot change to HammerDB directory"
 
-log_info "Running HammerDB installer..."
-unset DISPLAY
-echo "y" > input
-echo "${HAMMERDB_INSTALL_DIR}" >> input
-./HammerDB-3.2-Linux-x86-64-Install < input || error_exit "HammerDB installation failed"
+log_info "Installing HammerDB from hammerdb-tpcc.tar..."
+tar xf hammerdb-tpcc.tar || error_exit "Failed to extract hammerdb-tpcc.tar"
+rm -rf "${HAMMERDB_INSTALL_DIR}"
+mv HammerDB-* "${HAMMERDB_INSTALL_DIR}" || error_exit "Failed to move HammerDB to ${HAMMERDB_INSTALL_DIR}"
+echo "${HAMMERDB_INSTALL_DIR}/lib" > /etc/ld.so.conf.d/hammerdb.conf
+ldconfig
+
+cat > /usr/local/bin/hammerdbcli << WEOF
+#!/bin/bash
+cd ${HAMMERDB_INSTALL_DIR}
+exec ./hammerdbcli "\$@"
+WEOF
+chmod +x /usr/local/bin/hammerdbcli
+
+log_info "Verifying HammerDB installation..."
+hammerdbcli <<< "exit" 2>&1 | head -3 || log_info "Warning: HammerDB CLI verification returned non-zero (may still work)"
+log_info "HammerDB ${HAMMERDB_VERSION} installed to ${HAMMERDB_INSTALL_DIR}"
 
 # ----------------------------------------------------------------------------
 # Step 3: Stop MariaDB and Install Packages

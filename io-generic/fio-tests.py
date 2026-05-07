@@ -8,6 +8,7 @@ Supports YAML configuration and multiple machines/VMs testing
 import argparse
 import base64
 import glob
+import json
 import logging
 import os
 import re
@@ -716,6 +717,9 @@ class ConfigLoader:
                         pattern_hosts = [f"{prefix}{i}" for i in range(start, end + 1)]
                         windows_hosts.extend(pattern_hosts)
                         logger.info(f"Expanded Windows host pattern to {len(pattern_hosts)} hosts")
+                else:
+                    windows_hosts.extend(windows_host_pattern.split())
+                    logger.info(f"Using Windows host pattern as literal hostname(s): {windows_host_pattern}")
             
             self.config.windows_hosts = set(windows_hosts)
             
@@ -1127,6 +1131,7 @@ def main():
         
         # Copy results only
         collect_results(config, executor, results_dir)
+        generate_combined_results(results_dir, config)
         
         # Copy log file to results directory if found
         if log_file_to_copy and os.path.exists(log_file_to_copy):
@@ -1202,6 +1207,7 @@ def main():
     results_dir = config.get_results_dir_name()
     
     collect_results(config, executor, results_dir)
+    generate_combined_results(results_dir, config)
     
     # Copy log file to results directory
     log_file_path = None
@@ -2316,6 +2322,60 @@ def collect_results(config: FioTestConfig, executor: CommandExecutor, results_di
             future.result()
     
     logger.info(f"All results collected in: {results_dir}")
+
+
+def generate_combined_results(results_dir: str, config: FioTestConfig) -> None:
+    """Merge all per-host JSON results into a single NDJSON file for Elasticsearch."""
+    ndjson_path = os.path.join(results_dir, "combined-results.ndjson")
+    run_timestamp = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
+    count = 0
+
+    with open(ndjson_path, "w", encoding="utf-8") as out:
+        for host_dir in sorted(Path(results_dir).iterdir()):
+            if not host_dir.is_dir():
+                continue
+            hostname = host_dir.name
+            is_windows = hostname in (config.windows_hosts or set())
+
+            for json_file in sorted(host_dir.glob("*.json")):
+                try:
+                    with open(json_file, "r", encoding="utf-8") as f:
+                        fio_data = json.load(f)
+                except (json.JSONDecodeError, OSError) as e:
+                    logger.warning(f"Skipping {json_file}: {e}")
+                    continue
+
+                test_name = json_file.stem
+                io_pattern = ""
+                block_size = ""
+                m = re.match(r"fio-test-(.+)-bs-(.+)", test_name)
+                if m:
+                    io_pattern = m.group(1)
+                    block_size = m.group(2)
+
+                entry = {
+                    "hostname": hostname,
+                    "test_name": test_name,
+                    "io_pattern": io_pattern,
+                    "block_size": block_size,
+                    "os_type": "windows" if is_windows else "linux",
+                    "description": config.description or "",
+                    "timestamp": run_timestamp,
+                    "numjobs": config.windows_numjobs if is_windows else config.numjobs,
+                    "iodepth": config.windows_iodepth if is_windows else config.iodepth,
+                    "test_size": config.windows_test_size if is_windows else config.test_size,
+                    "runtime": config.windows_test_runtime if is_windows else config.test_runtime,
+                    "fio_results": fio_data,
+                }
+                out.write(json.dumps(entry, separators=(",", ":")) + "\n")
+                count += 1
+
+    if count:
+        logger.info(f"Wrote {count} results to {ndjson_path}")
+    else:
+        logger.warning(f"No JSON result files found to combine in {results_dir}")
+        if os.path.exists(ndjson_path):
+            os.remove(ndjson_path)
 
 
 def cleanup_storage(config: FioTestConfig, executor: CommandExecutor) -> None:

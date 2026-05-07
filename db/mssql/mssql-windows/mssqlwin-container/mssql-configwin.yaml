@@ -1,0 +1,46 @@
+# Minimal MSSQL HammerDB Windows Configuration (mssqlwin.py)
+
+description: ""
+
+database:
+  # Choose ONE of: hosts, host_pattern, host_labels, host_file
+  hosts: "vm1 vm2"        # Space-separated list of hosts
+  # host_pattern: "winvm-{1..3}"          # Expands to winvm-1 winvm-2 winvm-3
+  # host_labels: "app=mssql,role=primary" # OpenShift VM labels (virtctl)
+  # host_file: "mssql_hosts.txt"          # File with one host per line
+  namespace: "default"  # only used for virtctl mode
+  warehouse_count: 50            # Number of warehouses for TPCC test
+  build_users: 50                # Virtual users for schema build step
+  mssql_total_iterations: 10000000              # Number of iterations to run
+  test_duration: 15              # Test duration in minutes
+  # rampup_time: 2               # Ramp-up time in minutes (defaults to template)
+  user_count: "1 10 20 50 100"   # Space-separated list of user counts to test, eg "1 2 4 8"
+  # mssql_pass: "Password123"       # MSSQL server password
+
+windows:
+  hammerdb_path: "C:\\tools\\Hammerdb-4.12"
+  test_script: "C:\\tools\\Hammerdb-4.12\\hammertest.ps1"
+  hammerdb_test_script: "C:\\tools\\Hammerdb-4.12\\mssqls_tprocc_run10.tcl"
+  build_schema_file: "C:\\tools\\Hammerdb-4.12\\mssqls_tprocc_buildschema.tcl"
+  result_dir: "C:\\tools\\Hammerdb-4.12\\results"
+  rebuild_script: "C:\\tools\\Hammerdb-4.12\\rebuild-db.ps1"
+  create_db_sql: "C:\\tools\\Hammerdb-4.12\\create_db.sql"
+  disk_id: "1"  # data disk id to format and use for testing
+  ssh_user: "Administrator"
+  # mssql_service_name: "MSSQLSERVER"  # Optional service name override
+  rebuilddb: true
+  # rebuild_timeout: 7200  # Optional timeout in seconds (omit to disable)
+  rebuild_always: false
+  rebuild_only: false
+  test_only: false
+
+# Timeout configuration (all values in seconds)
+# Uncomment to override defaults
+timeouts:
+  default: 300            # Default command timeout
+  scp: 300                # SCP file copy timeout
+  test: 7200              # Test execution timeout per user count
+  prepare: 1200           # Machine preparation timeout
+  vm_lookup: 10           # VM lookup timeout (oc get vm/vmi)
+  label_query: 30         # Label-based VM query timeout
+  oc_command: 15          # OpenShift/virsh command timeout (vm-dump, pod list)
