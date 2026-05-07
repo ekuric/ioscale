@@ -145,10 +145,10 @@ mv HammerDB-* "${HAMMERDB_INSTALL_DIR}" || error_exit "Failed to move HammerDB t
 echo "${HAMMERDB_INSTALL_DIR}/lib" > /etc/ld.so.conf.d/hammerdb.conf
 ldconfig
 
-cat > /usr/local/bin/hammerdbcli << WEOF
+cat > /usr/local/bin/hammerdbcli << 'WEOF'
 #!/bin/bash
-cd ${HAMMERDB_INSTALL_DIR}
-exec ./hammerdbcli "\$@"
+cd /usr/local/HammerDB
+exec bash ./hammerdbcli "$@"
 WEOF
 chmod +x /usr/local/bin/hammerdbcli
 
