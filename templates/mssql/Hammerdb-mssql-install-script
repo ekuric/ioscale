@@ -203,6 +203,16 @@ for tool in sqlcmd bcp; do
     fi
 done
 
+if [ "${MSSQL_TOOLS_DIR}" != "/opt/mssql-tools/bin" ]; then
+    log_info "Creating legacy /opt/mssql-tools/bin symlinks for compatibility..."
+    mkdir -p /opt/mssql-tools/bin
+    for tool in sqlcmd bcp; do
+        if [ -f "${MSSQL_TOOLS_DIR}/$tool" ]; then
+            ln -sf "${MSSQL_TOOLS_DIR}/$tool" "/opt/mssql-tools/bin/$tool"
+        fi
+    done
+fi
+
 # ----------------------------------------------------------------------------
 # Step 5: Copy MSSQL Setup Files
 # ----------------------------------------------------------------------------
