@@ -580,7 +580,7 @@ def ensure_packages_installed(config: PostgreSQLTestConfig, executor: CommandExe
                 "  echo \"All required packages are already installed\"; "
                 "else "
                 "  echo \"Installing required packages...\"; "
-                "  dnf -y install curl vim wget git postgresql.x86_64 postgresql-contrib.x86_64 postgresql-server.x86_64 glibc-langpack-en libpq; "
+                "  dnf -y --nobest install curl vim wget git postgresql.x86_64 postgresql-contrib.x86_64 postgresql-server.x86_64 glibc-langpack-en libpq; "
                 "  echo \"Package installation completed\"; "
                 "fi"
                 "'"

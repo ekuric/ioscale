@@ -565,7 +565,7 @@ def ensure_packages_installed(config: MariaDBTestConfig, executor: CommandExecut
                 "  echo \"All required packages are already installed\"; "
                 "else "
                 "  echo \"Installing required packages...\"; "
-                "  dnf -y install git curl vim wget mariadb mariadb-server mariadb-server-utils mariadb-errmsg mysql-libs; "
+                "  dnf -y --nobest install git curl vim wget mariadb mariadb-server mariadb-server-utils mariadb-errmsg mysql-libs; "
                 "  if [ -L /usr/lib64/libmysqlclient.so.21 ]; then rm -f /usr/lib64/libmysqlclient.so.21; fi; "
                 "  ldconfig; "
                 "  echo \"Package installation completed\"; "
@@ -870,7 +870,7 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
         futures = []
         for host in config.db_hosts:
-            cmd = "echo 'DROP DATABASE IF EXISTS tpcc;' | mysql -u root -p$MARIADB_ROOT_PASSWORD"
+            cmd = "mariadb --no-defaults -u root -S /var/lib/mysql/mysql.sock -e 'DROP DATABASE IF EXISTS tpcc;' 2>/dev/null || mariadb --no-defaults -u root -pmysql -S /var/lib/mysql/mysql.sock -e 'DROP DATABASE IF EXISTS tpcc;'"
             future = pool.submit(executor.execute_command, host, cmd, "Cleaning existing database")
             futures.append(future)
         for future in as_completed(futures):

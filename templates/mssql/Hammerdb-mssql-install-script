@@ -154,8 +154,8 @@ WEOF
 chmod +x /usr/local/bin/hammerdbcli
 
 log_info "Setting TMP/TEMP environment variables for HammerDB..."
-echo 'TMP=/tmp' >> /etc/environment
-echo 'TEMP=/tmp' >> /etc/environment
+grep -q '^TMP=' /etc/environment 2>/dev/null || echo 'TMP=/tmp' >> /etc/environment
+grep -q '^TEMP=' /etc/environment 2>/dev/null || echo 'TEMP=/tmp' >> /etc/environment
 export TMP=/tmp
 export TEMP=/tmp
 
@@ -168,23 +168,18 @@ log_info "HammerDB installed to ${HAMMERDB_INSTALL_DIR}"
 # ----------------------------------------------------------------------------
 log_step "Installing MSSQL Server Packages"
 
-log_info "Configuring MSSQL Server repository..."
+log_info "Configuring Microsoft repositories..."
 curl -f https://packages.microsoft.com/rhel/9/mssql-server-2022/config.repo -o /etc/yum.repos.d/mssql-server-2022.repo || \
-    error_exit "Failed to download MSSQL Server repository configuration"
-
-log_info "Installing MSSQL Server..."
-dnf -y install mssql-server || error_exit "Failed to install MSSQL Server"
-
-log_info "Configuring Microsoft packages repository..."
-curl -f https://packages.microsoft.com/config/rhel/9/packages-microsoft-prod.rpm -o /tmp/packages-microsoft-prod.rpm || \
-    error_exit "Failed to download Microsoft packages repository"
-dnf -y install /tmp/packages-microsoft-prod.rpm || error_exit "Failed to install Microsoft packages repository"
+    error_exit "Failed to download MSSQL Server repository"
+curl -f https://packages.microsoft.com/config/rhel/9/prod.repo -o /etc/yum.repos.d/mssql-prod.repo || \
+    error_exit "Failed to download Microsoft prod repository"
 
 log_info "Removing conflicting unixODBC packages..."
-dnf -y remove unixODBC-utf16 unixODBC-utf16-devel 2>/dev/null || log_info "No conflicting packages to remove"
+dnf -y remove unixODBC-utf16 unixODBC-utf16-devel 2>/dev/null || true
 
-log_info "Installing MSSQL tools, ODBC driver, and dependencies..."
-ACCEPT_EULA=Y dnf -y install mssql-tools18 msodbcsql18 unixODBC-devel || error_exit "Failed to install MSSQL tools and ODBC driver"
+log_info "Installing MSSQL Server, tools, and ODBC driver..."
+ACCEPT_EULA=Y dnf -y install mssql-server mssql-tools18 msodbcsql18 unixODBC-devel || \
+    error_exit "Failed to install MSSQL packages"
 
 log_info "Verifying ODBC Driver 18 is installed..."
 if odbcinst -q -d 2>/dev/null | grep -q "ODBC Driver 18"; then
@@ -323,7 +318,15 @@ echo "${MSSQL_SA_PASSWORD}" >> input
 ./mssql-conf -n setup accept-eula < input || error_exit "MSSQL configuration setup failed"
 
 log_info "Waiting for MSSQL configuration to complete..."
-sleep 30
+RETRY=0
+while [ $RETRY -lt 12 ]; do
+    if systemctl is-active --quiet mssql-server 2>/dev/null; then
+        log_info "MSSQL Server is running after setup"
+        break
+    fi
+    RETRY=$((RETRY + 1))
+    sleep 5
+done
 
 log_info "Stopping MSSQL Server to move data directory..."
 systemctl stop mssql-server || log_info "MSSQL Server was not running"
@@ -391,19 +394,18 @@ log_info "Starting MSSQL Server..."
 systemctl restart mssql-server.service || error_exit "Failed to start MSSQL Server"
 
 log_info "Waiting for MSSQL Server to be ready..."
-sleep 30
-
-# Wait for MSSQL Server to be ready (retry up to 10 times)
 RETRY_COUNT=0
-MAX_RETRIES=10
+MAX_RETRIES=30
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P "${MSSQL_SA_PASSWORD}" -Q "SELECT 1" >/dev/null 2>&1; then
+    if sqlcmd -S localhost -U sa -P "${MSSQL_SA_PASSWORD}" -C -Q "SELECT 1" >/dev/null 2>&1; then
         log_info "MSSQL Server is ready"
         break
     fi
     RETRY_COUNT=$((RETRY_COUNT + 1))
-    log_info "Waiting for MSSQL Server to be ready... (attempt $RETRY_COUNT/$MAX_RETRIES)"
-    sleep 10
+    if [ $((RETRY_COUNT % 5)) -eq 0 ]; then
+        log_info "Waiting for MSSQL Server to be ready... (attempt $RETRY_COUNT/$MAX_RETRIES)"
+    fi
+    sleep 5
 done
 
 if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
