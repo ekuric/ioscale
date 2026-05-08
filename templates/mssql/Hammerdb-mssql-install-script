@@ -184,7 +184,7 @@ log_info "Removing conflicting unixODBC packages..."
 dnf -y remove unixODBC-utf16 unixODBC-utf16-devel 2>/dev/null || log_info "No conflicting packages to remove"
 
 log_info "Installing MSSQL tools, ODBC driver, and dependencies..."
-ACCEPT_EULA=Y dnf -y install mssql-tools msodbcsql18 unixODBC-devel freetds || error_exit "Failed to install MSSQL tools and ODBC driver"
+ACCEPT_EULA=Y dnf -y install mssql-tools18 msodbcsql18 unixODBC-devel || error_exit "Failed to install MSSQL tools and ODBC driver"
 
 log_info "Verifying ODBC Driver 18 is installed..."
 if odbcinst -q -d 2>/dev/null | grep -q "ODBC Driver 18"; then
@@ -194,21 +194,19 @@ else
 fi
 
 log_info "Adding MSSQL tools to PATH..."
-if ! grep -q "/opt/mssql-tools/bin" ~/.bash_profile 2>/dev/null; then
-    echo 'export PATH="$PATH:/opt/mssql-tools/bin"' >> ~/.bash_profile
+MSSQL_TOOLS_DIR="/opt/mssql-tools18/bin"
+if [ ! -d "${MSSQL_TOOLS_DIR}" ]; then
+    MSSQL_TOOLS_DIR="/opt/mssql-tools/bin"
 fi
-
-# installed as part of mssql-tools package to make them available in the PATH
-if [ -f "/opt/mssql-tools/bin/sqlcmd" ] && [ ! -f "/usr/local/bin/sqlcmd" ]; then
-    ln -sf "/opt/mssql-tools/bin/sqlcmd" "/usr/local/bin/sqlcmd"
-    log_info "Created symlink: /usr/local/bin/sqlcmd -> /opt/mssql-tools/bin/sqlcmd"
+if ! grep -q "${MSSQL_TOOLS_DIR}" ~/.bash_profile 2>/dev/null; then
+    echo "export PATH=\"\$PATH:${MSSQL_TOOLS_DIR}\"" >> ~/.bash_profile
 fi
-if [ -f "/usr/bin/bcp" ]; then
-    log_info "Using FreeTDS bcp at /usr/bin/bcp (compatible with HammerDB)"
-elif [ -f "/opt/mssql-tools/bin/bcp" ] && [ ! -f "/usr/local/bin/bcp" ]; then
-    ln -sf "/opt/mssql-tools/bin/bcp" "/usr/local/bin/bcp"
-    log_info "Created symlink: /usr/local/bin/bcp -> /opt/mssql-tools/bin/bcp (Microsoft bcp)"
-fi
+for tool in sqlcmd bcp; do
+    if [ -f "${MSSQL_TOOLS_DIR}/$tool" ]; then
+        ln -sf "${MSSQL_TOOLS_DIR}/$tool" "/usr/local/bin/$tool"
+        log_info "Created symlink: /usr/local/bin/$tool -> ${MSSQL_TOOLS_DIR}/$tool"
+    fi
+done
 
 # ----------------------------------------------------------------------------
 # Step 5: Copy MSSQL Setup Files
