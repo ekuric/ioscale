@@ -64,6 +64,12 @@ else
         DISK_LIST_LINE="  disk_list: null"
     fi
 
+    # Rampup time (optional)
+    RAMPUP_LINE=""
+    if [[ -n "${RAMPUP_TIME:-}" ]]; then
+        RAMPUP_LINE=$'\n'"  rampup_time: ${RAMPUP_TIME}"
+    fi
+
     # Migration
     MIGRATE_LINE="  user_counts: null"
     if [[ -n "${MIGRATE_USER_COUNTS}" ]]; then
@@ -83,7 +89,7 @@ ${HOST_BLOCK}
   namespace: "${NAMESPACE}"
   warehouse_count: ${WAREHOUSE_COUNT}
   build_users: ${BUILD_USERS}
-  test_duration: ${TEST_DURATION}
+  test_duration: ${TEST_DURATION}${RAMPUP_LINE}
   mssql_pass: "${MSSQL_PASS}"
   rebuilddb: ${REBUILDDB}
   rebuild_only: ${REBUILD_ONLY}

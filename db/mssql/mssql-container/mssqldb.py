@@ -63,6 +63,7 @@ class MSSQLTestConfig:
         self.hammerdb_path = None
         self.hammerdb_dir = "/usr/local/HammerDB"
         self.test_duration = None
+        self.rampup_time = None
         self.log_level = "INFO"
         self.description = ""  # Test description for logging and output naming
         self.mssql_pass = "mssqlpasswd1!"
@@ -278,6 +279,7 @@ class ConfigLoader:
         database = yaml_data.get('database', {})
         self.config.warehouse_count = database.get('warehouse_count')
         self.config.test_duration = database.get('test_duration')
+        self.config.rampup_time = database.get('rampup_time')
         build_users = database.get('build_users')
         if build_users not in (None, "", "null"):
             self.config.build_users = str(build_users)
@@ -554,6 +556,7 @@ def display_config(config: MSSQLTestConfig) -> None:
     logger.info(f"Warehouse count: {config.warehouse_count}")
     logger.info(f"User counts: {' '.join(config.user_count)}")
     logger.info(f"Test duration: {config.test_duration} minutes")
+    logger.info(f"Rampup time: {config.rampup_time} minutes" if config.rampup_time else "Rampup time: 2 minutes (default)")
     if config.build_users:
         logger.info(f"Build users: {config.build_users}")
     if config.disk_list != "none":
@@ -1355,7 +1358,8 @@ def run_tests(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
                     f"cp runtest_mssql.tcl runtest{vm_number}_mssql.tcl 2>/dev/null && "
                     f"sed -i 's/^diset tpcc mssqls_count_ware.*/diset tpcc mssqls_count_ware {config.warehouse_count}/g' runtest{vm_number}_mssql.tcl && "
                     f"sed -i 's/^diset tpcc mssqls_duration.*/diset tpcc mssqls_duration {config.test_duration}/g' runtest{vm_number}_mssql.tcl && "
-                    f"sed -i 's/^diset tpcc mssqls_num_vu.*/diset tpcc mssqls_num_vu {user_count}/g' runtest{vm_number}_mssql.tcl"
+                    f"sed -i 's/^diset tpcc mssqls_num_vu.*/diset tpcc mssqls_num_vu {user_count}/g' runtest{vm_number}_mssql.tcl" +
+                    (f" && sed -i 's/^diset tpcc mssqls_rampup.*/diset tpcc mssqls_rampup {config.rampup_time}/g' runtest{vm_number}_mssql.tcl" if config.rampup_time else "")
                 )
                 future = pool.submit(executor.execute_command, host, cmd, f"Preparing test script (runtest{vm_number}_mssql.tcl) for {user_count} users")
                 futures.append(future)
@@ -1366,7 +1370,7 @@ def run_tests(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
         logger.info(f"Executing performance tests with {user_count} users...")
         # Calculate test duration and migration timing upfront
         test_duration_seconds = int(config.test_duration) * 60 if config.test_duration else 900
-        rampup_time_seconds = 120  # 2 minutes rampup time
+        rampup_time_seconds = int(config.rampup_time) * 60 if config.rampup_time else 120
         
         # Start tests - use short timeout just to verify command starts (nohup should return quickly)
         test_start_time = time.time()

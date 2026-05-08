@@ -177,8 +177,15 @@ dnf -y install /tmp/packages-microsoft-prod.rpm || error_exit "Failed to install
 log_info "Removing conflicting unixODBC packages..."
 dnf -y remove unixODBC-utf16 unixODBC-utf16-devel 2>/dev/null || log_info "No conflicting packages to remove"
 
-log_info "Installing MSSQL tools and dependencies..."
-ACCEPT_EULA=Y dnf -y install mssql-tools unixODBC-devel || error_exit "Failed to install MSSQL tools"
+log_info "Installing MSSQL tools, ODBC driver, and dependencies..."
+ACCEPT_EULA=Y dnf -y install mssql-tools msodbcsql18 unixODBC-devel || error_exit "Failed to install MSSQL tools and ODBC driver"
+
+log_info "Verifying ODBC Driver 18 is installed..."
+if odbcinst -q -d 2>/dev/null | grep -q "ODBC Driver 18"; then
+    log_info "ODBC Driver 18 for SQL Server is installed"
+else
+    log_info "Warning: ODBC Driver 18 not found in odbcinst - HammerDB may fail to connect"
+fi
 
 log_info "Adding MSSQL tools to PATH..."
 if ! grep -q "/opt/mssql-tools/bin" ~/.bash_profile 2>/dev/null; then

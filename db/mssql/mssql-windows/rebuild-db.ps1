@@ -41,8 +41,44 @@ if ($elapsed -ge $waitSeconds) {
 
 cd $hammerdbPath
 
-Write-Host "Running delete schema TCL..."
+Write-Host "Force-dropping tpcc database if it exists (handles missing files after disk reformat)..."
+$sqlArgs = if ($mssqlPass) { @("-U", "sa", "-P", $mssqlPass, "-l", "30", "-t", "60") } else { @("-E", "-l", "30", "-t", "60") }
+
+$checkSql = "IF DB_ID('tpcc') IS NOT NULL PRINT 'EXISTS' ELSE PRINT 'NOTEXISTS'"
+$checkResult = sqlcmd @sqlArgs -Q $checkSql -h -1 2>&1
+if ($checkResult -match 'NOTEXISTS') {
+    Write-Host "Database tpcc does not exist - nothing to drop"
+} else {
+    Write-Host "Database tpcc found in catalog, force-removing..."
+    sqlcmd @sqlArgs -Q "BEGIN TRY ALTER DATABASE tpcc SET EMERGENCY END TRY BEGIN CATCH PRINT ERROR_MESSAGE() END CATCH" 2>&1 | ForEach-Object { Write-Host "  emergency: $_" }
+    sqlcmd @sqlArgs -Q "BEGIN TRY DROP DATABASE tpcc PRINT 'Dropped tpcc' END TRY BEGIN CATCH PRINT 'DROP failed: ' + ERROR_MESSAGE() END CATCH" 2>&1 | ForEach-Object { Write-Host "  drop: $_" }
+
+    $checkResult2 = sqlcmd @sqlArgs -Q $checkSql -h -1 2>&1
+    if ($checkResult2 -match 'EXISTS') {
+        Write-Host "  DROP did not work, trying sp_detach_db..."
+        sqlcmd @sqlArgs -Q "EXEC sp_detach_db 'tpcc', 'true'" 2>&1 | ForEach-Object { Write-Host "  detach: $_" }
+
+        $checkResult3 = sqlcmd @sqlArgs -Q $checkSql -h -1 2>&1
+        if ($checkResult3 -match 'EXISTS') {
+            Write-Host "  detach did not work, trying OFFLINE + DROP..."
+            sqlcmd @sqlArgs -Q "ALTER DATABASE tpcc SET OFFLINE WITH ROLLBACK IMMEDIATE" 2>&1 | Out-Null
+            Start-Sleep -Seconds 2
+            sqlcmd @sqlArgs -Q "DROP DATABASE tpcc" 2>&1 | ForEach-Object { Write-Host "  offline-drop: $_" }
+        }
+    }
+
+    $finalCheck = sqlcmd @sqlArgs -Q $checkSql -h -1 2>&1
+    if ($finalCheck -match 'NOTEXISTS') {
+        Write-Host "Database tpcc removed successfully"
+    } else {
+        Write-Host "WARNING: Could not fully remove tpcc - CREATE DATABASE may fail"
+    }
+}
+Write-Host "Force drop/detach step complete"
+
+Write-Host "Running delete schema TCL (cleanup any remaining objects)..."
 .\hammerdbcli auto $deleteSchema
+
 Start-Process powershell.exe -ArgumentList "-NoExit -Command & {$hammerdbPath\hammerdbws}"
 Write-Host "Running create_db.sql..."
 if ($mssqlPass) {
@@ -50,5 +86,10 @@ if ($mssqlPass) {
 } else {
     sqlcmd -U sa -i $createDbSql -b -l 30 -t $sqlcmdTimeout
 }
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "create_db.sql failed with exit code $LASTEXITCODE"
+    exit 1
+}
+Write-Host "create_db.sql completed successfully"
 Write-Host "Running build schema TCL..."
 .\hammerdbcli auto $buildSchema

@@ -35,6 +35,7 @@ database:
   warehouse_count: 50            # Number of warehouses for TPCC test
   build_users: 50                # Virtual users for schema build step
   test_duration: 15              # Test duration in minutes
+  # rampup_time: 2               # Ramp-up time in minutes (defaults to 2 if not set)
   mssql_pass: "mssqlpasswd1!"    # SA password for sqlcmd/ODBC
   rebuilddb: true                # Build database before tests
   rebuild_only: false            # Only rebuild database, skip tests/results

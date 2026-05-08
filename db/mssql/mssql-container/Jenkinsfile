@@ -25,6 +25,7 @@ pipeline {
         string(name: 'HAMMERDB_REPO',     defaultValue: 'https://github.com/ekuric/fusion-access.git', description: 'Git repo with HammerDB wrapper scripts')
         string(name: 'HAMMERDB_PATH',     defaultValue: '/root/hammerdb-tpcc-wrapper-scripts',          description: 'Clone path on remote hosts')
 
+        string(name: 'RAMPUP_TIME',        defaultValue: '',                    description: 'Ramp-up time in minutes (empty = default 2 min)')
         string(name: 'MIGRATE_USER_COUNTS', defaultValue: '',                  description: 'User counts triggering VM migration (space-separated, empty = no migration)')
         string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
         string(name: 'DESCRIPTION',       defaultValue: 'jenkins-mssqldb-test', description: 'Test run description')
@@ -102,6 +103,7 @@ pipeline {
                               -e TEST_ONLY=${params.TEST_ONLY} \
                               -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
                               -e HAMMERDB_PATH="${params.HAMMERDB_PATH}" \
+                              -e RAMPUP_TIME="${params.RAMPUP_TIME}" \
                               -e MIGRATE_USER_COUNTS="${params.MIGRATE_USER_COUNTS}" \
                               -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
                               -e DESCRIPTION="${params.DESCRIPTION}" \

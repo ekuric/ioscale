@@ -34,6 +34,7 @@ database:
   namespace: "default"           # Kubernetes namespace for VMs
   warehouse_count: 50            # Number of warehouses for TPCC test
   test_duration: 15              # Test duration in minutes
+  # rampup_time: 2               # Ramp-up time in minutes (defaults to 2 if not set)
 
 # Test Configuration
 test:

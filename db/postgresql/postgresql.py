@@ -62,6 +62,7 @@ class PostgreSQLTestConfig:
         self.hammerdb_path = None
         self.hammerdb_dir = "/usr/local/HammerDB"
         self.test_duration = None
+        self.rampup_time = None
         self.log_level = "INFO"
         self.description = ""  # Test description for logging and output naming
         self.migrate_user_counts = []  # User counts that should trigger migration
@@ -272,6 +273,7 @@ class ConfigLoader:
         database = yaml_data.get('database', {})
         self.config.warehouse_count = database.get('warehouse_count')
         self.config.test_duration = database.get('test_duration')
+        self.config.rampup_time = database.get('rampup_time')
         
         # Load test configuration
         test = yaml_data.get('test', {})
@@ -531,6 +533,7 @@ def display_config(config: PostgreSQLTestConfig) -> None:
     logger.info(f"Warehouse count: {config.warehouse_count}")
     logger.info(f"User counts: {' '.join(config.user_count)}")
     logger.info(f"Test duration: {config.test_duration} minutes")
+    logger.info(f"Rampup time: {config.rampup_time} minutes" if config.rampup_time else "Rampup time: 2 minutes (default)")
     if config.disk_list != "none":
         logger.info(f"Disk device: {config.disk_list}")
     if config.mount_point != "none":
@@ -1243,7 +1246,8 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
                     f"cp '{config.hammerdb_path}/templates/postgresql/postgresqlsetup/runtest_pg.tcl' runtest{vm_number}_pg.tcl && "
                     f"sed -i 's/^diset tpcc pg_count_ware.*/diset tpcc pg_count_ware {config.warehouse_count}/g' runtest{vm_number}_pg.tcl && "
                     f"sed -i 's/^vuset.*/vuset vu {user_count}/g' runtest{vm_number}_pg.tcl && "
-                    f"sed -i 's/^diset tpcc pg_duration.*/diset tpcc pg_duration {config.test_duration}/g' runtest{vm_number}_pg.tcl"
+                    f"sed -i 's/^diset tpcc pg_duration.*/diset tpcc pg_duration {config.test_duration}/g' runtest{vm_number}_pg.tcl" +
+                    (f" && sed -i 's/^diset tpcc pg_rampup.*/diset tpcc pg_rampup {config.rampup_time}/g' runtest{vm_number}_pg.tcl" if config.rampup_time else "")
                 )
                 future = pool.submit(executor.execute_command, host, cmd, f"Preparing test script (runtest{vm_number}_pg.tcl) for {user_count} users")
                 futures.append(future)
@@ -1254,7 +1258,7 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
         logger.info(f"Executing performance tests with {user_count} users...")
         # Calculate test duration and migration timing upfront
         test_duration_seconds = int(config.test_duration) * 60 if config.test_duration else 900
-        rampup_time_seconds = 120  # 2 minutes rampup time
+        rampup_time_seconds = int(config.rampup_time) * 60 if config.rampup_time else 120
         
         # Start tests - use short timeout just to verify command starts (nohup should return quickly)
         test_start_time = time.time()

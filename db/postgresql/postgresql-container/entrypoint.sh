@@ -60,6 +60,12 @@ else
         DISK_LIST_LINE="  disk_list: null"
     fi
 
+    # Rampup time (optional)
+    RAMPUP_LINE=""
+    if [[ -n "${RAMPUP_TIME:-}" ]]; then
+        RAMPUP_LINE=$'\n'"  rampup_time: ${RAMPUP_TIME}"
+    fi
+
     # Migration
     MIGRATE_LINE="  user_counts: null"
     if [[ -n "${MIGRATE_USER_COUNTS}" ]]; then
@@ -78,7 +84,7 @@ database:
 ${HOST_BLOCK}
   namespace: "${NAMESPACE}"
   warehouse_count: ${WAREHOUSE_COUNT}
-  test_duration: ${TEST_DURATION}
+  test_duration: ${TEST_DURATION}${RAMPUP_LINE}
 
 test:
   user_count: "${USER_COUNT}"
