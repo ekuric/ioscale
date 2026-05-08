@@ -142,7 +142,8 @@ class CommandExecutor:
                 raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
             return [
                 "virtctl", "-n", self.config.namespace, "ssh",
-                "--local-ssh-opts=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+                "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
                 f"root@vmi/{host}", "-c", command
             ]
         else:
@@ -167,7 +168,8 @@ class CommandExecutor:
                 raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
             return [
                 "virtctl", "-n", self.config.namespace, "scp",
-                "--local-ssh-opts=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
+                "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
                 source, destination
             ]
         else:
@@ -920,7 +922,7 @@ def wait_for_mssql_ready(config: MSSQLTestConfig, executor: CommandExecutor, hos
     password = shlex.quote(config.mssql_pass)
     cmd = (
         "systemctl is-active --quiet mssql-server && "
-        f"sqlcmd -S localhost -U sa -P {password} "
+        f"sqlcmd -S localhost -U sa -P {password} -C "
         "-Q \"SELECT 1\" -b -l 5 -t 5 >/dev/null 2>&1"
     )
     while time.monotonic() < deadline:
@@ -969,7 +971,7 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
             # Note: Password is typically set during installation (default: mssqlpasswd1!)
             # Password is wrapped in single quotes to protect special characters like "!"
             cmd = (
-                f"sqlcmd -S localhost -U sa -P {password} -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
+                f"sqlcmd -S localhost -U sa -P {password} -C -Q \"IF EXISTS (SELECT name FROM sys.databases WHERE name = 'tpcc') DROP DATABASE tpcc;\" 2>&1 || echo 'Database cleanup completed'"
             )
             future = pool.submit(executor.execute_command, host, cmd, "Cleaning existing database")
             futures.append(future)
