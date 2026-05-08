@@ -198,6 +198,14 @@ if ! grep -q "/opt/mssql-tools/bin" ~/.bash_profile 2>/dev/null; then
     echo 'export PATH="$PATH:/opt/mssql-tools/bin"' >> ~/.bash_profile
 fi
 
+# installed as part of mssql-tools package to make them available in the PATH
+for tool in sqlcmd bcp; do
+    if [ -f "/opt/mssql-tools/bin/$tool" ] && [ ! -f "/usr/local/bin/$tool" ]; then
+        ln -sf "/opt/mssql-tools/bin/$tool" "/usr/local/bin/$tool"
+        log_info "Created symlink: /usr/local/bin/$tool -> /opt/mssql-tools/bin/$tool"
+    fi
+done
+
 # ----------------------------------------------------------------------------
 # Step 5: Copy MSSQL Setup Files
 # ----------------------------------------------------------------------------
