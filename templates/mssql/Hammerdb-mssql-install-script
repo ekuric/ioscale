@@ -196,21 +196,23 @@ fi
 if ! grep -q "${MSSQL_TOOLS_DIR}" ~/.bash_profile 2>/dev/null; then
     echo "export PATH=\"\$PATH:${MSSQL_TOOLS_DIR}\"" >> ~/.bash_profile
 fi
-for tool in sqlcmd bcp; do
-    if [ -f "${MSSQL_TOOLS_DIR}/$tool" ]; then
-        ln -sf "${MSSQL_TOOLS_DIR}/$tool" "/usr/local/bin/$tool"
-        log_info "Created symlink: /usr/local/bin/$tool -> ${MSSQL_TOOLS_DIR}/$tool"
-    fi
-done
+if [ -f "${MSSQL_TOOLS_DIR}/bcp" ]; then
+    ln -sf "${MSSQL_TOOLS_DIR}/bcp" "/usr/local/bin/bcp"
+    log_info "Created symlink: /usr/local/bin/bcp -> ${MSSQL_TOOLS_DIR}/bcp"
+fi
+
+log_info "Creating sqlcmd wrapper with -C (trust server certificate) for ODBC Driver 18..."
+cat > /usr/local/bin/sqlcmd << SQLEOF
+#!/bin/bash
+exec ${MSSQL_TOOLS_DIR}/sqlcmd -C "\$@"
+SQLEOF
+chmod +x /usr/local/bin/sqlcmd
 
 if [ "${MSSQL_TOOLS_DIR}" != "/opt/mssql-tools/bin" ]; then
     log_info "Creating legacy /opt/mssql-tools/bin symlinks for compatibility..."
     mkdir -p /opt/mssql-tools/bin
-    for tool in sqlcmd bcp; do
-        if [ -f "${MSSQL_TOOLS_DIR}/$tool" ]; then
-            ln -sf "${MSSQL_TOOLS_DIR}/$tool" "/opt/mssql-tools/bin/$tool"
-        fi
-    done
+    ln -sf /usr/local/bin/sqlcmd /opt/mssql-tools/bin/sqlcmd
+    ln -sf "${MSSQL_TOOLS_DIR}/bcp" /opt/mssql-tools/bin/bcp
 fi
 
 # ----------------------------------------------------------------------------
