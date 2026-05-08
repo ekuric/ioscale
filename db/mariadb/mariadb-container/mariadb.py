@@ -120,7 +120,7 @@ class CommandExecutor:
                 raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
             return [
                 "virtctl", "-n", self.config.namespace, "ssh",
-                "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                "--local-ssh-opts=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
                 f"root@vmi/{host}", "-c", command
             ]
         else:
@@ -145,7 +145,7 @@ class CommandExecutor:
                 raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
             return [
                 "virtctl", "-n", self.config.namespace, "scp",
-                "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                "--local-ssh-opts=-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null",
                 source, destination
             ]
         else:
