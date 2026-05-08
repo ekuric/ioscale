@@ -153,6 +153,12 @@ exec bash ./hammerdbcli "$@"
 WEOF
 chmod +x /usr/local/bin/hammerdbcli
 
+log_info "Setting TMP/TEMP environment variables for HammerDB..."
+echo 'TMP=/tmp' >> /etc/environment
+echo 'TEMP=/tmp' >> /etc/environment
+export TMP=/tmp
+export TEMP=/tmp
+
 log_info "Verifying HammerDB installation..."
 hammerdbcli <<< "exit" 2>&1 | head -3 || log_info "Warning: HammerDB CLI verification returned non-zero (may still work)"
 log_info "HammerDB installed to ${HAMMERDB_INSTALL_DIR}"
