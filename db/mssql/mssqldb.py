@@ -610,7 +610,7 @@ def ensure_packages_installed(config: MSSQLTestConfig, executor: CommandExecutor
                 "  echo \"All required packages are already installed\"; "
                 "else "
                 "  echo \"Installing required packages...\"; "
-                "  dnf -y --nobest install curl vim wget git; "
+                "  dnf -y --nobest install curl vim wget git iproute; "
                 "  echo \"Package installation completed\"; "
                 "fi"
                 "'"
@@ -922,7 +922,7 @@ def wait_for_mssql_ready(config: MSSQLTestConfig, executor: CommandExecutor, hos
     password = shlex.quote(config.mssql_pass)
     cmd = (
         "systemctl is-active --quiet mssql-server && "
-        "bash -c 'echo > /dev/tcp/127.0.0.1/1433' 2>/dev/null"
+        "ss -tln | grep -q ':1433 '"
         # or nc -z 127.0.0.1 1433 >/dev/null 2>&1
     )
     while time.monotonic() < deadline:
