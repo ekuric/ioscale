@@ -332,8 +332,9 @@ echo "${MSSQL_SA_PASSWORD}" >> input
 log_info "Waiting for MSSQL configuration to complete..."
 RETRY=0
 while [ $RETRY -lt 12 ]; do
-    if systemctl is-active --quiet mssql-server 2>/dev/null; then
-        log_info "MSSQL Server is running after setup"
+    if systemctl is-active --quiet mssql-server 2>/dev/null && \
+       ss -tln | grep -q ':1433 '; then
+        log_info "MSSQL Server is running after setup (port 1433 listening)"
         break
     fi
     RETRY=$((RETRY + 1))

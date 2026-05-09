@@ -182,7 +182,7 @@ class CommandExecutor:
             ]
     
     def execute_command(self, host: str, command: str, description: str = "command",
-                       timeout: Optional[int] = None) -> Tuple[bool, str]:
+                       timeout: Optional[int] = None, quiet: bool = False) -> Tuple[bool, str]:
         """Execute command on remote host"""
         cmd_timeout = timeout if timeout is not None else 300
         
@@ -205,8 +205,6 @@ class CommandExecutor:
                     logger.info(f"Command output from {host}: {result.stdout}")
                 return True, result.stdout
             else:
-                logger.error(f"Failed to execute '{description}' on {host}")
-                # Combine stdout and stderr for better error reporting
                 error_output = ""
                 if result.stdout:
                     error_output += f"STDOUT: {result.stdout}\n"
@@ -214,7 +212,9 @@ class CommandExecutor:
                     error_output += f"STDERR: {result.stderr}\n"
                 if not error_output:
                     error_output = f"Exit code: {result.returncode}"
-                logger.error(f"Error output: {error_output}")
+                if not quiet:
+                    logger.error(f"Failed to execute '{description}' on {host}")
+                    logger.error(f"Error output: {error_output}")
                 return False, error_output
                 
         except subprocess.TimeoutExpired:
@@ -926,7 +926,7 @@ def wait_for_mssql_ready(config: MSSQLTestConfig, executor: CommandExecutor, hos
         # or nc -z 127.0.0.1 1433 >/dev/null 2>&1
     )
     while time.monotonic() < deadline:
-        success, _ = executor.execute_command(host, cmd, f"Checking MSSQL readiness on {host}")
+        success, _ = executor.execute_command(host, cmd, f"Checking MSSQL readiness on {host}", quiet=True)
         if success:
             logger.info(f"MSSQL Server is ready and running on {host}")
             return
