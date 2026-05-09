@@ -289,31 +289,36 @@ else
 fi
 
 # ----------------------------------------------------------------------------
-# Step 7: Create MSSQL Data Directory
+# Step 7: Create MSSQL Data Directory and Symlink (BEFORE mssql-conf setup)
 # ----------------------------------------------------------------------------
 log_step "Creating MSSQL Data Directory"
 
-log_info "Stopping MSSQL Server before data directory setup..."
-systemctl stop mssql-server || log_info "MSSQL Server was not running"
+log_info "Stopping MSSQL Server if running..."
+systemctl stop mssql-server 2>/dev/null || true
 
 log_info "Removing existing MSSQL data directories..."
-rm -rf "${MOUNTPOINT}/mssql_data" 2>/dev/null || log_info "No existing mssql_data directory to remove"
-rm -rf "${MSSQL_DATA_DIR}" 2>/dev/null || log_info "No existing ${MSSQL_DATA_DIR} directory to remove"
+rm -rf "${MOUNTPOINT}/mssql_data" 2>/dev/null || true
+rm -rf "${MSSQL_DATA_DIR}" 2>/dev/null || true
 
-log_info "Creating MSSQL data directory..."
-mkdir -p "${MOUNTPOINT}/mssql_data" || error_exit "Failed to create MSSQL data directory"
+log_info "Creating data directory on dedicated disk: ${MOUNTPOINT}/mssql_data/data..."
+mkdir -p "${MOUNTPOINT}/mssql_data/data" || error_exit "Failed to create MSSQL data directory"
 
 log_info "Setting permissions on MSSQL data directory..."
-chmod 777 /var/opt 2>/dev/null || log_info "Could not set permissions on /var/opt"
+chmod 777 /var/opt 2>/dev/null || true
 chown -R mssql:mssql "${MOUNTPOINT}/mssql_data" || error_exit "Failed to set ownership"
 
+log_info "Creating symlink: ${MSSQL_DATA_DIR}/data -> ${MOUNTPOINT}/mssql_data/data..."
+mkdir -p "${MSSQL_DATA_DIR}/secrets/" || error_exit "Failed to create secrets directory"
+ln -sf "${MOUNTPOINT}/mssql_data/data" "${MSSQL_DATA_DIR}/data" || \
+    error_exit "Failed to create symbolic link"
+chown -R mssql:mssql "${MSSQL_DATA_DIR}" || error_exit "Failed to set ownership on ${MSSQL_DATA_DIR}"
+
+log_info "MSSQL data will be written directly to ${MOUNTPOINT} via symlink"
+
 # ----------------------------------------------------------------------------
-# Step 8: Configure MSSQL Server
+# Step 8: Configure and Start MSSQL Server
 # ----------------------------------------------------------------------------
 log_step "Configuring MSSQL Server"
-
-log_info "Creating MSSQL secrets directory..."
-mkdir -p "${MSSQL_DATA_DIR}/secrets/" || error_exit "Failed to create secrets directory"
 
 log_info "Setting MSSQL environment variables..."
 export MSSQL_SA_PASSWORD="${MSSQL_SA_PASSWORD}"
@@ -321,66 +326,57 @@ export MSSQL_PID="${MSSQL_PID}"
 
 cd /opt/mssql/bin/ || error_exit "Cannot change to MSSQL bin directory"
 
-log_info "Running MSSQL configuration setup..."
+log_info "Running MSSQL configuration setup (data writes directly to ${MOUNTPOINT} via symlink)..."
 echo "1" > input
 echo "Yes" >> input
 echo "${MSSQL_SA_PASSWORD}" >> input
 echo "${MSSQL_SA_PASSWORD}" >> input
 
 ./mssql-conf -n setup accept-eula < input || error_exit "MSSQL configuration setup failed"
+rm -f input
 
-log_info "Waiting for MSSQL configuration to complete..."
-RETRY=0
-while [ $RETRY -lt 12 ]; do
+log_info "Waiting for MSSQL Server to be ready after setup..."
+RETRY_COUNT=0
+MAX_RETRIES=30
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
     if systemctl is-active --quiet mssql-server 2>/dev/null && \
        ss -tln | grep -q ':1433 '; then
-        log_info "MSSQL Server is running after setup (port 1433 listening)"
+        log_info "MSSQL Server is ready (port 1433 accepting connections)"
         break
     fi
-    RETRY=$((RETRY + 1))
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    if [ $((RETRY_COUNT % 5)) -eq 0 ]; then
+        log_info "Waiting for MSSQL Server to be ready... (attempt $RETRY_COUNT/$MAX_RETRIES)"
+    fi
     sleep 5
 done
 
-log_info "Stopping MSSQL Server to move data directory..."
-systemctl stop mssql-server || log_info "MSSQL Server was not running"
-
-# ----------------------------------------------------------------------------
-# Step 9: Move MSSQL Data to Mount Point
-# ----------------------------------------------------------------------------
-log_step "Moving MSSQL Data Directory"
-
-if [ -d "${MSSQL_DATA_DIR}/data" ]; then
-    log_info "Moving MSSQL data directory to ${MOUNTPOINT}/mssql_data/data..."
-    mv "${MSSQL_DATA_DIR}/data" "${MOUNTPOINT}/mssql_data/data" || \
-        error_exit "Failed to move MSSQL data directory"
-    
-    log_info "Creating symbolic link from ${MSSQL_DATA_DIR}/data to ${MOUNTPOINT}/mssql_data/data..."
-    ln -sf "${MOUNTPOINT}/mssql_data/data" "${MSSQL_DATA_DIR}/data" || \
-        error_exit "Failed to create symbolic link"
-else
-    log_info "MSSQL data directory not found, creating new one..."
-    mkdir -p "${MOUNTPOINT}/mssql_data/data" || error_exit "Failed to create MSSQL data directory"
-    chown -R mssql:mssql "${MOUNTPOINT}/mssql_data" || error_exit "Failed to set ownership"
-    ln -sf "${MOUNTPOINT}/mssql_data/data" "${MSSQL_DATA_DIR}/data" || \
-        error_exit "Failed to create symbolic link"
+if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+    log_info "Warning: MSSQL Server may not be fully ready, continuing anyway"
 fi
 
 # ----------------------------------------------------------------------------
-# Step 10: Configure MSSQL Settings
+# Step 9: Configure MSSQL Settings and Memory Limit
 # ----------------------------------------------------------------------------
 log_step "Configuring MSSQL Settings"
+
+log_info "Setting MSSQL Server memory limit to 80% of total RAM..."
+TOTMEM_KB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
+TOTMEM_MB=$((TOTMEM_KB / 1024))
+MSSQL_MAX_MEM=$((TOTMEM_MB * 80 / 100))
+log_info "Total RAM: ${TOTMEM_MB}MB, MSSQL max: ${MSSQL_MAX_MEM}MB (80%), OS reserved: $((TOTMEM_MB - MSSQL_MAX_MEM))MB (20%)"
+/opt/mssql/bin/mssql-conf set memory.memorylimitmb ${MSSQL_MAX_MEM} 2>/dev/null || \
+    log_info "Warning: Failed to set memory limit"
 
 cd "${HAMMERDB_INSTALL_DIR}" || error_exit "Cannot change to HammerDB install directory"
 
 if [ -f "mssql.conf" ]; then
     log_info "Updating MSSQL configuration..."
-    # Add FUA Traceflag if not already present
     if ! grep -q "Traceflag15 = 3982" mssql.conf 2>/dev/null; then
         echo "Traceflag15 = 3982" >> mssql.conf
         log_info "Added FUA Traceflag to configuration"
     fi
     
-    # Update Writethrough setting
     sed -i "s/^Writethrough.*/Writethrough = 1/" mssql.conf || \
         log_info "Warning: Failed to update Writethrough setting"
     
@@ -396,15 +392,15 @@ EOF
 fi
 
 # ----------------------------------------------------------------------------
-# Step 11: Start MSSQL Server
+# Step 10: Restart MSSQL Server with Final Configuration
 # ----------------------------------------------------------------------------
-log_step "Starting MSSQL Server"
+log_step "Restarting MSSQL Server"
 
-log_info "Disabling MSSQL Server service (will be started manually)..."
-systemctl disable mssql-server.service || log_info "Warning: Failed to disable service"
+log_info "Disabling MSSQL Server auto-start..."
+systemctl disable mssql-server.service 2>/dev/null || true
 
-log_info "Starting MSSQL Server..."
-systemctl restart mssql-server.service || error_exit "Failed to start MSSQL Server"
+log_info "Restarting MSSQL Server with final configuration..."
+systemctl restart mssql-server.service || error_exit "Failed to restart MSSQL Server"
 
 log_info "Waiting for MSSQL Server to be ready..."
 RETRY_COUNT=0
