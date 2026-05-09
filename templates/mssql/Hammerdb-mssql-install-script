@@ -399,6 +399,9 @@ fi
 # ----------------------------------------------------------------------------
 log_step "Starting MSSQL Server"
 
+log_info "Disabling forced encryption (fixes sqlcmd TLS hang on Fedora 42 / OpenSSL 3.2)..."
+/opt/mssql/bin/mssql-conf set network.forceencryption 0 2>/dev/null || true
+
 log_info "Disabling MSSQL Server service (will be started manually)..."
 systemctl disable mssql-server.service || log_info "Warning: Failed to disable service"
 
@@ -409,8 +412,9 @@ log_info "Waiting for MSSQL Server to be ready..."
 RETRY_COUNT=0
 MAX_RETRIES=30
 while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-    if sqlcmd -S localhost -U sa -P "${MSSQL_SA_PASSWORD}" -C -Q "SELECT 1" >/dev/null 2>&1; then
-        log_info "MSSQL Server is ready"
+    if systemctl is-active --quiet mssql-server 2>/dev/null && \
+       bash -c 'echo > /dev/tcp/127.0.0.1/1433' 2>/dev/null; then
+        log_info "MSSQL Server is ready (port 1433 accepting connections)"
         break
     fi
     RETRY_COUNT=$((RETRY_COUNT + 1))

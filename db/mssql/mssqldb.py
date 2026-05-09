@@ -610,12 +610,12 @@ def ensure_packages_installed(config: MSSQLTestConfig, executor: CommandExecutor
                 "  echo \"All required packages are already installed\"; "
                 "else "
                 "  echo \"Installing required packages...\"; "
-                "  dnf -y install curl vim wget git; "
+                "  dnf -y --nobest install curl vim wget git; "
                 "  echo \"Package installation completed\"; "
                 "fi"
                 "'"
             )
-            future = pool.submit(executor.execute_command, host, cmd, "Checking and installing required packages")
+            future = pool.submit(executor.execute_command, host, cmd, "Checking and installing required packages", timeout=600)
             futures.append(future)
         
         failed = 0
@@ -922,8 +922,8 @@ def wait_for_mssql_ready(config: MSSQLTestConfig, executor: CommandExecutor, hos
     password = shlex.quote(config.mssql_pass)
     cmd = (
         "systemctl is-active --quiet mssql-server && "
-        f"sqlcmd -S localhost -U sa -P {password} -C "
-        "-Q \"SELECT 1\" -b -l 5 -t 5 >/dev/null 2>&1"
+        "bash -c 'echo > /dev/tcp/127.0.0.1/1433' 2>/dev/null"
+        # or nc -z 127.0.0.1 1433 >/dev/null 2>&1
     )
     while time.monotonic() < deadline:
         success, _ = executor.execute_command(host, cmd, f"Checking MSSQL readiness on {host}")
