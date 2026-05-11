@@ -2279,6 +2279,8 @@ EXAMPLES:
         logger.info("Prepare-machine mode complete; skipping tests and result collection")
         return
 
+    prepare_windows_machines(config, executor)
+
     if not config.windows_hammerdb_path:
         logger.error("windows.hammerdb_path is required for Windows testing")
         sys.exit(1)

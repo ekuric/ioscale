@@ -24,7 +24,6 @@ pipeline {
         string(name: 'MIGRATE_USER_COUNTS', defaultValue: '',                  description: 'User counts triggering VM migration (space-separated, empty = no migration)')
         string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
         string(name: 'DESCRIPTION',       defaultValue: 'jenkins-mariadb-test', description: 'Test run description')
-        booleanParam(name: 'PREPARE_HOSTS', defaultValue: true, description: 'Run --prepare-hosts before test (install packages, clone repo, setup MariaDB)')
     }
 
     environment {
@@ -46,45 +45,12 @@ pipeline {
             }
         }
 
-        stage('Prepare Hosts') {
-            when { expression { params.PREPARE_HOSTS } }
-            steps {
-                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
-                    sh """
-                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
-                            podman run --rm \
-                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
-                              -e NAMESPACE="${params.NAMESPACE}" \
-                              -e DISK_LIST="${params.DISK_LIST}" \
-                              -e MOUNT_POINT="${params.MOUNT_POINT}" \
-                              -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
-                              -e HAMMERDB_PATH="${params.HAMMERDB_PATH}" \
-                              -e HAMMERDB_INSTALL_DIR="${params.HAMMERDB_INSTALL_DIR}" \
-                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
-                              -v /root/.kube/config:/root/.kube/config \
-                              --privileged \
-                              ${params.CONTAINER_IMAGE} \
-                              --prepare-hosts
-                        '
-                    """
-                }
-            }
-        }
-
-        stage('Wait for Hosts') {
-            when { expression { params.PREPARE_HOSTS } }
-            steps {
-                echo "Waiting 120 seconds for hosts to settle after preparation..."
-                sleep time: 120, unit: 'SECONDS'
-            }
-        }
-
         stage('Run MariaDB Test') {
             steps {
                 sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
-                            podman run --rm \
+                            podman run --rm --pids-limit=-1 \
                               -e HOST_PATTERN="${params.HOST_PATTERN}" \
                               -e NAMESPACE="${params.NAMESPACE}" \
                               -e DISK_LIST="${params.DISK_LIST}" \
