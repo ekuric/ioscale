@@ -1,30 +1,9 @@
-FROM fedora:latest
-
-RUN dnf install -y \
-        python3 \
-        python3-pyyaml \
-        openssh-clients \
-    && dnf clean all
-
-# Install oc CLI
-RUN curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz \
-    | tar xzf - -C /usr/local/bin oc kubectl \
-    && chmod +x /usr/local/bin/oc /usr/local/bin/kubectl
-
-# Install virtctl
-ARG VIRTCTL_VERSION=v1.7.3
-RUN curl -sL -o /usr/local/bin/virtctl \
-        "https://github.com/kubevirt/kubevirt/releases/download/${VIRTCTL_VERSION}/virtctl-${VIRTCTL_VERSION}-linux-amd64" \
-    && chmod +x /usr/local/bin/virtctl
-
-WORKDIR /work
+FROM quay.io/ekuric/benchmark-base:latest
 
 COPY mssqlwin.py .
 COPY templates/ templates/
-COPY mssql-configwin.yaml mssql-configwin-example.yaml
+COPY mssql-configwin.yaml examples/
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
-
-RUN mkdir -p results
 
 ENTRYPOINT ["/work/entrypoint.sh"]
