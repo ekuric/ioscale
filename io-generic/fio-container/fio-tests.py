@@ -2007,6 +2007,33 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
     logger.info("Test dataset writing completed")
 
 
+def is_migration_in_flight(namespace: str, vm_name: str) -> bool:
+    """Check if a VM already has an active migration in progress"""
+    try:
+        result = subprocess.run(
+            ["oc", "get", "vmim", "-n", namespace,
+             "-o", "jsonpath={.items[*].metadata.name}",
+             "--field-selector", "status.phase!=Succeeded,status.phase!=Failed"],
+            capture_output=True, text=True, timeout=15
+        )
+        if result.returncode != 0:
+            return False
+        
+        active_migrations = result.stdout.strip()
+        if not active_migrations:
+            return False
+        
+        check_result = subprocess.run(
+            ["oc", "get", "vmim", "-n", namespace,
+             "-o", "jsonpath={range .items[?(@.spec.vmiName==\"" + vm_name + "\")]}{.metadata.name}{end}",
+             "--field-selector", "status.phase!=Succeeded,status.phase!=Failed"],
+            capture_output=True, text=True, timeout=15
+        )
+        return bool(check_result.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        return False
+
+
 def migrate_vms_during_test(config: FioTestConfig, pattern: str) -> bool:
     """Migrate VMs during FIO test"""
     if not config.migrate_workloads or pattern not in config.migrate_workloads:
@@ -2055,39 +2082,50 @@ def migrate_vms_during_test(config: FioTestConfig, pattern: str) -> bool:
                 logger.error(f"✗ Failed to migrate VM: {vm} - {e}")
                 failed_vms.append(vm)
         
-        # Retry failed migrations
+        # Retry failed migrations (skip VMs that already have an active migration)
         if failed_vms:
-            logger.info(f"Retrying {len(failed_vms)} failed VM migrations: {', '.join(failed_vms)}")
-            retry_failed = []
+            actually_failed = []
             for vm in failed_vms:
-                logger.info(f"Retrying migration for VM: {vm}")
-                try:
-                    result = subprocess.run(
-                        ["virtctl", "-n", config.namespace, "migrate", vm],
-                        capture_output=True,
-                        timeout=config.timeout_migration
-                    )
-                    if result.returncode == 0:
-                        logger.info(f"✓ Successfully migrated VM: {vm} (retry)")
-                    else:
-                        logger.error(f"✗ Failed to migrate VM: {vm} (retry)")
-                        if result.stderr:
-                            logger.error(f"  Error: {result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr}")
-                        retry_failed.append(vm)
-                    
-                    if vm != failed_vms[-1]:
-                        time.sleep(config.migrate_interval)
-                except Exception as e:
-                    logger.error(f"✗ Failed to migrate VM: {vm} (retry) - {e}")
-                    retry_failed.append(vm)
+                if is_migration_in_flight(config.namespace, vm):
+                    logger.info(f"⟳ VM {vm} already has migration in progress - skipping retry")
+                else:
+                    actually_failed.append(vm)
             
-            if retry_failed:
-                logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
-                return False
+            if actually_failed:
+                logger.info(f"Retrying {len(actually_failed)} failed VM migrations: {', '.join(actually_failed)}")
+                retry_failed = []
+                for vm in actually_failed:
+                    logger.info(f"Retrying migration for VM: {vm}")
+                    try:
+                        result = subprocess.run(
+                            ["virtctl", "-n", config.namespace, "migrate", vm],
+                            capture_output=True,
+                            timeout=config.timeout_migration
+                        )
+                        if result.returncode == 0:
+                            logger.info(f"✓ Successfully migrated VM: {vm} (retry)")
+                        else:
+                            logger.error(f"✗ Failed to migrate VM: {vm} (retry)")
+                            if result.stderr:
+                                logger.error(f"  Error: {result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr}")
+                            retry_failed.append(vm)
+                        
+                        if vm != actually_failed[-1]:
+                            time.sleep(config.migrate_interval)
+                    except Exception as e:
+                        logger.error(f"✗ Failed to migrate VM: {vm} (retry) - {e}")
+                        retry_failed.append(vm)
+                
+                if retry_failed:
+                    logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
+                    return False
+                else:
+                    logger.info(f"All failed migrations succeeded on retry")
             else:
-                logger.info(f"All failed migrations succeeded on retry")
-                logger.info(f"All VM migrations completed successfully for pattern '{pattern}' (after retry)")
-                return True
+                logger.info(f"All 'failed' VMs already have migrations in progress - no retry needed")
+            
+            logger.info(f"All VM migrations completed successfully for pattern '{pattern}' (after retry)")
+            return True
         
         logger.info(f"All VM migrations completed successfully for pattern '{pattern}'")
         return True
@@ -2124,26 +2162,37 @@ def migrate_vms_during_test(config: FioTestConfig, pattern: str) -> bool:
                 if not success:
                     failed_vms.append(vm_name)
         
-        # Retry failed migrations
+        # Retry failed migrations (skip VMs that already have an active migration)
         if failed_vms:
-            logger.info(f"Retrying {len(failed_vms)} failed VM migrations in parallel: {', '.join(failed_vms)}")
-            with ThreadPoolExecutor(max_workers=len(failed_vms)) as pool:
-                futures = [pool.submit(migrate_vm, vm) for vm in failed_vms]
-                retry_failed = []
-                for future in as_completed(futures):
-                    success, vm_name = future.result()
-                    if not success:
-                        retry_failed.append(vm_name)
-                    else:
-                        logger.info(f"✓ Successfully migrated VM: {vm_name} (retry)")
+            actually_failed = []
+            for vm in failed_vms:
+                if is_migration_in_flight(config.namespace, vm):
+                    logger.info(f"⟳ VM {vm} already has migration in progress - skipping retry")
+                else:
+                    actually_failed.append(vm)
             
-            if retry_failed:
-                logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
-                return False
+            if actually_failed:
+                logger.info(f"Retrying {len(actually_failed)} failed VM migrations in parallel: {', '.join(actually_failed)}")
+                with ThreadPoolExecutor(max_workers=len(actually_failed)) as pool:
+                    futures = [pool.submit(migrate_vm, vm) for vm in actually_failed]
+                    retry_failed = []
+                    for future in as_completed(futures):
+                        success, vm_name = future.result()
+                        if not success:
+                            retry_failed.append(vm_name)
+                        else:
+                            logger.info(f"✓ Successfully migrated VM: {vm_name} (retry)")
+                
+                if retry_failed:
+                    logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
+                    return False
+                else:
+                    logger.info(f"All failed migrations succeeded on retry")
             else:
-                logger.info(f"All failed migrations succeeded on retry")
-                logger.info(f"All VM migrations completed successfully for pattern '{pattern}' (after retry)")
-                return True
+                logger.info(f"All 'failed' VMs already have migrations in progress - no retry needed")
+            
+            logger.info(f"All VM migrations completed successfully for pattern '{pattern}' (after retry)")
+            return True
         
         logger.info(f"All VM migrations completed successfully for pattern '{pattern}'")
         return True
