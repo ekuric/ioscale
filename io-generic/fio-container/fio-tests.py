@@ -261,7 +261,8 @@ class CommandExecutor:
     def execute_command(self, host: str, command: str, description: str = "command",
                        max_retries: Optional[int] = None,
                        retry_interval: Optional[int] = None,
-                       timeout: Optional[int] = None) -> Tuple[bool, str]:
+                       timeout: Optional[int] = None,
+                       quiet: bool = False) -> Tuple[bool, str]:
         """Execute command on remote host with retry logic"""
         # Use provided values or fall back to config (which must be set)
         max_retries = max_retries if max_retries is not None else self.config.max_retries
@@ -326,44 +327,46 @@ class CommandExecutor:
                     return True, result.stdout
                 
                 if attempt < max_retries:
-                    logger.warning(f"Command failed on {host} (attempt {attempt}/{max_retries}): {description}")
-                    logger.warning(f"Exit code: {result.returncode}")
-                    if result.stderr:
-                        logger.warning(f"Error output: {result.stderr}")
-                    if result.stdout:
-                        logger.warning(f"Standard output: {result.stdout}")
-                    logger.warning(f"Retrying in {retry_interval}s...")
+                    if not quiet:
+                        logger.warning(f"Command failed on {host} (attempt {attempt}/{max_retries}): {description}")
+                        logger.warning(f"Exit code: {result.returncode}")
+                        if result.stderr:
+                            logger.warning(f"Error output: {result.stderr}")
+                        if result.stdout:
+                            logger.warning(f"Standard output: {result.stdout}")
+                        logger.warning(f"Retrying in {retry_interval}s...")
                     time.sleep(retry_interval)
                 else:
-                    # For process checks (non-critical), use warning instead of error
-                    # Process checks are expected to fail sometimes (process might not be running)
                     is_process_check = "process" in description.lower() or "task" in description.lower() or "checking if" in description.lower()
-                    log_level = logger.warning if is_process_check else logger.error
-                    log_prefix = "WARNING" if is_process_check else "ERROR"
-                    
-                    log_level(f"{log_prefix}: Failed to execute '{description}' on {host} after {max_retries} attempts")
-                    log_level(f"{log_prefix}: Exit code: {result.returncode}")
-                    if result.stderr:
-                        log_level(f"{log_prefix}: Error output: {result.stderr}")
-                    if result.stdout:
-                        log_level(f"{log_prefix}: Standard output: {result.stdout}")
-                    if is_process_check:
-                        log_level(f"{log_prefix}: This is a non-critical process check - assuming process is not running (fail-safe behavior)")
+                    if not quiet:
+                        log_level = logger.warning if is_process_check else logger.error
+                        log_prefix = "WARNING" if is_process_check else "ERROR"
+                        
+                        log_level(f"{log_prefix}: Failed to execute '{description}' on {host} after {max_retries} attempts")
+                        log_level(f"{log_prefix}: Exit code: {result.returncode}")
+                        if result.stderr:
+                            log_level(f"{log_prefix}: Error output: {result.stderr}")
+                        if result.stdout:
+                            log_level(f"{log_prefix}: Standard output: {result.stdout}")
+                        if is_process_check:
+                            log_level(f"{log_prefix}: This is a non-critical process check - assuming process is not running (fail-safe behavior)")
                     return False, result.stderr or result.stdout or "Command failed with no output"
                     
             except subprocess.TimeoutExpired:
-                # For quick checks (short timeout), use warning instead of error
-                if cmd_timeout <= 30:
-                    logger.warning(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s)")
-                else:
-                    logger.error(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s)")
+                if not quiet:
+                    if cmd_timeout <= 30:
+                        logger.warning(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s)")
+                    else:
+                        logger.error(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s)")
                 return False, "Command timeout"
             except Exception as e:
                 if attempt < max_retries:
-                    logger.warning(f"Command error on {host} (attempt {attempt}/{max_retries}): {str(e)}")
+                    if not quiet:
+                        logger.warning(f"Command error on {host} (attempt {attempt}/{max_retries}): {str(e)}")
                     time.sleep(retry_interval)
                 else:
-                    logger.error(f"Command exception on {host}: {str(e)}")
+                    if not quiet:
+                        logger.error(f"Command exception on {host}: {str(e)}")
                     return False, str(e)
         
         return False, "Max retries exceeded"
@@ -1287,103 +1290,59 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
         drive_letter = root_dir_ps[0].upper() if root_dir_ps else "D"
         logger.info(f"Ensuring Windows disk is provisioned for drive {drive_letter}: before FIO installation...")
         
-        # Check if the drive exists, and if not, provision it
+        # Check if the drive exists, and if not, provision it -- all in parallel
         with ThreadPoolExecutor(max_workers=len(windows_hosts)) as pool:
             provision_futures = []
             for host in windows_hosts:
                 device = config.windows_storage_devices.get(host, "1")
-                # Check if drive exists - use a more robust check that handles errors properly
-                # Test-Path returns $true/$false, so we check the output explicitly
-                check_drive_cmd = f"powershell -Command \"$result = Test-Path '{drive_letter}:\\'; if ($result) {{ Write-Host 'EXISTS' }} else {{ Write-Host 'NOT_FOUND' }}\""
-                logger.debug(f"Checking if drive {drive_letter}: exists on {host}...")
-                check_success, check_output = executor.execute_command(host, check_drive_cmd, f"Checking if drive {drive_letter}: exists", timeout=10)
-                
-                # Log the check result for debugging
-                if check_success:
-                    logger.debug(f"Drive check output from {host}: {check_output.strip()}")
-                else:
-                    logger.warning(f"Drive check command failed on {host}: {check_output}")
-                
-                # If check succeeded and drive exists, skip provisioning
-                if check_success and 'EXISTS' in check_output:
-                    logger.info(f"Drive {drive_letter}: already exists on {host} - skipping disk provisioning")
-                else:
-                    # Drive doesn't exist or check failed - need to provision it
-                    logger.info(f"Drive {drive_letter}: not found on {host} (or check failed) - provisioning disk {device}...")
-                    # Match bash script format: powershell c:\tools\setup\provision-data-disk.ps1 -DiskID {device}
-                    provision_cmd = f"powershell c:\\tools\\setup\\provision-data-disk.ps1 -DiskID {device}"
-                    future = pool.submit(executor.execute_command, host, provision_cmd, "Provisioning Windows disk for FIO installation")
-                    provision_futures.append((future, host))
+                cmd = (
+                    f"powershell -Command \""
+                    f"if (Test-Path '{drive_letter}:\\') {{ Write-Host 'DRIVE_EXISTS' }} "
+                    f"else {{ "
+                    f"Write-Host 'PROVISIONING'; "
+                    f"& c:\\tools\\setup\\provision-data-disk.ps1 -DiskID {device}; "
+                    f"Write-Host 'PROVISIONED' "
+                    f"}}\""
+                )
+                future = pool.submit(executor.execute_command, host, cmd, f"Checking/provisioning drive {drive_letter}: on {host}", timeout=config.timeout_default)
+                provision_futures.append((future, host))
             
-            # Wait for all disk provisioning to complete
-            if provision_futures:
-                logger.info(f"Waiting for disk provisioning to complete on {len(provision_futures)} host(s)...")
-                for future, host in provision_futures:
-                    success, output = future.result()
-                    if not success:
-                        logger.error(f"Failed to provision disk on {host}: {output}")
-                        logger.error(f"Cannot proceed with FIO installation - disk must be provisioned first")
-                        sys.exit(1)
-                    else:
-                        logger.info(f"Disk provisioning completed on {host} - drive {drive_letter}: is now available")
-                
-                # Verify the drive exists after provisioning
-                logger.info(f"Verifying drive {drive_letter}: exists after provisioning...")
-                for host in windows_hosts:
-                    verify_cmd = f"powershell -Command \"$result = Test-Path '{drive_letter}:\\'; if ($result) {{ Write-Host 'EXISTS' }} else {{ Write-Host 'NOT_FOUND' }}\""
-                    verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying drive {drive_letter}: after provisioning", timeout=10)
-                    if verify_success and 'EXISTS' in verify_output:
-                        logger.info(f"✓ Drive {drive_letter}: verified on {host}")
-                    else:
-                        logger.error(f"✗ Drive {drive_letter}: still not found on {host} after provisioning - cannot proceed")
-                        sys.exit(1)
-            else:
-                logger.info("All drives already exist - no provisioning needed")
+            # Wait for all check/provision to complete
+            provisioned = 0
+            existed = 0
+            for future, host in provision_futures:
+                success, output = future.result()
+                if not success:
+                    logger.error(f"Failed to check/provision disk on {host}: {output}")
+                    sys.exit(1)
+                elif output and 'DRIVE_EXISTS' in output:
+                    existed += 1
+                else:
+                    provisioned += 1
+            if existed > 0:
+                logger.info(f"Drive {drive_letter}: already existed on {existed} host(s)")
+            if provisioned > 0:
+                logger.info(f"Drive {drive_letter}: provisioned on {provisioned} host(s)")
         
         logger.info(f"Copying FIO from c:\\tools\\fio to {root_dir_ps_with_slash} on Windows hosts...")
         logger.info(f"Source path: c:\\tools\\fio, Destination path: {root_dir_ps_with_slash}")
         with ThreadPoolExecutor(max_workers=len(windows_hosts)) as pool:
             futures = []
-            host_futures = {}  # Track which host each future belongs to
             for host in windows_hosts:
-                # First, verify source exists
-                check_source_cmd = f"powershell -Command \"if (Test-Path 'c:\\tools\\fio') {{ Write-Host 'SOURCE_EXISTS' }} else {{ Write-Host 'SOURCE_NOT_FOUND' }}\""
-                check_success, check_output = executor.execute_command(host, check_source_cmd, "Checking if source directory exists", timeout=10)
-                if check_success and 'SOURCE_EXISTS' in check_output:
-                    logger.info(f"Source directory c:\\tools\\fio exists on {host}")
-                else:
-                    logger.warning(f"Source directory c:\\tools\\fio may not exist on {host}: {check_output}")
-                
-                # Match bash script format exactly: "powershell copy-item -Path c:\tools\fio -Destination $ROOT_DIR -recurse -force"
-                # The bash script doesn't use -Command flag or quotes around paths
-                # Use backslashes in paths to match Windows convention
-                cmd = f"powershell copy-item -Path c:\\tools\\fio -Destination {root_dir_ps_with_slash} -recurse -force"
-                logger.debug(f"Executing on {host}: {cmd}")
-                future = pool.submit(executor.execute_command, host, cmd, "Installing FIO on Windows host")
+                cmd = f"powershell -Command \"if (Test-Path 'c:\\tools\\fio') {{ copy-item -Path c:\\tools\\fio -Destination {root_dir_ps_with_slash} -recurse -force; Write-Host 'FIO_COPIED' }} else {{ Write-Host 'SOURCE_NOT_FOUND' }}\""
+                future = pool.submit(executor.execute_command, host, cmd, f"Installing FIO on {host}")
                 futures.append(future)
-                host_futures[future] = host
             
             # Wait for all installations to complete
             failed = 0
             for future in as_completed(futures):
-                host = host_futures[future]
                 success, output = future.result()
                 if not success:
-                    logger.error(f"Failed to install FIO on {host}: {output}")
                     failed += 1
-                else:
-                    # Log output to verify the copy actually happened
-                    if output:
-                        logger.info(f"FIO installation output from {host}: {output.strip()[:200]}")
-                    # Verify the copy by checking if fio directory exists
-                    verify_cmd = f"powershell -Command \"if (Test-Path '{root_dir_ps_with_slash}fio') {{ Write-Host 'EXISTS' }} else {{ Write-Host 'NOT_FOUND' }}\""
-                    verify_success, verify_output = executor.execute_command(host, verify_cmd, "Verifying FIO installation", timeout=10)
-                    if verify_success and 'EXISTS' in verify_output:
-                        logger.info(f"FIO installation verified on {host} - fio directory exists at {root_dir_ps_with_slash}fio")
-                    else:
-                        logger.warning(f"FIO installation may have failed on {host} - fio directory not found at {root_dir_ps_with_slash}fio")
-                        if verify_output:
-                            logger.warning(f"Verification output from {host}: {verify_output.strip()}")
+                elif output:
+                    if 'SOURCE_NOT_FOUND' in output:
+                        logger.warning(f"Source c:\\tools\\fio not found on a host")
+                        failed += 1
             
             if failed > 0:
                 logger.error(f"{failed}/{len(windows_hosts)} Windows hosts failed to install FIO")
@@ -1732,59 +1691,35 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
         completed_count = 0
         total_hosts = len(config.vm_hosts)
         
-        for host in config.vm_hosts:
-            file_exists = False
-            # Check if FIO process is still running, and if output file exists with content
-            # FIO will run for the specified runtime to write data
-            if executor.is_windows_host(host):
-                output_dir_win = normalize_windows_path(config.windows_output_dir)
-                output_file = f"{output_dir_win}/write_dataset.json"
-                # Check if file exists and has content
-                check_cmd = f"powershell -Command \"if (Test-Path '{output_file}') {{ $file = Get-Item '{output_file}'; if ($file.Length -gt 0) {{ Write-Host 'EXISTS' }} else {{ Write-Host 'EMPTY' }} }} else {{ Write-Host 'NOT_FOUND' }}\""
-                success, output = executor.execute_command(host, check_cmd, "Checking dataset file", timeout=10)
-                if success and output and 'EXISTS' in output:
-                    file_exists = True
-                    completed_count += 1
-                elif success and output and 'EMPTY' in output:
-                    # File exists but is empty - FIO might still be writing
-                    if executor.check_task_running(host, "fio"):
-                        all_done = False
-                    else:
-                        logger.warning(f"Dataset file exists but is empty on {host} and FIO is not running")
-                        all_done = False
-                elif success and output and 'NOT_FOUND' in output:
-                    # File doesn't exist yet - check if FIO is still running
-                    if executor.check_task_running(host, "fio"):
-                        all_done = False
-                    else:
-                        # FIO not running and file doesn't exist - might have failed
-                        logger.warning(f"FIO not running and dataset file not found on {host}")
-                        all_done = False
+        with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), 50)) as pool:
+            check_futures = []
+            for host in config.vm_hosts:
+                if executor.is_windows_host(host):
+                    output_dir_win = normalize_windows_path(config.windows_output_dir)
+                    output_file = f"{output_dir_win}/write_dataset.json"
+                    check_cmd = (
+                        f"powershell -Command \""
+                        f"if (Test-Path '{output_file}') {{ $f = Get-Item '{output_file}'; if ($f.Length -gt 0) {{ Write-Host 'DONE' }} else {{ Write-Host 'RUNNING' }} }} "
+                        f"else {{ $p = Get-Process fio -ErrorAction SilentlyContinue; if ($p) {{ Write-Host 'RUNNING' }} else {{ Write-Host 'FAILED' }} }}\""
+                    )
                 else:
-                    # Check command failed - try checking process as fallback
-                    if executor.check_task_running(host, "fio"):
-                        all_done = False
-            else:
-                # Linux: Check for output file
-                output_file = f"{config.output_dir}/write_dataset.json"
-                check_cmd = f"test -f {output_file} && test -s {output_file} && echo 'EXISTS' || echo 'NOT_FOUND'"
-                success, output = executor.execute_command(host, check_cmd, "Checking dataset file", timeout=10)
-                if success and output and 'EXISTS' in output:
-                    file_exists = True
+                    output_file = f"{config.output_dir}/write_dataset.json"
+                    check_cmd = (
+                        f"test -f {output_file} && test -s {output_file} && echo 'DONE' || "
+                        f"(pgrep -f 'fio.*testfile' >/dev/null 2>&1 && echo 'RUNNING' || echo 'FAILED')"
+                    )
+                future = pool.submit(executor.execute_command, host, check_cmd, "Checking dataset status", quiet=True, timeout=15)
+                check_futures.append((future, host))
+
+            for future, host in check_futures:
+                success, output = future.result()
+                if success and output and 'DONE' in output:
                     completed_count += 1
+                elif success and output and 'RUNNING' in output:
+                    all_done = False
                 else:
-                    # File doesn't exist or is empty - check if FIO is still running
-                    if executor.check_task_running(host, "fio.*testfile|bash.*fio.*testfile"):
-                        all_done = False
-                    else:
-                        # FIO not running - check if file exists but is empty
-                        check_empty_cmd = f"test -f {output_file} && echo 'EXISTS_EMPTY' || echo 'NOT_FOUND'"
-                        empty_success, empty_output = executor.execute_command(host, check_empty_cmd, "Checking if file is empty", timeout=10)
-                        if empty_success and 'EXISTS_EMPTY' in empty_output:
-                            logger.warning(f"Dataset file exists but is empty on {host} and FIO is not running")
-                        else:
-                            logger.warning(f"FIO not running and dataset file not found on {host}")
-                        all_done = False
+                    logger.warning(f"FIO dataset write may have failed on {host}")
+                    all_done = False
         
         if all_done:
             # All hosts have completed (file exists or process finished)

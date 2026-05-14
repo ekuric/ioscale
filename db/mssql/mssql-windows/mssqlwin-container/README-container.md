@@ -8,13 +8,13 @@ mount a config file, use environment variables, or both.
 
 ```bash
 cd mssql-container
-podman build -t quay.io/ekuric/benchmark:latest .
+podman build -t quay.io/ekuric/mssqlwin-benchmark:latest .
 ```
 
 Override the virtctl version at build time:
 
 ```bash
-podman build --build-arg VIRTCTL_VERSION=v1.8.0 -t quay.io/ekuric/benchmark:latest .
+podman build --build-arg VIRTCTL_VERSION=v1.8.0 -t quay.io/ekuric/mssqlwin-benchmark:latest .
 ```
 
 ## Two Usage Modes
@@ -30,7 +30,7 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest
+  quay.io/ekuric/mssqlwin-benchmark:latest
 ```
 
 ### Mode 2: Env vars only (CI/CD)
@@ -50,7 +50,7 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest
+  quay.io/ekuric/mssqlwin-benchmark:latest
 ```
 
 **How it works:** If a config file exists at the `CONFIG` path, it is used
@@ -133,7 +133,7 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
   --verbose
 ```
 
@@ -146,7 +146,7 @@ podman run --rm \
   -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
   --dry-run
 ```
 
@@ -161,7 +161,7 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
   --copy-results
 ```
 
@@ -173,7 +173,7 @@ Force plain SSH for all hosts (overrides the default `--virtctl-only`).
 podman run --rm \
   -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
-  quay.io/ekuric/benchmark:latest \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
   --ssh-only
 ```
 
@@ -185,7 +185,7 @@ Only generate per-user config files locally and exit (no SSH, no tests).
 podman run --rm \
   -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
   -v /root/mssql-results:/work/results \
-  quay.io/ekuric/benchmark:latest \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
   --generate-only
 ```
 
@@ -199,7 +199,7 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
   --rebuild-always
 ```
 
@@ -213,7 +213,7 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
   --prepare-machine
 ```
 
@@ -228,7 +228,7 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest
+  quay.io/ekuric/mssqlwin-benchmark:latest
 ```
 
 ### Env vars only (CI/CD pipeline)
@@ -245,7 +245,7 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest
+  quay.io/ekuric/mssqlwin-benchmark:latest
 ```
 
 ### Dry run with verbose output
@@ -255,7 +255,7 @@ podman run --rm \
   -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
   --dry-run --verbose
 ```
 
@@ -272,7 +272,7 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/benchmark:latest
+  quay.io/ekuric/mssqlwin-benchmark:latest
 ```
 
 ### With oc login
@@ -285,7 +285,7 @@ podman run --rm \
   -v /root/mssql-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   --privileged \
-  quay.io/ekuric/benchmark:latest
+  quay.io/ekuric/mssqlwin-benchmark:latest
 ```
 
 ## SSH Key
