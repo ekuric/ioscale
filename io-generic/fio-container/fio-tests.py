@@ -139,6 +139,9 @@ class FioTestConfig:
         self.timeout_dataset_buffer = DATASET_WRITE_BUFFER
         self.timeout_check_interval = CHECK_INTERVAL
         self.timeout_migration = MIGRATION_TIMEOUT
+        self.monitor_vm = False
+        self.monitor_vm_interval = 10
+        self.migration_report = False
 
     def get_linux_hosts(self) -> List[str]:
         """Get Linux hosts only"""
@@ -156,6 +159,208 @@ class FioTestConfig:
         if desc:
             return f"./fio-results-{ts}-{desc}-machines_{len(self.vm_hosts)}"
         return f"./fio-results-{ts}-machines_{len(self.vm_hosts)}"
+
+
+class VMMigrationMonitor:
+    """Background monitor that tracks VM node placement changes during tests"""
+    
+    def __init__(self, namespace: str, interval: int = 10, vm_hosts: Optional[List[str]] = None):
+        self._stop_event = threading.Event()
+        self._thread = None
+        self.namespace = namespace
+        self.interval = interval
+        self.vm_hosts = vm_hosts or []
+        self.events = []
+        self.vm_nodes = {}
+        self._lock = threading.Lock()
+    
+    def _get_vmi_nodes(self) -> Dict[str, str]:
+        """Query current VMI node placement via oc"""
+        try:
+            cmd = [
+                "oc", "get", "vmi", "-n", self.namespace,
+                "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.status.nodeName}{\"\\n\"}{end}"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                return {}
+            
+            nodes = {}
+            for line in result.stdout.strip().split("\n"):
+                if "\t" in line:
+                    parts = line.split("\t", 1)
+                    vm_name = parts[0].strip()
+                    node_name = parts[1].strip() if len(parts) > 1 else ""
+                    if vm_name and node_name:
+                        if self.vm_hosts and vm_name not in self.vm_hosts:
+                            continue
+                        nodes[vm_name] = node_name
+            return nodes
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            logger.debug(f"VM monitor: failed to query VMI nodes: {e}")
+            return {}
+    
+    def _poll_loop(self):
+        """Main polling loop running in background thread"""
+        logger.info(f"VM_MONITOR: Started - polling every {self.interval}s in namespace '{self.namespace}'")
+        
+        initial_nodes = self._get_vmi_nodes()
+        with self._lock:
+            self.vm_nodes = initial_nodes.copy()
+        
+        node_count = len(set(initial_nodes.values()))
+        logger.info(f"VM_MONITOR: Tracking {len(initial_nodes)} VMs across {node_count} nodes")
+        
+        while not self._stop_event.is_set():
+            self._stop_event.wait(self.interval)
+            if self._stop_event.is_set():
+                break
+            
+            current_nodes = self._get_vmi_nodes()
+            if not current_nodes:
+                continue
+            
+            with self._lock:
+                for vm_name, new_node in current_nodes.items():
+                    old_node = self.vm_nodes.get(vm_name)
+                    if old_node and old_node != new_node:
+                        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        event = {
+                            "timestamp": timestamp,
+                            "vm": vm_name,
+                            "from_node": old_node,
+                            "to_node": new_node
+                        }
+                        self.events.append(event)
+                        logger.info(f"VM_MIGRATED: {vm_name} from {old_node} to {new_node}")
+                
+                self.vm_nodes = current_nodes.copy()
+    
+    def start(self):
+        """Start the background monitoring thread"""
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+    
+    def stop(self):
+        """Stop the monitoring thread"""
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=15)
+        
+        with self._lock:
+            migration_count = len(self.events)
+        
+        if migration_count > 0:
+            logger.info(f"VM_MONITOR: Stopped - {migration_count} migration(s) detected during tests")
+        else:
+            logger.info("VM_MONITOR: Stopped - no migrations detected")
+    
+    def get_events(self) -> List[Dict]:
+        """Get all recorded migration events"""
+        with self._lock:
+            return list(self.events)
+    
+    def write_report(self, output_path: str):
+        """Write migration events to a log file"""
+        with self._lock:
+            events = list(self.events)
+        
+        with open(output_path, 'w') as f:
+            f.write("# VM Migration Events Log\n")
+            f.write(f"# Namespace: {self.namespace}\n")
+            f.write(f"# Poll interval: {self.interval}s\n")
+            f.write(f"# Total migrations detected: {len(events)}\n")
+            f.write("#\n")
+            
+            if not events:
+                f.write("# No migrations detected during test execution.\n")
+            else:
+                for event in events:
+                    f.write(f"[{event['timestamp']}] {event['vm']}: {event['from_node']} -> {event['to_node']}\n")
+                
+                f.write(f"\n# SUMMARY: {len(events)} migration(s)\n")
+                nodes_involved = set()
+                for e in events:
+                    nodes_involved.add(e['from_node'])
+                    nodes_involved.add(e['to_node'])
+                f.write(f"# Nodes involved: {', '.join(sorted(nodes_involved))}\n")
+        
+        logger.info(f"VM_MONITOR: Migration report written to {output_path}")
+
+
+def run_migration_report(config) -> int:
+    """Post-hoc migration report: query VMIM objects from the cluster"""
+    logger.info(f"Querying VirtualMachineInstanceMigration objects in namespace '{config.namespace}'...")
+    
+    try:
+        cmd = ["oc", "get", "vmim", "-n", config.namespace, "-o", "json"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        
+        if result.returncode != 0:
+            logger.error(f"Failed to query VMIM objects: {result.stderr}")
+            return 1
+        
+        data = json.loads(result.stdout)
+        items = data.get("items", [])
+        
+        if not items:
+            logger.info("No VirtualMachineInstanceMigration objects found.")
+            return 0
+        
+        migrations = []
+        for item in items:
+            name = item.get("metadata", {}).get("name", "unknown")
+            vmi_name = item.get("spec", {}).get("vmiName", "unknown")
+            phase = item.get("status", {}).get("phase", "Unknown")
+            migration_state = item.get("status", {}).get("migrationState", {})
+            source_node = migration_state.get("sourceNode", "unknown")
+            target_node = migration_state.get("targetNode", "unknown")
+            start_ts = migration_state.get("startTimestamp", "")
+            end_ts = migration_state.get("endTimestamp", "")
+            
+            duration = ""
+            if start_ts and end_ts:
+                try:
+                    start_dt = datetime.fromisoformat(start_ts.replace("Z", "+00:00"))
+                    end_dt = datetime.fromisoformat(end_ts.replace("Z", "+00:00"))
+                    dur_seconds = int((end_dt - start_dt).total_seconds())
+                    duration = f"{dur_seconds}s"
+                except (ValueError, TypeError):
+                    duration = "N/A"
+            
+            migrations.append({
+                "name": name,
+                "vmi": vmi_name,
+                "phase": phase,
+                "source": source_node,
+                "target": target_node,
+                "start": start_ts,
+                "duration": duration
+            })
+        
+        migrations.sort(key=lambda x: x.get("start", ""))
+        
+        logger.info(f"Found {len(migrations)} migration(s):")
+        succeeded = 0
+        failed = 0
+        for m in migrations:
+            dur_str = f" ({m['duration']})" if m['duration'] else ""
+            logger.info(f"  [{m['start']}] {m['vmi']}: {m['source']} -> {m['target']}{dur_str} [{m['phase']}]")
+            if m['phase'] == "Succeeded":
+                succeeded += 1
+            else:
+                failed += 1
+        
+        logger.info(f"SUMMARY: {len(migrations)} migration(s), {succeeded} succeeded, {failed} failed/other")
+        return 0
+        
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        logger.error(f"Failed to run oc command: {e}")
+        return 1
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse VMIM JSON: {e}")
+        return 1
 
 
 class CommandExecutor:
@@ -988,6 +1193,12 @@ def main():
                        help='Show detailed configuration parsing debug information')
     parser.add_argument('--copy-results', action='store_true',
                        help='Only copy results from hosts (skip installation, preparation, and testing)')
+    parser.add_argument('--monitor-vm', action='store_true',
+                       help='Monitor VM node placement during tests and log migrations')
+    parser.add_argument('--monitor-vm-interval', type=int, default=10,
+                       help='VM monitor polling interval in seconds (default: 10)')
+    parser.add_argument('--migration-report', action='store_true',
+                       help='Query and display historical VM migration data from cluster (post-hoc)')
     
     args = parser.parse_args()
     
@@ -1015,10 +1226,17 @@ def main():
         config.task_monitor_interval = args.monitor_interval
     config.debug_config = args.debug
     config.copy_results = args.copy_results
+    config.monitor_vm = args.monitor_vm
+    config.monitor_vm_interval = args.monitor_vm_interval
+    config.migration_report = args.migration_report
     
     # Load configuration
     config_loader = ConfigLoader(config)
     config_loader.load_config()
+    
+    # Handle migration-report mode (early exit, no FIO testing needed)
+    if config.migration_report:
+        return run_migration_report(config)
     
     # Set up log file with description in filename
     log_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
@@ -1203,13 +1421,32 @@ def main():
     # Write test data
     write_test_data(config, executor)
     
+    # Start VM migration monitor if enabled
+    migration_monitor = None
+    if config.monitor_vm:
+        migration_monitor = VMMigrationMonitor(
+            namespace=config.namespace,
+            interval=config.monitor_vm_interval,
+            vm_hosts=config.vm_hosts
+        )
+        migration_monitor.start()
+    
     # Run FIO tests
     run_fio_tests(config, executor)
+    
+    # Stop VM migration monitor and save report
+    if migration_monitor:
+        migration_monitor.stop()
     
     # Collect results
     results_dir = config.get_results_dir_name()
     
     collect_results(config, executor, results_dir)
+    
+    # Write migration report to results directory
+    if migration_monitor:
+        migration_log_path = os.path.join(results_dir, "migration-events.log")
+        migration_monitor.write_report(migration_log_path)
     generate_combined_results(results_dir, config)
     
     # Copy log file to results directory
@@ -1686,14 +1923,18 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
     start_time = time.time()
     check_interval = 10  # Check every 10 seconds
     
+    completed_hosts = set()
+    total_hosts = len(config.vm_hosts)
+    
     while True:
         all_done = True
-        completed_count = 0
-        total_hosts = len(config.vm_hosts)
+        newly_completed = []
         
         with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), 50)) as pool:
             check_futures = []
             for host in config.vm_hosts:
+                if host in completed_hosts:
+                    continue
                 if executor.is_windows_host(host):
                     output_dir_win = normalize_windows_path(config.windows_output_dir)
                     output_file = f"{output_dir_win}/write_dataset.json"
@@ -1714,12 +1955,19 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
             for future, host in check_futures:
                 success, output = future.result()
                 if success and output and 'DONE' in output:
-                    completed_count += 1
+                    if host not in completed_hosts:
+                        completed_hosts.add(host)
+                        newly_completed.append(host)
                 elif success and output and 'RUNNING' in output:
                     all_done = False
                 else:
                     logger.warning(f"FIO dataset write may have failed on {host}")
                     all_done = False
+        
+        if newly_completed:
+            logger.info(f"Dataset write completed on: {', '.join(sorted(newly_completed))}")
+        
+        completed_count = len(completed_hosts)
         
         if all_done:
             # All hosts have completed (file exists or process finished)
