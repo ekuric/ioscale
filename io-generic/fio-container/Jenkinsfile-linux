@@ -1,0 +1,131 @@
+pipeline {
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP')
+        string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host')
+        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for bastion SSH key')
+        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/fio-benchmark:latest', description: 'Container image to run')
+
+        string(name: 'HOST_PATTERN',      defaultValue: 'fio-vm-{1..10}',     description: 'Linux VM host pattern')
+        string(name: 'DEVICES',           defaultValue: 'fio-vm-{1..10}=vdc', description: 'Device mapping (pattern=device, comma-separated)')
+        string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
+
+        string(name: 'TEST_SIZE',         defaultValue: '16G',                 description: 'FIO test file size')
+        string(name: 'RUNTIME',           defaultValue: '300',                 description: 'Test runtime in seconds')
+        string(name: 'BLOCK_SIZES',       defaultValue: '4k 8k 128k 1024k',  description: 'Block sizes (space-separated)')
+        string(name: 'IO_PATTERNS',       defaultValue: 'read write randread randwrite randrw', description: 'I/O patterns (space-separated)')
+        string(name: 'NUMJOBS',           defaultValue: '1',                  description: 'Number of parallel FIO jobs')
+        string(name: 'IODEPTH',           defaultValue: '16',                 description: 'I/O depth')
+        string(name: 'DIRECT_IO',         defaultValue: '1',                  description: 'Direct I/O (1=bypass page cache, 0=use cache)')
+        string(name: 'RATE_IOPS',         defaultValue: '',                   description: 'IOPS rate limit (empty = unlimited)')
+
+        string(name: 'INTERVAL',           defaultValue: '30',                  description: 'Seconds between failed ssh command attempts')
+        string(name: 'MAX_RETRIES',       defaultValue: '10',                  description: 'Maximum number of failed ssh command attempts')
+        string(name: 'MONITOR_INTERVAL',  defaultValue: '60',                  description: 'Seconds between task monitor checks')
+        string(name: 'KUBEADMIN_PASSWORD', defaultValue: '',                   description: 'Kubernetes admin password')
+        string(name: 'API_URL',           defaultValue: 'https://api.ocp.example.com:6443', description: 'Kubernetes API URL')
+
+        string(name: 'MIGRATE_WORKLOADS', defaultValue: '',                    description: 'I/O patterns triggering VM migration (empty = no migration)')
+        string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
+        string(name: 'MONITOR_VM',        defaultValue: 'false',              description: 'Monitor VM node placement during tests and log migrations (true/false)')
+        string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',               description: 'VM migration monitor polling interval in seconds')
+        string(name: 'DESCRIPTION',       defaultValue: 'jenkins-fio-linux',  description: 'Test run description')
+    }
+
+    environment {
+        RESULTS_DIR  = '/root/fio-results'
+        BASTION_CONN = "${params.BASTION_USER}@${params.BASTION_HOST}"
+    }
+
+    stages {
+        stage('Prepare') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            mkdir -p ${RESULTS_DIR}
+                            podman pull ${params.CONTAINER_IMAGE} || true
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Run FIO Linux Test') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            podman run --rm --pids-limit=-1 \
+                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e DEVICES="${params.DEVICES}" \
+                              -e NAMESPACE="${params.NAMESPACE}" \
+                              -e TEST_SIZE="${params.TEST_SIZE}" \
+                              -e RUNTIME=${params.RUNTIME} \
+                              -e BLOCK_SIZES="${params.BLOCK_SIZES}" \
+                              -e IO_PATTERNS="${params.IO_PATTERNS}" \
+                              -e NUMJOBS=${params.NUMJOBS} \
+                              -e IODEPTH=${params.IODEPTH} \
+                              -e DIRECT_IO=${params.DIRECT_IO} \
+                              -e RATE_IOPS="${params.RATE_IOPS}" \
+                              -e MIGRATE_WORKLOADS="${params.MIGRATE_WORKLOADS}" \
+                              -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
+                              -e RETRY_INTERVAL=${params.INTERVAL} \
+                              -e MAX_RETRIES=${params.MAX_RETRIES} \
+                              -e MONITOR_INTERVAL=${params.MONITOR_INTERVAL} \
+                              -e MONITOR_VM="${params.MONITOR_VM}" \
+                              -e MONITOR_VM_INTERVAL=${params.MONITOR_VM_INTERVAL} \
+                              -e KUBEADMIN_PASSWORD="${params.KUBEADMIN_PASSWORD}" \
+                              -e API_URL="${params.API_URL}" \
+                              -e DESCRIPTION="${params.DESCRIPTION}" \
+                              -v ${RESULTS_DIR}:/work/results \
+                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
+                              -v /root/.kube/config:/root/.kube/config \
+                              --privileged \
+                              ${params.CONTAINER_IMAGE}
+                        '
+                    """
+                }
+            }
+        }
+
+        stage('Collect Results') {
+            steps {
+                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                    sh """
+                        mkdir -p fio-results
+                        scp -o StrictHostKeyChecking=no -r \
+                            ${BASTION_CONN}:${RESULTS_DIR}/ ./fio-results/
+                    """
+                }
+            }
+        }
+
+        stage('Archive') {
+            steps {
+                archiveArtifacts artifacts: 'fio-results/**', allowEmptyArchive: true
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "FIO Linux test completed successfully. Results archived as build artifacts."
+        }
+        failure {
+            echo "FIO Linux test failed. Check the console output for details."
+        }
+        always {
+            echo "Test description: ${params.DESCRIPTION}"
+            echo "Hosts: ${params.HOST_PATTERN}"
+            echo "Block sizes: ${params.BLOCK_SIZES}"
+            echo "I/O patterns: ${params.IO_PATTERNS}"
+            echo "Numjobs: ${params.NUMJOBS}, Iodepth: ${params.IODEPTH}"
+        }
+    }
+}

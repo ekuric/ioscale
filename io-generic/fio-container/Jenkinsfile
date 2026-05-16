@@ -1,6 +1,10 @@
 pipeline {
     agent any
 
+    options {
+        disableConcurrentBuilds()
+    }
+
     parameters {
         string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP. Each user/team sets their own bastion here.')
         string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host (e.g. root, admin)')
@@ -13,18 +17,37 @@ pipeline {
         string(name: 'WIN_DEVICES',       defaultValue: 'vm-{1..2}=2',        description: 'Windows device mapping (pattern=diskid, comma-separated)')
         string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
 
-        string(name: 'TEST_SIZE',         defaultValue: '5G',                  description: 'FIO test file size')
+        // Linux FIO parameters
+        string(name: 'TEST_SIZE',         defaultValue: '5G',                  description: 'FIO test file size (Linux)')
         string(name: 'RUNTIME',           defaultValue: '300',                 description: 'Linux test runtime in seconds')
-        string(name: 'WIN_RUNTIME',       defaultValue: '300',                 description: 'Windows test runtime in seconds')
-        string(name: 'BLOCK_SIZES',       defaultValue: '4k 1024k',           description: 'Linux block sizes (space-separated)')
-        string(name: 'WIN_BLOCK_SIZES',   defaultValue: '4k 1024k',           description: 'Windows block sizes (space-separated)')
-        string(name: 'IO_PATTERNS',       defaultValue: 'write',              description: 'Linux I/O patterns (space-separated)')
-        string(name: 'WIN_IO_PATTERNS',   defaultValue: 'write',              description: 'Windows I/O patterns (space-separated)')
+        string(name: 'BLOCK_SIZES',       defaultValue: '4k 8k 128k 1024k',  description: 'Linux block sizes (space-separated)')
+        string(name: 'IO_PATTERNS',       defaultValue: 'read write randread randwrite randrw', description: 'Linux I/O patterns (space-separated)')
+        string(name: 'NUMJOBS',           defaultValue: '1',                  description: 'Linux number of parallel FIO jobs')
+        string(name: 'IODEPTH',           defaultValue: '16',                 description: 'Linux I/O depth')
+        string(name: 'DIRECT_IO',         defaultValue: '1',                  description: 'Linux direct I/O (1=bypass page cache, 0=use cache)')
+        string(name: 'RATE_IOPS',         defaultValue: '',                   description: 'Linux IOPS rate limit (empty = unlimited)')
 
+        // Windows FIO parameters
+        string(name: 'WIN_RUNTIME',       defaultValue: '300',                 description: 'Windows test runtime in seconds')
+        string(name: 'WIN_BLOCK_SIZES',   defaultValue: '4k 8k 128k 1024k',  description: 'Windows block sizes (space-separated)')
+        string(name: 'WIN_IO_PATTERNS',   defaultValue: 'read write randread randwrite randrw', description: 'Windows I/O patterns (space-separated)')
+        string(name: 'WIN_NUMJOBS',       defaultValue: '1',                  description: 'Windows number of parallel FIO jobs')
+        string(name: 'WIN_IODEPTH',       defaultValue: '16',                 description: 'Windows I/O depth')
+        string(name: 'INTERVAL',          defaultValue: '30',                 description: 'Seconds between failed ssh command attempts')
+        string(name: 'MAX_RETRIES',       defaultValue: '10',                 description: 'Maximum number of failed ssh command attemts')
+        string(name: 'MONITOR_INTERVAL',  defaultValue: '60',                 description: 'Seconds between task monitor checks')
+        string(name: 'KUBEADMIN_PASSWORD', defaultValue: '',                   description: 'Kubernetes admin password')
+        string(name: 'API_URL',           defaultValue: 'https://api.ocp.example.com:6443', description: 'Kubernetes API URL')
+        string(name: 'WIN_DIRECT_IO',     defaultValue: '1',                  description: 'Windows direct I/O (1=yes, 0=no)')
+        string(name: 'WIN_TEST_SIZE',     defaultValue: '10GB',               description: 'FIO test file size (Windows)')
+        string(name: 'WIN_RATE_IOPS',     defaultValue: '',                   description: 'Windows IOPS rate limit (empty = unlimited)')
+
+        // Migration and general
         string(name: 'MIGRATE_WORKLOADS', defaultValue: '',                    description: 'I/O patterns triggering VM migration (space-separated, empty = no migration)')
         string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
+        string(name: 'MONITOR_VM',        defaultValue: 'false',              description: 'Monitor VM node placement during tests and log migrations (true/false)')
+        string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',               description: 'VM migration monitor polling interval in seconds')
         string(name: 'DESCRIPTION',       defaultValue: 'jenkins-fio-test',   description: 'Test run description (included in results directory name)')
-        booleanParam(name: 'PREPARE_MACHINES', defaultValue: true, description: 'Run --prepare-machine before test (format disks, install FIO)')
     }
 
     environment {
@@ -46,43 +69,12 @@ pipeline {
             }
         }
 
-        stage('Prepare Machines') {
-            when { expression { params.PREPARE_MACHINES } }
-            steps {
-                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
-                    sh """
-                        ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
-                            podman run --rm \
-                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
-                              -e DEVICES="${params.DEVICES}" \
-                              -e WIN_HOST_PATTERN="${params.WIN_HOST_PATTERN}" \
-                              -e WIN_DEVICES="${params.WIN_DEVICES}" \
-                              -e NAMESPACE="${params.NAMESPACE}" \
-                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
-                              -v /root/.kube/config:/root/.kube/config \
-                              --privileged \
-                              ${params.CONTAINER_IMAGE} \
-                              --prepare-machine
-                        '
-                    """
-                }
-            }
-        }
-
-        stage('Wait for Machines') {
-            when { expression { params.PREPARE_MACHINES } }
-            steps {
-                echo "Waiting 120 seconds for machines to settle after preparation..."
-                sleep time: 120, unit: 'SECONDS'
-            }
-        }
-
         stage('Run FIO Test') {
             steps {
                 sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
-                            podman run --rm \
+                            podman run --rm --pids-limit=-1 \
                               -e HOST_PATTERN="${params.HOST_PATTERN}" \
                               -e DEVICES="${params.DEVICES}" \
                               -e WIN_HOST_PATTERN="${params.WIN_HOST_PATTERN}" \
@@ -90,13 +82,29 @@ pipeline {
                               -e NAMESPACE="${params.NAMESPACE}" \
                               -e TEST_SIZE="${params.TEST_SIZE}" \
                               -e RUNTIME=${params.RUNTIME} \
-                              -e WIN_RUNTIME=${params.WIN_RUNTIME} \
                               -e BLOCK_SIZES="${params.BLOCK_SIZES}" \
-                              -e WIN_BLOCK_SIZES="${params.WIN_BLOCK_SIZES}" \
                               -e IO_PATTERNS="${params.IO_PATTERNS}" \
+                              -e NUMJOBS=${params.NUMJOBS} \
+                              -e IODEPTH=${params.IODEPTH} \
+                              -e DIRECT_IO=${params.DIRECT_IO} \
+                              -e RATE_IOPS="${params.RATE_IOPS}" \
+                              -e WIN_RUNTIME=${params.WIN_RUNTIME} \
+                              -e WIN_BLOCK_SIZES="${params.WIN_BLOCK_SIZES}" \
                               -e WIN_IO_PATTERNS="${params.WIN_IO_PATTERNS}" \
+                              -e WIN_NUMJOBS=${params.WIN_NUMJOBS} \
+                              -e WIN_IODEPTH=${params.WIN_IODEPTH} \
+                              -e WIN_DIRECT_IO=${params.WIN_DIRECT_IO} \
+                              -e WIN_TEST_SIZE="${params.WIN_TEST_SIZE}" \
+                              -e WIN_RATE_IOPS="${params.WIN_RATE_IOPS}" \
                               -e MIGRATE_WORKLOADS="${params.MIGRATE_WORKLOADS}" \
                               -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
+                              -e RETRY_INTERVAL=${params.INTERVAL} \
+                              -e MAX_RETRIES=${params.MAX_RETRIES} \
+                              -e MONITOR_INTERVAL=${params.MONITOR_INTERVAL} \
+                              -e MONITOR_VM="${params.MONITOR_VM}" \
+                              -e MONITOR_VM_INTERVAL=${params.MONITOR_VM_INTERVAL} \
+                              -e KUBEADMIN_PASSWORD="${params.KUBEADMIN_PASSWORD}" \
+                              -e API_URL="${params.API_URL}" \
                               -e DESCRIPTION="${params.DESCRIPTION}" \
                               -v ${RESULTS_DIR}:/work/results \
                               -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
