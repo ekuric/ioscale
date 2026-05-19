@@ -14,6 +14,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
@@ -98,6 +99,10 @@ class MSSQLWinConfig:
         self.timeout_vm_lookup = VM_LOOKUP_TIMEOUT
         self.timeout_label_query = LABEL_QUERY_TIMEOUT
         self.timeout_oc_command = OC_COMMAND_TIMEOUT
+        self.max_retries = 10
+        self.retry_interval = 30
+        self.monitor_vm = False
+        self.monitor_vm_interval = 10
 
 
 def get_vm_number(hostname: str) -> str:
@@ -115,6 +120,117 @@ def build_powershell_command(command: str) -> str:
     """Wrap a PowerShell command for SSH execution"""
     encoded = base64.b64encode(command.encode("utf-16le")).decode("ascii")
     return f"powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand {encoded}"
+
+
+class VMMigrationMonitor:
+    """Background monitor that tracks VM node placement changes during tests."""
+    
+    def __init__(self, namespace: str, interval: int = 10, vm_hosts: Optional[List[str]] = None):
+        self._stop_event = threading.Event()
+        self._thread = None
+        self.namespace = namespace
+        self.interval = interval
+        self.vm_hosts = vm_hosts or []
+        self.events = []
+        self._lock = threading.Lock()
+        self._current_operation = ""
+        self.vm_nodes = {}
+    
+    @property
+    def current_operation(self) -> str:
+        with self._lock:
+            return self._current_operation
+
+    @current_operation.setter
+    def current_operation(self, value: str):
+        with self._lock:
+            self._current_operation = value
+
+    def _get_vmi_nodes(self) -> Dict[str, str]:
+        try:
+            cmd = [
+                "oc", "get", "vmi", "-n", self.namespace,
+                "-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\t\"}{.status.nodeName}{\"\\n\"}{end}"
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                return {}
+            nodes = {}
+            for line in result.stdout.strip().split("\n"):
+                if "\t" in line:
+                    parts = line.split("\t", 1)
+                    vm_name = parts[0].strip()
+                    node_name = parts[1].strip() if len(parts) > 1 else ""
+                    if vm_name and node_name:
+                        if self.vm_hosts and vm_name not in self.vm_hosts:
+                            continue
+                        nodes[vm_name] = node_name
+            return nodes
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+            return {}
+    
+    def _poll_loop(self):
+        logger.info(f"VM_MONITOR: Started - polling every {self.interval}s in namespace '{self.namespace}'")
+        initial_nodes = self._get_vmi_nodes()
+        with self._lock:
+            self.vm_nodes = initial_nodes.copy()
+        node_count = len(set(initial_nodes.values()))
+        logger.info(f"VM_MONITOR: Tracking {len(initial_nodes)} VMs across {node_count} nodes")
+        
+        while not self._stop_event.is_set():
+            self._stop_event.wait(self.interval)
+            if self._stop_event.is_set():
+                break
+            current_nodes = self._get_vmi_nodes()
+            if not current_nodes:
+                continue
+            with self._lock:
+                op = self._current_operation
+                for vm_name, new_node in current_nodes.items():
+                    old_node = self.vm_nodes.get(vm_name)
+                    if old_node and old_node != new_node:
+                        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        event = {"timestamp": timestamp, "vm": vm_name, "from_node": old_node, "to_node": new_node, "operation": op}
+                        self.events.append(event)
+                        if op:
+                            logger.info(f"VM_MIGRATED: op {op}: {vm_name}: {old_node} -> {new_node}")
+                        else:
+                            logger.info(f"VM_MIGRATED: {vm_name}: {old_node} -> {new_node}")
+                self.vm_nodes = current_nodes.copy()
+    
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._poll_loop, daemon=True)
+        self._thread.start()
+    
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=15)
+        with self._lock:
+            count = len(self.events)
+        if count > 0:
+            logger.info(f"VM_MONITOR: Stopped - {count} migration(s) detected")
+        else:
+            logger.info("VM_MONITOR: Stopped - no migrations detected")
+    
+    def write_report(self, output_path: str):
+        with self._lock:
+            events = list(self.events)
+        with open(output_path, 'w') as f:
+            f.write(f"# VM Migration Events Log\n")
+            f.write(f"# Namespace: {self.namespace}\n")
+            f.write(f"# Total migrations: {len(events)}\n#\n")
+            if not events:
+                f.write("# No migrations detected during test execution.\n")
+            else:
+                for event in events:
+                    op = event.get('operation', '')
+                    if op:
+                        f.write(f"[{event['timestamp']}] op {op}: {event['vm']}: {event['from_node']} -> {event['to_node']}\n")
+                    else:
+                        f.write(f"[{event['timestamp']}] {event['vm']}: {event['from_node']} -> {event['to_node']}\n")
+        logger.info(f"VM_MONITOR: Migration report written to {output_path}")
 
 
 class CommandExecutor:
@@ -164,6 +280,9 @@ class CommandExecutor:
         return [
             "ssh", "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=60",
+            "-o", "ControlPath=/tmp/mssqlwin-ssh-%r@%h:%p",
             f"{ssh_user}@{host}", command
         ]
 
@@ -252,50 +371,84 @@ class CommandExecutor:
             return False
 
     def execute_command(self, host: str, command: str, description: str = "command",
-                        timeout: Optional[int] = None) -> Tuple[bool, str]:
-        """Execute command on remote host (streaming output)"""
+                        timeout: Optional[int] = None,
+                        max_retries: Optional[int] = None,
+                        retry_interval: Optional[int] = None,
+                        quiet: bool = False) -> Tuple[bool, str]:
+        """Execute command on remote host (streaming output) with retry logic."""
         cmd_timeout = timeout if timeout is not None else self.config.timeout_default
+        max_retries = max_retries if max_retries is not None else self.config.max_retries
+        retry_interval = retry_interval if retry_interval is not None else self.config.retry_interval
         if self.config.dry_run:
             logger.info(f"DRY-RUN: Would execute on {host}: {command}")
             return True, ""
 
         ssh_cmd = self.get_ssh_command(host, command)
-        try:
-            process = subprocess.Popen(
-                ssh_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1
-            )
-            output_lines = []
-            start_time = time.time()
-            while True:
-                line = process.stdout.readline() if process.stdout else ""
-                if line:
-                    output_lines.append(line)
-                    stripped = line.rstrip()
-                    if stripped and not self._should_suppress_output(stripped):
-                        logger.info(f"{host}: {stripped}")
-                elif process.poll() is not None:
-                    break
-                if cmd_timeout and (time.time() - start_time) > cmd_timeout:
-                    process.kill()
-                    logger.error(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s)")
-                    return False, "Command timeout"
-            returncode = process.wait()
-            output = "".join(output_lines)
-            if returncode == 0:
-                return True, output
-            logger.error(f"Failed to execute '{description}' on {host}")
-            error_output = output.strip() or f"Exit code: {returncode}"
-            logger.error(f"Error output: {error_output}")
-            return False, error_output
-        except Exception as e:
-            logger.error(f"Command exception on {host}: {str(e)}")
-            return False, str(e)
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                process = subprocess.Popen(
+                    ssh_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1
+                )
+                output_lines = []
+                start_time = time.time()
+                while True:
+                    line = process.stdout.readline() if process.stdout else ""
+                    if line:
+                        output_lines.append(line)
+                        stripped = line.rstrip()
+                        if stripped and not self._should_suppress_output(stripped):
+                            logger.info(f"{host}: {stripped}")
+                    elif process.poll() is not None:
+                        break
+                    if cmd_timeout and (time.time() - start_time) > cmd_timeout:
+                        process.kill()
+                        if attempt < max_retries:
+                            if not quiet:
+                                logger.warning(f"Command timeout on {host} (attempt {attempt}/{max_retries}): {description} (timeout: {cmd_timeout}s)")
+                                logger.warning(f"Retrying in {retry_interval}s...")
+                            time.sleep(retry_interval)
+                            break
+                        else:
+                            if not quiet:
+                                logger.error(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s) after {max_retries} attempts")
+                            return False, "Command timeout"
+                else:
+                    returncode = process.wait()
+                    output = "".join(output_lines)
+                    if returncode == 0:
+                        return True, output
+                    if attempt < max_retries:
+                        if not quiet:
+                            logger.warning(f"Command failed on {host} (attempt {attempt}/{max_retries}): {description}")
+                            logger.warning(f"Exit code: {returncode}")
+                            logger.warning(f"Retrying in {retry_interval}s...")
+                        time.sleep(retry_interval)
+                        continue
+                    if not quiet:
+                        logger.error(f"Failed to execute '{description}' on {host} after {max_retries} attempts")
+                    error_output = output.strip() or f"Exit code: {returncode}"
+                    if not quiet:
+                        logger.error(f"Error output: {error_output}")
+                    return False, error_output
+                continue
+            except Exception as e:
+                if attempt < max_retries:
+                    if not quiet:
+                        logger.warning(f"Command error on {host} (attempt {attempt}/{max_retries}): {str(e)}")
+                    time.sleep(retry_interval)
+                else:
+                    if not quiet:
+                        logger.error(f"Command exception on {host}: {str(e)} after {max_retries} attempts")
+                    return False, str(e)
+
+        return False, "Max retries exceeded"
 
     @staticmethod
     def _should_suppress_output(line: str) -> bool:
@@ -1120,7 +1273,7 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
     ps_cmd = "; ".join(ps_parts)
     cmd = build_powershell_command(ps_cmd)
 
-    with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
         futures = []
         for host in config.db_hosts:
             if config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
@@ -1162,7 +1315,7 @@ def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) 
     disk_id = config.windows_disk_id
     ps_cmd = f'& "C:\\tools\\setup\\provision-data-disk.ps1" -DiskID {disk_id}'
     cmd = build_powershell_command(ps_cmd)
-    with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
         futures = []
         for host in config.db_hosts:
             futures.append(pool.submit(
@@ -1185,7 +1338,7 @@ def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) 
         'Copy-Item -Path "C:\\tools\\hammerdb-4.12" -Destination "D:\\" -Recurse -Force }',
         'New-Item -Path "D:\\mssql\\data" -ItemType Directory -Force | Out-Null'
     ]))
-    with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
         futures = []
         for host in config.db_hosts:
             futures.append(pool.submit(
@@ -1321,7 +1474,7 @@ def generate_test_files(config: MSSQLWinConfig) -> None:
         logger.info(f"Generated create_db.sql: {generated_create_db}")
 
 
-def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None:
+def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor, migration_monitor: Optional['VMMigrationMonitor'] = None) -> None:
     logger.info("Running performance tests on Windows hosts...")
     if not config.windows_test_script:
         logger.warning("windows.test_script is not set; will try using generated files if present")
@@ -1652,6 +1805,9 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
             return
 
     for user_count in user_counts:
+        if migration_monitor:
+            migration_monitor.current_operation = f"tpcc {user_count} users"
+
         if config.windows_rebuild_always is True:
             logger.info(f"Rebuilding database before {user_count} user test...")
             if not config.dry_run:
@@ -1660,7 +1816,7 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None
             f"Starting Windows test run for {user_count} users on hosts: "
             f"{', '.join(config.db_hosts)}"
         )
-        with ThreadPoolExecutor(max_workers=len(config.db_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
             # Phase 1: pre-warm connections to reduce first-connection overhead
             if not config.dry_run and not config.generate_only:
                 warm_cmd = build_powershell_command('Write-Output "warm"')
@@ -1903,113 +2059,157 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
     archive_name = "mssql-results.zip"
 
     for host in config.db_hosts:
-        host_dir = os.path.join(results_dir, host)
-        os.makedirs(host_dir, exist_ok=True)
-        logger.info(f"Collecting results from {host}...")
+        os.makedirs(os.path.join(results_dir, host), exist_ok=True)
 
-        if config.dry_run:
-            logger.info(f"DRY-RUN: Would archive results on {host}")
-        else:
-            mkdir_cmd = build_powershell_command(
-                f'New-Item -Path "{result_dir}" -ItemType Directory -Force | Out-Null'
-            )
-            mkdir_success, mkdir_output = executor.execute_command(
-                host,
-                mkdir_cmd,
-                "Ensuring result directory exists",
-                timeout=60
-            )
+    if config.dry_run:
+        for host in config.db_hosts:
+            logger.info(f"DRY-RUN: Would archive and copy results from {host}")
+        return
+
+    def collect_from_host(host):
+        """Collect results from a single Windows host. Returns (host, success)."""
+        host_dir = os.path.join(results_dir, host)
+        host_result_dir_scp = result_dir_scp
+
+        mkdir_cmd = build_powershell_command(
+            f'New-Item -Path "{result_dir}" -ItemType Directory -Force | Out-Null'
+        )
+        mkdir_success, mkdir_output = executor.execute_command(
+            host, mkdir_cmd, "Ensuring result directory exists", timeout=60,
+            max_retries=3, retry_interval=10
+        )
+        if not mkdir_success:
+            if "connection timed out" in (mkdir_output or "").lower() or "dial tcp" in (mkdir_output or "").lower():
+                logger.warning(f"{host}: Unreachable - restarting VM...")
+                try:
+                    restart_result = subprocess.run(
+                        ["virtctl", "-n", config.namespace, "restart", host],
+                        capture_output=True, text=True, timeout=30
+                    )
+                    if restart_result.returncode == 0:
+                        logger.info(f"{host}: VM restart initiated, waiting 60s...")
+                        time.sleep(60)
+                        mkdir_success, mkdir_output = executor.execute_command(
+                            host, mkdir_cmd, "Ensuring result directory exists (after restart)",
+                            timeout=60, max_retries=3, retry_interval=15
+                        )
+                except Exception as e:
+                    logger.error(f"{host}: Failed to restart VM: {e}")
             if not mkdir_success:
-                logger.error(f"Failed to create result directory on {host}: {mkdir_output}")
-                continue
+                logger.error(f"{host}: Failed to create result directory: {mkdir_output}")
+                return host, False
+
+        ps_cmd = "; ".join([
+            f'$out = "{result_dir}\\{archive_name}"',
+            "if (Test-Path $out) { Remove-Item $out -Force }",
+            f'if (-not (Test-Path "{result_dir}")) {{ Write-Error "Result dir not found"; exit 1 }}',
+            f'$files = Get-ChildItem -Path "{result_dir}" -File -Recurse -ErrorAction SilentlyContinue',
+            "if ($files.Count -gt 0) { Compress-Archive -Path $files.FullName -DestinationPath $out -Force } "
+            "else { Write-Output 'No result files found'; exit 0 }"
+        ])
+        cmd = build_powershell_command(ps_cmd)
+        success, output = executor.execute_command(host, cmd, f"Creating Windows results archive on {host}")
+        if not success:
+            if "No result files found" in output or "Result dir not found" in output:
+                logger.info(f"{host}: No results found; skipping copy")
+                return host, False
+            logger.error(f"{host}: Failed to create results archive: {output}")
+            return host, False
+        if "No result files found" in output:
+            fallback_dir = windows_path
+            logger.warning(f"{host}: No results in {result_dir}, trying {fallback_dir}")
             ps_cmd = "; ".join([
-                f'$out = "{result_dir}\\{archive_name}"',
+                f'$out = "{fallback_dir}\\{archive_name}"',
                 "if (Test-Path $out) { Remove-Item $out -Force }",
-                f'if (-not (Test-Path "{result_dir}")) {{ Write-Error "Result dir not found"; exit 1 }}',
-                f'$files = Get-ChildItem -Path "{result_dir}" -File -Recurse -ErrorAction SilentlyContinue',
+                f'if (-not (Test-Path "{fallback_dir}")) {{ Write-Error "Result dir not found"; exit 1 }}',
+                f'$files = Get-ChildItem -Path "{fallback_dir}" -File -Recurse -ErrorAction SilentlyContinue',
                 "if ($files.Count -gt 0) { Compress-Archive -Path $files.FullName -DestinationPath $out -Force } "
                 "else { Write-Output 'No result files found'; exit 0 }"
             ])
             cmd = build_powershell_command(ps_cmd)
-            success, output = executor.execute_command(host, cmd, "Creating Windows results archive")
+            success, output = executor.execute_command(host, cmd, f"Creating Windows results archive (fallback) on {host}")
             if not success:
                 if "No result files found" in output or "Result dir not found" in output:
-                    logger.info(f"No results found on {host}; skipping copy")
-                    continue
-                logger.error(f"Failed to create results archive on {host}: {output}")
-                continue
+                    logger.info(f"{host}: No results found; skipping copy")
+                    return host, False
+                logger.error(f"{host}: Failed to create fallback results archive: {output}")
+                return host, False
             if "No result files found" in output:
-                fallback_dir = windows_path
-                logger.warning(f"No results in {result_dir} on {host}, trying {fallback_dir}")
-                ps_cmd = "; ".join([
-                    f'$out = "{fallback_dir}\\{archive_name}"',
-                    "if (Test-Path $out) { Remove-Item $out -Force }",
-                    f'if (-not (Test-Path "{fallback_dir}")) {{ Write-Error "Result dir not found"; exit 1 }}',
-                    f'$files = Get-ChildItem -Path "{fallback_dir}" -File -Recurse -ErrorAction SilentlyContinue',
-                    "if ($files.Count -gt 0) { Compress-Archive -Path $files.FullName -DestinationPath $out -Force } "
-                    "else { Write-Output 'No result files found'; exit 0 }"
-                ])
-                cmd = build_powershell_command(ps_cmd)
-                success, output = executor.execute_command(host, cmd, "Creating Windows results archive (fallback)")
-                if not success:
-                    if "No result files found" in output or "Result dir not found" in output:
-                        logger.info(f"No results found on {host}; skipping copy")
-                        continue
-                    logger.error(f"Failed to create fallback results archive on {host}: {output}")
-                    continue
-                if "No result files found" in output:
-                    logger.info(f"No results found on {host}; skipping copy")
-                    continue
-                result_dir_scp = fallback_dir.replace("\\", "/")
+                logger.info(f"{host}: No results found; skipping copy")
+                return host, False
+            host_result_dir_scp = fallback_dir.replace("\\", "/")
 
-        if config.dry_run:
-            logger.info(f"DRY-RUN: Would copy results from {host} to {host_dir}/")
-            continue
-
-        logger.info(f"Copying results from {host} to localhost...")
+        logger.info(f"{host}: Copying results to localhost...")
         if executor.is_vm_host(host):
-            source = f"{config.windows_ssh_user}@vmi/{host}:{result_dir_scp}/{archive_name}"
+            source = f"{config.windows_ssh_user}@vmi/{host}:{host_result_dir_scp}/{archive_name}"
         else:
-            source = f"{config.windows_ssh_user}@{host}:{result_dir_scp}/{archive_name}"
+            source = f"{config.windows_ssh_user}@{host}:{host_result_dir_scp}/{archive_name}"
         destination = os.path.join(host_dir, archive_name)
 
         try:
             scp_cmd = executor.get_scp_command(source, destination)
-            result = subprocess.run(scp_cmd, capture_output=True, timeout=config.timeout_scp)
+            result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=config.timeout_scp)
             if result.returncode != 0:
-                logger.warning("SCP failed, trying base64 fallback...")
+                logger.warning(f"{host}: SCP failed, trying base64 fallback...")
                 ps_cmd = (
                     f"$bytes = [IO.File]::ReadAllBytes('{result_dir}\\{archive_name}'); "
                     "$b64 = [Convert]::ToBase64String($bytes); "
                     "Write-Output $b64"
                 )
                 cmd = build_powershell_command(ps_cmd)
-                success, output = executor.execute_command(host, cmd, "Reading results archive (base64)", timeout=config.timeout_scp)
+                success, output = executor.execute_command(host, cmd, f"Reading results archive (base64) from {host}", timeout=config.timeout_scp)
                 if success:
-                    decoded_data = base64.b64decode(output.strip())
-                    with open(destination, "wb") as f:
-                        f.write(decoded_data)
+                    try:
+                        decoded_data = base64.b64decode(output.strip())
+                        with open(destination, "wb") as f:
+                            f.write(decoded_data)
+                        logger.info(f"{host}: Copied results using base64 fallback")
+                    except Exception as e:
+                        logger.error(f"{host}: base64 decode failed: {e}")
+                        return host, False
                 else:
-                    logger.error(f"Failed to copy results from {host} using both methods")
-                    continue
+                    logger.error(f"{host}: Both SCP and base64 methods failed")
+                    return host, False
+            else:
+                logger.info(f"{host}: Copied results successfully")
 
             with zipfile.ZipFile(destination, "r") as zip_ref:
                 zip_ref.extractall(host_dir)
             os.remove(destination)
-            logger.info(f"Extracted results for {host}")
+            logger.info(f"{host}: Extracted results")
 
             cleanup_ps = "; ".join([
                 f'Remove-Item "{result_dir}\\{archive_name}" -Force -ErrorAction SilentlyContinue',
                 f'if (Test-Path "{result_dir}") {{ Get-ChildItem -Path "{result_dir}" -File -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue }}'
             ])
             cleanup_cmd = build_powershell_command(cleanup_ps)
-            cleanup_success, cleanup_output = executor.execute_command(host, cleanup_cmd, "Cleaning up result files", timeout=30)
+            cleanup_success, cleanup_output = executor.execute_command(host, cleanup_cmd, f"Cleaning up result files on {host}", timeout=30)
             if cleanup_success:
-                logger.info(f"Cleaned up test result files on {host}")
+                logger.info(f"{host}: Cleaned up test result files")
             else:
-                logger.warning(f"Failed to clean up result files on {host}: {cleanup_output}")
+                logger.warning(f"{host}: Failed to clean up result files: {cleanup_output}")
+            return host, True
         except Exception as e:
-            logger.error(f"Error copying results from {host}: {e}")
+            logger.error(f"{host}: Error copying results: {e}")
+            return host, False
+
+    max_workers = min(len(config.db_hosts), 50)
+    logger.info(f"Collecting results from {len(config.db_hosts)} hosts (max {max_workers} parallel)...")
+
+    succeeded = []
+    failed = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(collect_from_host, host): host for host in config.db_hosts}
+        for future in as_completed(futures):
+            host, success = future.result()
+            if success:
+                succeeded.append(host)
+            else:
+                failed.append(host)
+
+    logger.info(f"Results collected: {len(succeeded)} succeeded, {len(failed)} failed")
+    if failed:
+        logger.warning(f"Failed hosts: {', '.join(sorted(failed))}")
 
     config_dir = os.path.dirname(os.path.abspath(config.config_file)) if config.config_file else os.getcwd()
     generated_dir = os.path.join(config_dir, ".mssqltestfiles-generated")
@@ -2198,6 +2398,10 @@ EXAMPLES:
                         help="Rebuild database before each user-count test run")
     parser.add_argument("--prepare-machine", action="store_true",
                         help="Prepare Windows machines by formatting the data disk and exit")
+    parser.add_argument('--monitor-vm', action='store_true',
+                        help='Monitor VM node placement during tests and log migrations')
+    parser.add_argument('--monitor-vm-interval', type=int, default=10,
+                        help='VM monitor polling interval in seconds (default: 10)')
 
     args = parser.parse_args()
 
@@ -2212,6 +2416,8 @@ EXAMPLES:
     config.verbose = args.verbose
     config.use_virtctl = None if not (args.ssh_only or args.virtctl_only) else (not args.ssh_only)
     config.copy_results = args.copy_results
+    config.monitor_vm = args.monitor_vm
+    config.monitor_vm_interval = args.monitor_vm_interval
     config.generate_only = args.generate_only
     if args.rebuild_always:
         config.windows_rebuild_always = True
@@ -2279,6 +2485,8 @@ EXAMPLES:
         logger.info("Prepare-machine mode complete; skipping tests and result collection")
         return
 
+    prepare_windows_machines(config, executor)
+
     if not config.windows_hammerdb_path:
         logger.error("windows.hammerdb_path is required for Windows testing")
         sys.exit(1)
@@ -2322,8 +2530,27 @@ EXAMPLES:
 
     if not config.windows_test_only:
         build_database_windows(config, executor)
-    run_tests_windows(config, executor)
+
+    migration_monitor = None
+    if config.monitor_vm:
+        migration_monitor = VMMigrationMonitor(
+            namespace=config.namespace,
+            interval=config.monitor_vm_interval,
+            vm_hosts=config.db_hosts
+        )
+        migration_monitor.start()
+
+    run_tests_windows(config, executor, migration_monitor=migration_monitor)
+
+    if migration_monitor:
+        migration_monitor.stop()
+
     collect_results(config, executor, results_dir)
+
+    if migration_monitor:
+        migration_log_path = os.path.join(results_dir, "migration-events.log")
+        migration_monitor.write_report(migration_log_path)
+
     _move_log_to_results(log_file, results_dir)
 
 
