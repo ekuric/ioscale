@@ -1662,9 +1662,10 @@ def run_tests(config: MSSQLTestConfig, executor: CommandExecutor, migration_moni
             
             # Monitor test completion
             test_duration_seconds = int(config.test_duration) * 60 if config.test_duration else 900
+            rampup_seconds = int(config.rampup_time) * 60 if config.rampup_time else 120
             start_time = time.time()
             check_interval = 30  # Check every 30 seconds
-            max_wait_time = test_duration_seconds + 300  # Add 5 minute buffer
+            max_wait_time = rampup_seconds + test_duration_seconds + 300  # rampup + test + 5 min buffer
             
             while time.time() - start_time < max_wait_time:
                 all_done = True
@@ -1704,6 +1705,32 @@ def run_tests(config: MSSQLTestConfig, executor: CommandExecutor, migration_moni
                     future = pool.submit(executor.execute_command, host, check_cmd, f"Checking test status on {host}", timeout=30)
                     futures.append((future, vm_number, host, f"test_mssql_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"))
         
+        # Verify tests ran for the full duration
+        expected_minutes = int(config.test_duration) if config.test_duration else 15
+        for host in config.db_hosts:
+            vm_number = get_vm_number(host)
+            output_file = f"test_mssql_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"
+            if not config.dry_run:
+                verify_cmd = (
+                    f"cd {config.hammerdb_dir} && "
+                    f"if grep -q 'TEST RESULT' '{output_file}' 2>/dev/null; then "
+                    f"echo 'COMPLETE'; "
+                    f"elif grep -q 'Timing test period' '{output_file}' 2>/dev/null; then "
+                    f"last_min=$(grep -oP '\\d+(?= \\.\\.\\.,)' '{output_file}' | tail -1); "
+                    f"echo \"INCOMPLETE:$last_min\"; "
+                    f"else echo 'NO_OUTPUT'; fi"
+                )
+                success, output = executor.execute_command(host, verify_cmd, f"Verifying test completion on {host}", timeout=30)
+                if success:
+                    result = output.strip()
+                    if result == "COMPLETE":
+                        logger.info(f"{host}: Test completed successfully (full {expected_minutes} min duration)")
+                    elif result.startswith("INCOMPLETE:"):
+                        last_min = result.split(":")[1] if ":" in result else "?"
+                        logger.warning(f"{host}: Test ended prematurely at minute {last_min}/{expected_minutes} - results may be partial")
+                    elif result == "NO_OUTPUT":
+                        logger.warning(f"{host}: No test output found - test may not have started")
+
         # Step 3: Collect results
         logger.info(f"Collecting test results for {user_count} users:")
         for host in config.db_hosts:

@@ -6,7 +6,6 @@ Configuration is read from a YAML file instead of command line arguments
 """
 
 import argparse
-import base64
 import glob
 import logging
 import os
@@ -15,12 +14,10 @@ import shutil
 import subprocess
 import sys
 import tarfile
-import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 # Configure logging early (before dependency checks)
@@ -75,6 +72,7 @@ class MariaDBTestConfig:
         self.skip_connectivity_test = False  # Skip initial connectivity test
         # Monitoring configuration
         self.task_monitor_interval = 60  # Check task status every N seconds for long-running tasks
+        self.build_time_limit = 14400  # Hard limit for database build (4 hours)
         self.monitor_vm = False
         self.monitor_vm_interval = 10
 
@@ -247,34 +245,6 @@ class CommandExecutor:
                 f"root@{host}", command
             ]
     
-    def get_scp_command(self, source: str, destination: str) -> List[str]:
-        """Get SCP command for copying files"""
-        # Extract hostname from source - support both root@vmi/ and root@
-        host_match = (re.search(r'root@vmi/([^:]+):', source) or 
-                     re.search(r'root@([^:]+):', source))
-        if not host_match:
-            raise ValueError(f"Cannot extract hostname from source: {source}")
-        
-        host = host_match.group(1)
-        
-        if self.is_vm_host(host):
-            if not self.config.namespace or self.config.namespace == "N/A":
-                raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
-            return [
-                "virtctl", "-n", self.config.namespace, "scp",
-                "--local-ssh-opts=-o StrictHostKeyChecking=no",
-                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
-                source, destination
-            ]
-        else:
-            # Convert virtctl format to SSH format
-            ssh_source = source.replace("root@vmi/", "root@")
-            return [
-                "scp", "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                ssh_source, destination
-            ]
-    
     def execute_command(self, host: str, command: str, description: str = "command",
                        timeout: Optional[int] = None,
                        max_retries: Optional[int] = None,
@@ -364,7 +334,9 @@ class CommandExecutor:
     def execute_background(self, host: str, command: str, description: str = "background command") -> threading.Thread:
         """Execute command in background thread"""
         def run_command():
-            self.execute_command(host, command, description)
+            success, output = self.execute_command(host, command, description)
+            if not success:
+                logger.error(f"Background {description} failed on {host}: {output}")
         
         thread = threading.Thread(target=run_command, daemon=True)
         thread.start()
@@ -498,6 +470,13 @@ class ConfigLoader:
             self.config.task_monitor_interval = 60
         else:
             self.config.task_monitor_interval = int(self.config.task_monitor_interval)
+        
+        # Load build time limit (hard timeout for database build monitoring)
+        self.config.build_time_limit = monitoring.get('build_time_limit', 14400)
+        if self.config.build_time_limit == "null" or not self.config.build_time_limit:
+            self.config.build_time_limit = 14400
+        else:
+            self.config.build_time_limit = int(self.config.build_time_limit)
     
     def _get_db_hosts(self, yaml_data: Dict) -> List[str]:
         """Get database hosts from various methods"""
@@ -544,7 +523,7 @@ class ConfigLoader:
                 except Exception as e:
                     logger.warning(f"Failed to query VMs by labels: {e}")
             else:
-                logger.info("Dry-run mode: Would query VMs with labels: {host_labels}")
+                logger.info(f"Dry-run mode: Would query VMs with labels: {host_labels}")
                 return ["example-db1", "example-db2"]
         
         # Method 3: Host file
@@ -579,7 +558,7 @@ class ConfigLoader:
                 return hosts.split()
             return hosts
         
-        logger.error("No hosts specified in configuration. Use one of: hosts, host_pattern, host_labels, or host_file")
+        logger.error(f"No hosts specified in configuration. Use one of: hosts, host_pattern, host_labels, or host_file")
         sys.exit(1)
 
 
@@ -621,22 +600,6 @@ def check_dependencies(config: MariaDBTestConfig) -> None:
         logger.error("Install the missing tools and try again.")
         sys.exit(1)
     
-    # Check if virtctl supports scp command (only if using virtctl)
-    if not config.dry_run and config.use_virtctl is not False and shutil.which("virtctl"):
-        try:
-            result = subprocess.run(
-                ["virtctl", "help"],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-            if "scp" not in result.stdout:
-                logger.warning("virtctl does not support 'scp' command")
-                logger.warning("Results will be archived on VMs but not automatically copied to localhost")
-                logger.warning("You may need to upgrade virtctl or manually copy results")
-        except Exception:
-            pass
-
 
 def validate_inputs(config: MariaDBTestConfig) -> None:
     """Validate configuration inputs"""
@@ -679,7 +642,10 @@ def display_config(config: MariaDBTestConfig) -> None:
     logger.info(f"Warehouse count: {config.warehouse_count}")
     logger.info(f"User counts: {' '.join(config.user_count)}")
     logger.info(f"Test duration: {config.test_duration} minutes")
-    logger.info(f"Rampup time: {config.rampup_time} minutes" if config.rampup_time else "Rampup time: 2 minutes (default)")
+    if config.rampup_time:
+        logger.info(f"Rampup time: {config.rampup_time} minutes")
+    else:
+        logger.info("Rampup time: 2 minutes (default)")
     if config.disk_list != "none":
         logger.info(f"Disk device: {config.disk_list}")
     if config.mount_point != "none":
@@ -969,7 +935,7 @@ def install_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> Non
 
 
 def manage_mariadb_service(config: MariaDBTestConfig, executor: CommandExecutor, 
-                          host: str, action: str, description: str = "MariaDB service management") -> None:
+                          host: str, action: str, description: str = "MariaDB service management") -> bool:
     """Safely manage MariaDB service"""
     if action == "restart":
         cmd = (
@@ -1001,9 +967,12 @@ def manage_mariadb_service(config: MariaDBTestConfig, executor: CommandExecutor,
         )
     else:
         logger.error(f"Invalid action '{action}' for MariaDB service management")
-        return
+        return False
     
-    executor.execute_command(host, cmd, description)
+    success, output = executor.execute_command(host, cmd, description)
+    if not success:
+        logger.error(f"Failed to {description} on {host}: {output}")
+    return success
 
 
 def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
@@ -1012,13 +981,18 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     
     # Step 1: Restart MariaDB services
     logger.info("Step 1/5: Restarting MariaDB services on all hosts...")
+    failed_hosts = []
     with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
         futures = []
         for host in config.db_hosts:
             future = pool.submit(manage_mariadb_service, config, executor, host, "restart", "Restarting MariaDB service")
-            futures.append(future)
-        for future in as_completed(futures):
-            future.result()
+            futures.append((future, host))
+        for future, host in futures:
+            if not future.result():
+                failed_hosts.append(host)
+    if failed_hosts:
+        logger.error(f"Failed to restart MariaDB on {len(failed_hosts)} host(s): {', '.join(failed_hosts)}")
+        sys.exit(1)
     
     # Step 2: Wait for services to be ready
     logger.info("Step 2/5: Waiting for MariaDB services to be ready...")
@@ -1112,14 +1086,25 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     
     # Monitor build completion by checking if hammerdbcli processes are still running
     # Database builds can take a very long time (30+ minutes for large warehouses),
-    # so we keep waiting and only warn after the soft threshold.
-    soft_max_build_time = 3600  # 1 hour soft warning threshold
+    # so we keep waiting with a soft warning at 1h and a hard timeout of build_time_limit
+    # (default 4h, configurable via monitoring.build_time_limit in YAML).
+    if config.build_time_limit <= config.retry_interval:
+        logger.error("monitoring.build_time_limit must be greater than retry_interval")
+        sys.exit(1)
     check_interval = 30  # Check every 30 seconds
     start_time = time.time()
-    warned_long_build = False
+    warned_soft = False
     completed_hosts = set()  # Track hosts that have completed (successfully or with errors)
     
     while True:
+        if time.time() - start_time >= config.build_time_limit:
+            remaining = [h for h in config.db_hosts if h not in completed_hosts]
+            logger.error(
+                f"Database build timed out after {config.build_time_limit}s. "
+                f"{len(remaining)} host(s) still building: {', '.join(remaining)}. "
+                f"Check build output files for details."
+            )
+            sys.exit(1)
         still_building = []
         hosts_to_check = [h for h in config.db_hosts if h not in completed_hosts]
         
@@ -1183,11 +1168,12 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
             break
         
         elapsed = int(time.time() - start_time)
-        if elapsed > soft_max_build_time and not warned_long_build:
+        if elapsed > config.build_time_limit // 4 and not warned_soft:
             logger.warning(
-                f"Database builds are taking longer than {soft_max_build_time}s; continuing to wait..."
+                f"Database builds are taking longer than {config.build_time_limit // 4}s; "
+                f"hard timeout at {config.build_time_limit}s"
             )
-            warned_long_build = True
+            warned_soft = True
         logger.info(f"Waiting for database builds to complete... ({len(still_building)} hosts still building: {', '.join(still_building)}, {elapsed}s elapsed)")
         time.sleep(check_interval)
     
@@ -1558,10 +1544,10 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
             time.sleep(5)
             
             # Monitor test completion
-            test_duration_seconds = int(config.test_duration) * 60 if config.test_duration else 900
+            rampup_seconds = int(config.rampup_time) * 60 if config.rampup_time else 120
             start_time = time.time()
             check_interval = 30  # Check every 30 seconds
-            max_wait_time = test_duration_seconds + 600  # Add 10 minute buffer
+            max_wait_time = rampup_seconds + test_duration_seconds + 600  # rampup + test + 10 min buffer
             
             while time.time() - start_time < max_wait_time:
                 all_done = True
@@ -1602,6 +1588,33 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
                     futures.append((future, counter, host, f"test_mariadb_{run_date}_{num_hosts}pod_pod{counter}_{user_count}.out"))
                     counter += 1
         
+        # Verify tests ran for the full duration
+        expected_minutes = int(config.test_duration) if config.test_duration else 15
+        counter = 1
+        for host in config.db_hosts:
+            output_file = f"test_mariadb_{run_date}_{num_hosts}pod_pod{counter}_{user_count}.out"
+            if not config.dry_run:
+                verify_cmd = (
+                    f"cd '{config.hammerdb_dir}' && "
+                    f"if grep -q 'TEST RESULT' '{output_file}' 2>/dev/null; then "
+                    f"echo 'COMPLETE'; "
+                    f"elif grep -q 'Timing test period' '{output_file}' 2>/dev/null; then "
+                    f"last_min=$(grep -oP '\\d+(?= \\.\\.\\.,)' '{output_file}' | tail -1); "
+                    f"echo \"INCOMPLETE:$last_min\"; "
+                    f"else echo 'NO_OUTPUT'; fi"
+                )
+                success, output = executor.execute_command(host, verify_cmd, f"Verifying test completion on {host}", timeout=30)
+                if success:
+                    result = output.strip()
+                    if result == "COMPLETE":
+                        logger.info(f"{host}: Test completed successfully (full {expected_minutes} min duration)")
+                    elif result.startswith("INCOMPLETE:"):
+                        last_min = result.split(":")[1] if ":" in result else "?"
+                        logger.warning(f"{host}: Test ended prematurely at minute {last_min}/{expected_minutes} - results may be partial")
+                    elif result == "NO_OUTPUT":
+                        logger.warning(f"{host}: No test output found - test may not have started")
+            counter += 1
+
         # Step 3: Collect results
         logger.info(f"Collecting test results for {user_count} users:")
         counter = 1
@@ -1696,38 +1709,30 @@ def collect_results(config: MariaDBTestConfig, executor: CommandExecutor, result
             logger.warning(f"{host}: No result files found to archive")
             return host, False
         
-        # Copy results from VM to localhost
-        source = f"root@vmi/{host}:{config.hammerdb_dir}/mariadb-results.tar.gz"
+        # Copy results from VM to localhost via SSH pipe
         destination = os.path.join(host_dir, "mariadb-results.tar.gz")
         
         try:
-            scp_cmd = executor.get_scp_command(source, destination)
-            result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=config.timeout_scp if hasattr(config, 'timeout_scp') else 600)
+            cat_cmd = f"cat '{config.hammerdb_dir}/mariadb-results.tar.gz'"
+            ssh_cmd = executor.get_ssh_command(host, cat_cmd)
+            timeout_s = config.timeout_scp if hasattr(config, 'timeout_scp') else 600
+            
+            with open(destination, 'wb') as f:
+                result = subprocess.run(
+                    ssh_cmd,
+                    stdout=f,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout_s
+                )
             
             if result.returncode != 0:
-                logger.warning(f"{host}: SCP failed, trying base64 fallback...")
-                cmd = f"base64 '{config.hammerdb_dir}/mariadb-results.tar.gz'"
-                b64_success, b64_output = executor.execute_command(host, cmd, f"Reading results via base64 from {host}", timeout=config.timeout_scp if hasattr(config, 'timeout_scp') else 600)
-                if b64_success and b64_output:
-                    try:
-                        decoded_data = base64.b64decode(b64_output.strip())
-                        with open(destination, 'wb') as f:
-                            f.write(decoded_data)
-                        logger.info(f"{host}: Copied results using base64 fallback")
-                    except Exception as e:
-                        logger.error(f"{host}: base64 decode failed: {e}")
-                        return host, False
-                else:
-                    logger.error(f"{host}: Both SCP and base64 methods failed")
-                    logger.info(f"{host}: Results still available at {config.hammerdb_dir}/mariadb-results.tar.gz")
-                    return host, False
-            else:
-                logger.info(f"{host}: Copied results successfully")
+                stderr = result.stderr.decode() if result.stderr else ""
+                raise RuntimeError(f"SSH pipe failed (exit {result.returncode}): {stderr[:200]}")
             
             # Extract results locally
             if _safe_extract_tar(destination, host_dir):
                 os.remove(destination)
-                logger.info(f"{host}: Extracted results")
+                logger.info(f"{host}: Copied and extracted results")
                 
                 # Clean up remote archive only (keep .out files as backup)
                 cleanup_cmd = (
@@ -1738,7 +1743,7 @@ def collect_results(config: MariaDBTestConfig, executor: CommandExecutor, result
                 executor.execute_command(host, cleanup_cmd, f"Cleaning up archive on {host}", timeout=30)
                 return host, True
             else:
-                logger.warning(f"{host}: Extraction failed, keeping archive at {destination}")
+                logger.warning(f"{host}: Extraction failed, archive kept at {destination}")
                 return host, False
                 
         except subprocess.TimeoutExpired:
@@ -1746,6 +1751,7 @@ def collect_results(config: MariaDBTestConfig, executor: CommandExecutor, result
             return host, False
         except Exception as e:
             logger.error(f"{host}: Error copying results: {e}")
+            logger.info(f"{host}: Results still available at {config.hammerdb_dir}/mariadb-results.tar.gz")
             return host, False
     
     # Run collection in parallel
@@ -1819,13 +1825,17 @@ def stop_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
     
     # Step 1: Stop MariaDB services
     logger.info("Step 1/3: Stopping MariaDB services on all hosts...")
+    failed_hosts = []
     with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
         futures = []
         for host in config.db_hosts:
             future = pool.submit(manage_mariadb_service, config, executor, host, "stop", "Stopping MariaDB service")
-            futures.append(future)
-        for future in as_completed(futures):
-            future.result()
+            futures.append((future, host))
+        for future, host in futures:
+            if not future.result():
+                failed_hosts.append(host)
+    if failed_hosts:
+        logger.warning(f"Failed to stop MariaDB on {len(failed_hosts)} host(s): {', '.join(failed_hosts)}")
     
     # Step 2: Cleanup storage
     if config.mount_point != "none" and config.mount_point != "null":
