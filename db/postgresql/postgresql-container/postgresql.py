@@ -75,6 +75,10 @@ class PostgreSQLTestConfig:
         self.skip_connectivity_test = False  # Skip initial connectivity test
         # Monitoring configuration
         self.task_monitor_interval = 60  # Check task status every N seconds for long-running tasks
+        self.build_time_limit = 14400  # Hard limit for database build monitoring (4 hours)
+        self.build_poll_interval = 60  # Seconds between build status polls
+        self.build_check_timeout = 60  # Per-poll virtctl/SSH timeout during build monitoring
+        self.build_check_max_retries = 1  # Avoid retry storms during build polling
         self.monitor_vm = False
         self.monitor_vm_interval = 10
 
@@ -500,6 +504,30 @@ class ConfigLoader:
             self.config.task_monitor_interval = 60
         else:
             self.config.task_monitor_interval = int(self.config.task_monitor_interval)
+
+        self.config.build_time_limit = monitoring.get('build_time_limit', 14400)
+        if self.config.build_time_limit == "null" or not self.config.build_time_limit:
+            self.config.build_time_limit = 14400
+        else:
+            self.config.build_time_limit = int(self.config.build_time_limit)
+
+        self.config.build_poll_interval = monitoring.get('build_poll_interval', 60)
+        if self.config.build_poll_interval == "null" or not self.config.build_poll_interval:
+            self.config.build_poll_interval = 60
+        else:
+            self.config.build_poll_interval = int(self.config.build_poll_interval)
+
+        self.config.build_check_timeout = monitoring.get('build_check_timeout', 60)
+        if self.config.build_check_timeout == "null" or not self.config.build_check_timeout:
+            self.config.build_check_timeout = 60
+        else:
+            self.config.build_check_timeout = int(self.config.build_check_timeout)
+
+        self.config.build_check_max_retries = monitoring.get('build_check_max_retries', 1)
+        if self.config.build_check_max_retries == "null" or not self.config.build_check_max_retries:
+            self.config.build_check_max_retries = 1
+        else:
+            self.config.build_check_max_retries = int(self.config.build_check_max_retries)
     
     def _get_db_hosts(self, yaml_data: Dict) -> List[str]:
         """Get database hosts from various methods"""
@@ -695,6 +723,9 @@ def display_config(config: PostgreSQLTestConfig) -> None:
     logger.info(f"Max retries: {config.max_retries}")
     logger.info(f"Skip connectivity test: {'ENABLED' if config.skip_connectivity_test else 'DISABLED'}")
     logger.info(f"Task monitor interval: {config.task_monitor_interval}s")
+    logger.info(f"Build time limit: {config.build_time_limit}s")
+    logger.info(f"Build poll interval: {config.build_poll_interval}s")
+    logger.info(f"Build check timeout: {config.build_check_timeout}s (max_retries={config.build_check_max_retries})")
     if config.migrate_user_counts:
         if config.migrate_interval > 0:
             logger.info(f"VM Migration: ENABLED for user_counts: {' '.join(config.migrate_user_counts)} "
@@ -847,12 +878,13 @@ def deploy_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
             # Use bash -c for consistent execution across SSH and virtctl
             script_path_escaped = script_path.replace("'", "'\"'\"'")
             hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
+            hammerdb_path_display = config.hammerdb_path.replace("'", "'\"'\"'")
             cmd = (
                 f"bash -c '"
-                f"if [ -f \"{script_path_escaped}\" ]; then "
-                f"chmod +x \"{script_path_escaped}\" && echo \"Permissions set successfully\"; "
+                f"if [ -f \"{hammerdb_path_escaped}/templates/postgresql/Hammerdb-postgres-install-script\" ]; then "
+                f"chmod +x \"{hammerdb_path_escaped}/templates/postgresql/Hammerdb-postgres-install-script\" && echo \"Permissions set successfully\"; "
                 f"else "
-                f"echo \"ERROR: Script file not found at {script_path_escaped}\"; "
+                f"echo \"ERROR: Script file not found at {hammerdb_path_display}/templates/postgresql/Hammerdb-postgres-install-script\"; "
                 f"echo \"Checking if git clone was successful...\"; "
                 f"ls -la \"{hammerdb_path_escaped}/templates/postgresql/\" 2>&1 || echo \"Directory does not exist\"; "
                 f"exit 1; "
@@ -991,6 +1023,183 @@ def manage_postgresql_service(config: PostgreSQLTestConfig, executor: CommandExe
     executor.execute_command(host, cmd, description)
 
 
+def _build_output_verify_cmd(hammerdb_dir: str, output_file: str) -> str:
+    """Remote command to inspect HammerDB build log for completion/errors."""
+    return (
+        f"cd {hammerdb_dir} && "
+        f"if [ -f {output_file} ] && [ -s {output_file} ]; then "
+        f"  tail -30 {output_file} | grep -iE '(complete|success|finished|VU.*complete|build.*complete)' || echo 'NO_COMPLETE_MARKER'; "
+        f"  tail -30 {output_file} | grep -iE '(error|failed|fatal)' | tail -5 || echo 'NO_ERRORS'; "
+        f"else "
+        f"  echo 'FILE_MISSING_OR_EMPTY'; "
+        f"fi"
+    )
+
+
+def _parse_build_verify_output(verify_output: str) -> Tuple[bool, bool, bool]:
+    """Return (has_complete_marker, has_errors, file_missing)."""
+    if not verify_output:
+        return False, False, False
+    file_missing = 'FILE_MISSING_OR_EMPTY' in verify_output
+    has_complete = 'NO_COMPLETE_MARKER' not in verify_output
+    has_errors = 'NO_ERRORS' not in verify_output and not file_missing
+    return has_complete, has_errors, file_missing
+
+
+def _get_build_output_size(
+    executor: 'CommandExecutor',
+    config: PostgreSQLTestConfig,
+    host: str,
+    output_file: str,
+    *,
+    quiet: bool = True,
+    max_retries: Optional[int] = None,
+) -> Optional[int]:
+    """Return build log size in bytes, or None if the check failed."""
+    size_cmd = f"stat -c '%s' {config.hammerdb_dir}/{output_file} 2>/dev/null || echo -1"
+    success, output = executor.execute_command(
+        host,
+        size_cmd,
+        f"Checking build output size on {host}",
+        timeout=config.build_check_timeout,
+        max_retries=max_retries if max_retries is not None else config.build_check_max_retries,
+        quiet=quiet,
+    )
+    if not success or not output.strip().lstrip('-').isdigit():
+        return None
+    size = int(output.strip())
+    return size if size >= 0 else None
+
+
+def _poll_build_host_status(
+    executor: 'CommandExecutor',
+    config: PostgreSQLTestConfig,
+    host: str,
+    vm_number: int,
+    output_file: str,
+    last_output_sizes: Dict[str, int],
+    *,
+    quiet: bool = True,
+    max_retries: Optional[int] = None,
+) -> str:
+    """
+    Poll one host during build monitoring.
+
+    Returns:
+        'complete'       - build finished successfully
+        'running'        - build still in progress
+        'failed'         - build log shows errors and no progress
+        'check_failed'   - virtctl/SSH check failed (treat as still running)
+    """
+    poll_retries = max_retries if max_retries is not None else config.build_check_max_retries
+    check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
+    success, output = executor.execute_command(
+        host,
+        check_cmd,
+        f"Checking build status on {host}",
+        timeout=config.build_check_timeout,
+        max_retries=poll_retries,
+        quiet=quiet,
+    )
+    if not success:
+        return 'check_failed'
+
+    process_count = int(output.strip()) if output.strip().isdigit() else 0
+    if process_count > 0:
+        return 'running'
+
+    verify_success, verify_output = executor.execute_command(
+        host,
+        _build_output_verify_cmd(config.hammerdb_dir, output_file),
+        f"Verifying build completion on {host}",
+        timeout=config.build_check_timeout,
+        max_retries=poll_retries,
+        quiet=quiet,
+    )
+    if not verify_success:
+        return 'check_failed'
+
+    has_complete, has_errors, file_missing = _parse_build_verify_output(verify_output)
+    if has_complete:
+        return 'complete'
+    if file_missing:
+        return 'running'
+
+    current_size = _get_build_output_size(
+        executor, config, host, output_file, quiet=quiet, max_retries=poll_retries
+    )
+    previous_size = last_output_sizes.get(host)
+    if current_size is not None:
+        if previous_size is None or current_size > previous_size:
+            last_output_sizes[host] = current_size
+            return 'running'
+        last_output_sizes[host] = current_size
+
+    if has_errors:
+        return 'failed'
+
+    # No completion marker yet, but no errors either — keep waiting.
+    return 'running'
+
+
+def _finalize_build_hosts(
+    executor: 'CommandExecutor',
+    config: PostgreSQLTestConfig,
+    host_build_info: Dict[str, Tuple[int, str]],
+    hosts: List[str],
+) -> List[str]:
+    """Run a final strict verification pass; return hosts that failed."""
+    failed_builds = []
+    last_output_sizes: Dict[str, int] = {}
+
+    with ThreadPoolExecutor(max_workers=min(len(hosts), 50)) as pool:
+        futures = {
+            pool.submit(
+                _poll_build_host_status,
+                executor,
+                config,
+                host,
+                host_build_info[host][0],
+                host_build_info[host][1],
+                last_output_sizes,
+                quiet=False,
+                max_retries=config.max_retries,
+            ): host
+            for host in hosts
+        }
+        for future in as_completed(futures):
+            host = futures[future]
+            vm_number, output_file = host_build_info[host]
+            try:
+                status = future.result()
+            except Exception as e:
+                logger.error(f"Final build verification error on {host}: {e}")
+                failed_builds.append(host)
+                continue
+
+            if status == 'complete':
+                logger.info(f"✓ Database build completed on {host}")
+            elif status == 'running':
+                logger.error(
+                    f"Database build on {host} still running after {config.build_time_limit}s "
+                    f"- check {output_file}"
+                )
+                failed_builds.append(host)
+            elif status == 'check_failed':
+                logger.error(
+                    f"Could not verify database build on {host} after {config.build_time_limit}s "
+                    f"- check connectivity and {output_file}"
+                )
+                failed_builds.append(host)
+            else:
+                logger.error(
+                    f"Database build on {host} may have failed - check {output_file}"
+                )
+                failed_builds.append(host)
+
+    return failed_builds
+
+
 def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
     """Build TPCC database"""
     logger.info("Building TPCC database with parallel execution...")
@@ -1085,7 +1294,8 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
                 else:
                     verify_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
                     verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build on {host}", timeout=30)
-                    process_count = int(verify_output.strip()) if verify_success and verify_output.strip().isdigit() else 0
+                    verify_output_stripped = verify_output.strip() if verify_output else ""
+                    process_count = int(verify_output_stripped) if verify_success and verify_output_stripped.isdigit() else 0
                     if process_count > 0:
                         logger.info(f"✓ Database build started on {host} (verified)")
                     else:
@@ -1097,136 +1307,103 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
             sys.exit(1)
     
     logger.info("All database build processes started. Monitoring build progress...")
-    
-    # Monitor build completion by checking if hammerdbcli processes are still running
-    # Database builds can take a very long time (30+ minutes for large warehouses),
-    # so we keep waiting and only warn after the soft threshold.
-    soft_max_build_time = 3600  # 1 hour soft warning threshold
-    check_interval = 30  # Check every 30 seconds
+
+    if config.build_time_limit <= config.build_poll_interval:
+        logger.error("monitoring.build_time_limit must be greater than build_poll_interval")
+        sys.exit(1)
+
     start_time = time.time()
     warned_long_build = False
-    completed_hosts = set()  # Track hosts that have completed (successfully or with errors)
-    
+    completed_hosts = set()
+    last_output_sizes: Dict[str, int] = {}
+
     while True:
-        still_building = []
+        if time.time() - start_time >= config.build_time_limit:
+            remaining = [h for h in config.db_hosts if h not in completed_hosts]
+            logger.warning(
+                f"Database build reached time limit ({config.build_time_limit}s). "
+                f"Running final verification on {len(remaining)} host(s): {', '.join(remaining)}"
+            )
+            failed_builds = _finalize_build_hosts(
+                executor, config, host_build_info, remaining
+            )
+            if failed_builds:
+                logger.error(
+                    f"Database build failed or timed out on {len(failed_builds)} host(s): "
+                    f"{', '.join(failed_builds)}"
+                )
+                logger.error("Cannot proceed with tests - database must be built successfully first")
+                sys.exit(1)
+            if remaining:
+                logger.info("All remaining database builds verified successfully after time limit")
+            break
+
         hosts_to_check = [h for h in config.db_hosts if h not in completed_hosts]
-        
         if not hosts_to_check:
-            # All hosts have completed
             logger.info("All database builds completed!")
             break
-        
+
+        still_building = []
+        check_failed_hosts = []
+
         with ThreadPoolExecutor(max_workers=len(hosts_to_check)) as pool:
-            futures = []
-            for host in hosts_to_check:
-                vm_number, output_file = host_build_info[host]
-                # Check if hammerdbcli build process is still running
-                check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
-                future = pool.submit(executor.execute_command, host, check_cmd, f"Checking build status on {host}", timeout=30)
-                futures.append((future, vm_number, host, output_file))
-            
-            for future, vm_number, host, output_file in futures:
+            futures = {
+                pool.submit(
+                    _poll_build_host_status,
+                    executor,
+                    config,
+                    host,
+                    host_build_info[host][0],
+                    host_build_info[host][1],
+                    last_output_sizes,
+                ): host
+                for host in hosts_to_check
+            }
+            for future in as_completed(futures):
+                host = futures[future]
                 try:
-                    success, output = future.result()
-                    if success:
-                        process_count = int(output.strip()) if output.strip().isdigit() else 0
-                        if process_count > 0:
-                            still_building.append(host)
-                        else:
-                            # Process finished - verify build completed successfully by checking output file
-                            # Check if output file exists and has content, and look for completion indicators
-                            verify_cmd = (
-                                f"cd {config.hammerdb_dir} && "
-                                f"if [ -f {output_file} ] && [ -s {output_file} ]; then "
-                                f"  tail -30 {output_file} | grep -iE '(complete|success|finished|VU.*complete|build.*complete)' || echo 'NO_COMPLETE_MARKER'; "
-                                f"  tail -30 {output_file} | grep -iE '(error|failed|fatal)' | tail -5 || echo 'NO_ERRORS'; "
-                                f"else "
-                                f"  echo 'FILE_MISSING_OR_EMPTY'; "
-                                f"fi"
-                            )
-                            verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build completion on {host}", timeout=30)
-                            if verify_success:
-                                if 'FILE_MISSING_OR_EMPTY' in verify_output:
-                                    logger.warning(f"Build output file missing or empty on {host} - build may have failed, will verify at end")
-                                    completed_hosts.add(host)  # Mark as checked, will verify at end
-                                elif 'NO_COMPLETE_MARKER' in verify_output and 'NO_ERRORS' not in verify_output:
-                                    # No completion marker but has errors - likely failed
-                                    logger.warning(f"Build on {host} may have failed - no completion marker and errors found - will verify at end")
-                                    completed_hosts.add(host)  # Mark as checked, will verify at end
-                                else:
-                                    # Build appears to have completed successfully
-                                    logger.info(f"✓ Database build completed on {host}")
-                                    completed_hosts.add(host)
-                            else:
-                                logger.warning(f"Could not verify build completion on {host} - will check again")
-                                still_building.append(host)
+                    status = future.result()
                 except Exception as e:
                     logger.warning(f"Error checking build status on {host}: {e}")
-                    # Assume still building if we can't check
                     still_building.append(host)
-        
-        if not still_building:
-            # All processes have finished (may need final verification)
-            logger.info("All database build processes have finished. Performing final verification...")
-            break
-        
-        elapsed = int(time.time() - start_time)
-        if elapsed > soft_max_build_time and not warned_long_build:
+                    continue
+
+                if status == 'complete':
+                    logger.info(f"✓ Database build completed on {host}")
+                    completed_hosts.add(host)
+                elif status == 'check_failed':
+                    still_building.append(host)
+                    check_failed_hosts.append(host)
+                elif status == 'failed':
+                    output_file = host_build_info[host][1]
+                    logger.warning(
+                        f"Build on {host} may have errors in {output_file} - will re-check before failing"
+                    )
+                    still_building.append(host)
+                else:
+                    still_building.append(host)
+
+        if check_failed_hosts:
             logger.warning(
-                f"Database builds are taking longer than {soft_max_build_time}s; continuing to wait..."
+                "Could not reach %d host(s) for build status check (virtctl/SSH timeout); "
+                "assuming still building: %s",
+                len(check_failed_hosts),
+                ', '.join(check_failed_hosts),
+            )
+
+        elapsed = int(time.time() - start_time)
+        if elapsed > config.build_time_limit // 4 and not warned_long_build:
+            logger.warning(
+                f"Database builds are taking longer than {config.build_time_limit // 4}s; "
+                f"hard timeout at {config.build_time_limit}s"
             )
             warned_long_build = True
-        logger.info(f"Waiting for database builds to complete... ({len(still_building)} hosts still building: {', '.join(still_building)}, {elapsed}s elapsed)")
-        time.sleep(check_interval)
-    
-    # Final verification - check all hosts one more time
-    failed_builds = []
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
-        futures = []
-        for host in config.db_hosts:
-            vm_number, output_file = host_build_info[host]
-            check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
-            future = pool.submit(executor.execute_command, host, check_cmd, f"Final build status check on {host}", timeout=30)
-            futures.append((future, vm_number, host, output_file))
-        
-        for future, vm_number, host, output_file in futures:
-            success, output = future.result()
-            if success:
-                process_count = int(output.strip()) if output.strip().isdigit() else 0
-                if process_count > 0:
-                    # Build still running; continue waiting rather than failing
-                    logger.info(f"Database build on {host} is still running - continuing to wait (output: {output_file})")
-                else:
-                    # Verify build completed successfully by checking output file
-                    verify_cmd = (
-                        f"cd {config.hammerdb_dir} && "
-                        f"if [ -f {output_file} ] && [ -s {output_file} ]; then "
-                        f"  tail -30 {output_file} | grep -iE '(complete|success|finished|VU.*complete|build.*complete)' || echo 'NO_COMPLETE_MARKER'; "
-                        f"  tail -30 {output_file} | grep -iE '(error|failed|fatal)' | tail -5 || echo 'NO_ERRORS'; "
-                        f"else "
-                        f"  echo 'FILE_MISSING_OR_EMPTY'; "
-                        f"fi"
-                    )
-                    verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Checking final build output on {host}", timeout=30)
-                    if verify_success:
-                        if 'FILE_MISSING_OR_EMPTY' in verify_output:
-                            logger.error(f"Database build on {host} failed - output file missing or empty - check {output_file}")
-                            failed_builds.append(host)
-                        elif 'NO_COMPLETE_MARKER' in verify_output and 'NO_ERRORS' not in verify_output:
-                            logger.error(f"Database build on {host} may have failed - no completion marker and errors found - check {output_file}")
-                            logger.error(f"Error output: {verify_output}")
-                            failed_builds.append(host)
-                        else:
-                            logger.info(f"✓ Database build completed on {host}")
-                    else:
-                        logger.warning(f"Could not verify build completion on {host} - check {output_file} manually")
-                        # Don't fail if we can't verify - let user check manually
-    
-    if failed_builds:
-        logger.error(f"Database build failed or timed out on {len(failed_builds)} host(s): {', '.join(failed_builds)}")
-        logger.error("Cannot proceed with tests - database must be built successfully first")
-        sys.exit(1)
-    
+        logger.info(
+            f"Waiting for database builds to complete... "
+            f"({len(still_building)} hosts still building: {', '.join(still_building)}, {elapsed}s elapsed)"
+        )
+        time.sleep(config.build_poll_interval)
+
     logger.info("Database building completed successfully on all hosts!")
 
 
@@ -1516,16 +1693,21 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor, migration
             
             # Verify HammerDB processes are still running after migration
             logger.info("Verifying HammerDB processes are still running after migration...")
-            for host in config.db_hosts:
-                vm_number = get_vm_number(host)
-                cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_pg' | grep -v grep | wc -l"
-                success, output = executor.execute_command(host, cmd, "Checking HammerDB process status", timeout=30)
-                if success:
-                    process_count = int(output.strip()) if output.strip().isdigit() else 0
-                    if process_count > 0:
-                        logger.info(f"✓ HammerDB process confirmed running on {host} after migration")
-                    else:
-                        logger.warning(f"⚠ HammerDB process not found on {host} after migration - test may have completed or failed")
+            with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+                futures = {}
+                for host in config.db_hosts:
+                    vm_number = get_vm_number(host)
+                    cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_pg' | grep -v grep | wc -l"
+                    futures[pool.submit(executor.execute_command, host, cmd, "Checking HammerDB process status after migration", timeout=30)] = host
+                for future in as_completed(futures):
+                    host = futures[future]
+                    success, output = future.result()
+                    if success:
+                        process_count = int(output.strip()) if output.strip().isdigit() else 0
+                        if process_count > 0:
+                            logger.info(f"✓ HammerDB process confirmed running on {host} after migration")
+                        else:
+                            logger.warning(f"⚠ HammerDB process not found on {host} after migration - test may have completed or failed")
         
         # Wait for tests to complete
         logger.info(f"Waiting for performance tests with {user_count} users to complete...")

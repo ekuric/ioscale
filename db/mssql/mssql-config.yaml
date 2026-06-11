@@ -33,7 +33,7 @@ database:
   
   namespace: "default"           # Kubernetes namespace for VMs
   warehouse_count: 50            # Number of warehouses for TPCC test
-  build_users: 50                # Virtual users for schema build step
+  build_users: 32                # Virtual users for schema build step - keep this at reasonable number for MSSQL 
   test_duration: 15              # Test duration in minutes
   # rampup_time: 2               # Ramp-up time in minutes (defaults to 2 if not set)
   mssql_pass: "mssqlpasswd1!"    # SA password for sqlcmd/ODBC

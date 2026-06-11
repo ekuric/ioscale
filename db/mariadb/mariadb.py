@@ -175,17 +175,39 @@ class VMMigrationMonitor:
         with open(output_path, 'w') as f:
             f.write(f"# VM Migration Events Log\n")
             f.write(f"# Namespace: {self.namespace}\n")
-            f.write(f"# Total migrations: {len(events)}\n#\n")
+            f.write(f"# Total events: {len(events)}\n#\n")
             if not events:
                 f.write("# No migrations detected during test execution.\n")
             else:
                 for event in events:
-                    op = event.get('operation', '')
-                    if op:
-                        f.write(f"[{event['timestamp']}] op {op}: {event['vm']}: {event['from_node']} -> {event['to_node']}\n")
+                    event_type = event.get('type', 'migration')
+                    if event_type == 'migration_failure':
+                        op = event.get('operation', '')
+                        msg = event.get('message', '')
+                        vm = event.get('vm', '')
+                        label = f"vm {vm}" if vm else ""
+                        if op:
+                            f.write(f"[{event['timestamp']}] FAILURE: op {op}: {msg} {label}\n")
+                        else:
+                            f.write(f"[{event['timestamp']}] FAILURE: {msg} {label}\n")
                     else:
-                        f.write(f"[{event['timestamp']}] {event['vm']}: {event['from_node']} -> {event['to_node']}\n")
+                        op = event.get('operation', '')
+                        if op:
+                            f.write(f"[{event['timestamp']}] op {op}: {event['vm']}: {event['from_node']} -> {event['to_node']}\n")
+                        else:
+                            f.write(f"[{event['timestamp']}] {event['vm']}: {event['from_node']} -> {event['to_node']}\n")
         logger.info(f"VM_MONITOR: Migration report written to {output_path}")
+
+    def log_event(self, message: str, vm: str = "", operation: str = "", event_type: str = "migration"):
+        """Log a migration event (node changes or command-level results) to the monitor's event list."""
+        with self._lock:
+            self.events.append({
+                "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                "vm": vm,
+                "message": message,
+                "operation": operation,
+                "type": event_type,
+            })
 
 
 class CommandExecutor:
@@ -737,8 +759,9 @@ def deploy_scripts(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     """Deploy HammerDB scripts to VMs"""
     logger.info("Deploying HammerDB scripts to VMs...")
     
-    # Step 1: Prepare directories
+    # Step 1: Prepare directories - remove existing HammerDB install (if any) to ensure clean state
     logger.info("Step 1/3: Preparing scripts directory on all hosts...")
+    logger.warning(f"Removing existing HammerDB installation at {config.hammerdb_path} (if any) to ensure clean state")
     with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
         futures = []
         for host in config.db_hosts:
@@ -856,23 +879,49 @@ def install_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> Non
     with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
         futures = []
         for host in config.db_hosts:
-            if config.mount_point != "none":
-                cmd = f"cd '{config.hammerdb_path}/templates/mariadb'; ./Hammerdb-mariadb-install-script -m '{config.mount_point}'"
-            else:
-                cmd = f"cd '{config.hammerdb_path}/templates/mariadb'; ./Hammerdb-mariadb-install-script -d '{config.disk_list}'"
+            cmd = (
+                f"if systemctl is-active --quiet mariadb && rpm -q mariadb-server &>/dev/null; then "
+                f"echo 'MariaDB already installed and running'; "
+                f"exit 0; "
+                f"elif rpm -q mariadb-server &>/dev/null; then "
+                f"echo 'MariaDB already installed but not running, will reinstall'; "
+                f"cd '{config.hammerdb_path}/templates/mariadb'; "
+                f"./Hammerdb-mariadb-install-script {'-m ' + config.mount_point if config.mount_point != 'none' else '-d ' + config.disk_list} || exit 1; "
+                f"else "
+                f"echo 'Installing MariaDB from scratch'; "
+                f"cd '{config.hammerdb_path}/templates/mariadb'; "
+                f"./Hammerdb-mariadb-install-script {'-m ' + config.mount_point if config.mount_point != 'none' else '-d ' + config.disk_list} || exit 1; "
+                f"fi"
+            )
             future = pool.submit(executor.execute_command, host, cmd, "Installing MariaDB")
             futures.append(future)
         
+        already_installed = 0
+        installed_from_scratch = 0
         failed = 0
+        reinstall_count = 0
         for future in as_completed(futures):
             success, output = future.result()
             if not success:
                 logger.error(f"Failed to install MariaDB: {output}")
                 failed += 1
+            elif output and "already installed and running" in output.lower():
+                already_installed += 1
+            elif output and "from scratch" in output.lower():
+                installed_from_scratch += 1
+            elif output and "will reinstall" in output.lower():
+                reinstall_count += 1
         
         if failed > 0:
             logger.error(f"{failed}/{len(config.db_hosts)} hosts failed to install MariaDB")
             sys.exit(1)
+        
+        if already_installed > 0:
+            logger.info(f"MariaDB already installed and running on {already_installed} host(s)")
+        if installed_from_scratch > 0:
+            logger.info(f"MariaDB installed from scratch on {installed_from_scratch} host(s)")
+        if reinstall_count > 0:
+            logger.info(f"MariaDB reinstalled (was installed but not running) on {reinstall_count} host(s)")
     
     # Create /etc/fstab entries if persistent mount is enabled
     if config.persistent_mount:
@@ -1023,12 +1072,15 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
             future = pool.submit(executor.execute_command, host, cmd, f"Preparing build script (build{counter}_mariadb.tcl)")
             futures.append((future, counter))
             counter += 1
+        build_script_failures = []
         for future, counter in futures:
             success, output = future.result()
             if not success:
                 logger.error(f"Failed to prepare build script: {output}")
-    
-    # Step 5: Build databases
+                build_script_failures.append(f"build{counter}_mariadb.tcl")
+        if build_script_failures:
+            logger.error(f"Failed to prepare {len(build_script_failures)} build script(s): {', '.join(build_script_failures)}")
+            sys.exit(1)
     logger.info("Step 5/5: Building TPCC databases on all hosts (this may take a while)...")
     
     # Start build processes - use nohup with immediate verification
@@ -1228,25 +1280,31 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     logger.info("Database building completed successfully on all hosts!")
 
 
-def migrate_vms_during_test(config: MariaDBTestConfig, executor: CommandExecutor, user_count: str) -> bool:
-    """Migrate VMs during MariaDB test"""
+def migrate_vms_during_test(config: MariaDBTestConfig, executor: CommandExecutor, user_count: str) -> Tuple[bool, List[str]]:
+    """Migrate VMs during MariaDB test.
+    
+    Returns:
+        Tuple of (success: bool, failed_vms: List[str]).
+        (True, []) means all migrations succeeded.
+        (False, [...]) means some VMs failed to migrate.
+    """
     if not config.migrate_user_counts or user_count not in config.migrate_user_counts:
-        return True
+        return True, []
     
     if config.use_virtctl is False:
         logger.warning(f"Migration requested for user_count '{user_count}' but SSH-only mode is enabled")
-        return True
+        return True, []
     
     if not config.namespace or config.namespace == "N/A":
         logger.warning(f"Migration requested for user_count '{user_count}' but namespace is not set")
-        return True
+        return True, []
     
     # Get VMs to migrate
     vms_to_migrate = [h for h in config.db_hosts if executor.is_vm_host(h)]
     
     if not vms_to_migrate:
         logger.info(f"No VMs found to migrate for user_count '{user_count}'")
-        return True
+        return True, []
     
     if config.migrate_interval > 0:
         logger.info(f"Starting VM migrations for user_count '{user_count}' ({len(vms_to_migrate)} VMs, sequential with {config.migrate_interval}s interval)...")
@@ -1303,14 +1361,14 @@ def migrate_vms_during_test(config: MariaDBTestConfig, executor: CommandExecutor
             
             if retry_failed:
                 logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
-                return False
+                return False, retry_failed
             else:
                 logger.info(f"All failed migrations succeeded on retry")
                 logger.info(f"All VM migrations completed successfully for user_count '{user_count}' (after retry)")
-                return True
+                return True, []
         
         logger.info(f"All VM migrations completed successfully for user_count '{user_count}'")
-        return True
+        return True, []
     else:
         logger.info(f"Starting VM migrations for user_count '{user_count}' ({len(vms_to_migrate)} VMs, parallel)...")
         
@@ -1359,14 +1417,14 @@ def migrate_vms_during_test(config: MariaDBTestConfig, executor: CommandExecutor
                 
                 if retry_failed:
                     logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
-                    return False
+                    return False, retry_failed
                 else:
                     logger.info(f"All failed migrations succeeded on retry")
                     logger.info(f"All VM migrations completed successfully for user_count '{user_count}' (after retry)")
-                    return True
+                    return True, []
         
         logger.info(f"All VM migrations completed successfully for user_count '{user_count}'")
-        return True
+        return True, []
 
 
 def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_monitor: Optional['VMMigrationMonitor'] = None) -> None:
@@ -1513,7 +1571,13 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
             time.sleep(migration_time)
             
             logger.info(f"Triggering VM migrations at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (midpoint of actual test runtime after rampup)...")
-            migrate_vms_during_test(config, executor, user_count)
+            migration_success, migration_failed_vms = migrate_vms_during_test(config, executor, user_count)
+            if not migration_success:
+                logger.error(f"VM migrations FAILED for user_count '{user_count}': {', '.join(migration_failed_vms)}")
+                if migration_monitor:
+                    op = f"tpcc {user_count} users"
+                    for vm_name in migration_failed_vms:
+                        migration_monitor.log_event(f"VM migration FAILED: {vm_name}", vm=vm_name, operation=op, event_type="migration_failure")
             
             # Verify HammerDB processes are still running after migration
             logger.info("Verifying HammerDB processes are still running after migration...")
@@ -1530,26 +1594,20 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
         # Wait for tests to complete
         logger.info(f"Waiting for performance tests with {user_count} users to complete...")
         with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
-            futures = []
-            counter = 1
-            for host in config.db_hosts:
-                output_file = f"test_mariadb_{run_date}_{num_hosts}pod_pod{counter}_{user_count}.out"
-                # Check if test is still running by looking for the process
-                check_cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{counter}_mariadb' | grep -v grep | wc -l"
-                future = pool.submit(executor.execute_command, host, check_cmd, f"Checking test status on {host}", timeout=30)
-                futures.append((future, counter, host, output_file))
-                counter += 1
-            
-            # Wait a bit for tests to start
-            time.sleep(5)
-            
-            # Monitor test completion
-            rampup_seconds = int(config.rampup_time) * 60 if config.rampup_time else 120
             start_time = time.time()
             check_interval = 30  # Check every 30 seconds
-            max_wait_time = rampup_seconds + test_duration_seconds + 600  # rampup + test + 10 min buffer
+            max_wait_time = rampup_time_seconds + test_duration_seconds + 600  # rampup + test + 10 min buffer
             
             while time.time() - start_time < max_wait_time:
+                # Submit fresh futures at the start of each iteration (avoids stale pre-loop checks)
+                futures = []
+                counter = 1
+                for host in config.db_hosts:
+                    check_cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{counter}_mariadb' | grep -v grep | wc -l"
+                    future = pool.submit(executor.execute_command, host, check_cmd, f"Checking test status on {host}", timeout=30)
+                    futures.append((future, counter, host, f"test_mariadb_{run_date}_{num_hosts}pod_pod{counter}_{user_count}.out"))
+                    counter += 1
+                
                 all_done = True
                 running_count = 0
                 
@@ -1578,15 +1636,6 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
                 elapsed = int(time.time() - start_time)
                 logger.info(f"Waiting for tests to complete... ({running_count} hosts still running, {elapsed}s elapsed)")
                 time.sleep(check_interval)
-                
-                # Recreate futures for next check
-                futures = []
-                counter = 1
-                for host in config.db_hosts:
-                    check_cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{counter}_mariadb' | grep -v grep | wc -l"
-                    future = pool.submit(executor.execute_command, host, check_cmd, f"Checking test status on {host}", timeout=30)
-                    futures.append((future, counter, host, f"test_mariadb_{run_date}_{num_hosts}pod_pod{counter}_{user_count}.out"))
-                    counter += 1
         
         # Verify tests ran for the full duration
         expected_minutes = int(config.test_duration) if config.test_duration else 15
@@ -1715,14 +1764,13 @@ def collect_results(config: MariaDBTestConfig, executor: CommandExecutor, result
         try:
             cat_cmd = f"cat '{config.hammerdb_dir}/mariadb-results.tar.gz'"
             ssh_cmd = executor.get_ssh_command(host, cat_cmd)
-            timeout_s = config.timeout_scp if hasattr(config, 'timeout_scp') else 600
             
             with open(destination, 'wb') as f:
                 result = subprocess.run(
                     ssh_cmd,
                     stdout=f,
                     stderr=subprocess.PIPE,
-                    timeout=timeout_s
+                    timeout=600
                 )
             
             if result.returncode != 0:

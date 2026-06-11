@@ -68,6 +68,14 @@ monitoring:
   # Only tasks running longer than 60 seconds will be monitored for reboots
   # The script will detect if a host reboots during a long-running task and restart it
   task_monitor_interval: 60
+  # Hard timeout for HammerDB database build monitoring (default: 14400 = 4 hours)
+  build_time_limit: 14400
+  # Seconds between build status polls (default: 60)
+  build_poll_interval: 60
+  # Per-poll virtctl/SSH timeout during build monitoring (default: 60)
+  build_check_timeout: 60
+  # Retries per build poll; keep at 1 to avoid long retry storms (default: 1)
+  build_check_max_retries: 1
 
 # VM Migration Configuration (optional)
 # This allows VMs to be migrated during test execution to test migration resilience

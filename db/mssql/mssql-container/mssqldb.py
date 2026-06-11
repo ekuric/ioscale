@@ -1183,7 +1183,8 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
                 verify_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_mssql' | grep -v grep | wc -l"
                 verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build process on {host}", timeout=30)
                 if verify_success:
-                    process_count = int(verify_output.strip()) if verify_output.strip().isdigit() else 0
+                    verify_output_stripped = verify_output.strip() if verify_output else ""
+                    process_count = int(verify_output_stripped) if verify_output_stripped.isdigit() else 0
                     if process_count > 0:
                         logger.info(f"✓ Database build process is running on {host} (verified despite timeout)")
                     else:
@@ -1198,7 +1199,8 @@ def build_database(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
                 else:
                     verify_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_mssql' | grep -v grep | wc -l"
                     verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build on {host}", timeout=30)
-                    process_count = int(verify_output.strip()) if verify_success and verify_output.strip().isdigit() else 0
+                    verify_output_stripped = verify_output.strip() if verify_output else ""
+                    process_count = int(verify_output_stripped) if verify_success and verify_output_stripped.isdigit() else 0
                     if process_count > 0:
                         logger.info(f"✓ Database build started on {host} (verified)")
                     else:
@@ -1634,16 +1636,21 @@ def run_tests(config: MSSQLTestConfig, executor: CommandExecutor, migration_moni
             
             # Verify HammerDB processes are still running after migration
             logger.info("Verifying HammerDB processes are still running after migration...")
-            for host in config.db_hosts:
-                vm_number = get_vm_number(host)
-                cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_mssql' | grep -v grep | wc -l"
-                success, output = executor.execute_command(host, cmd, "Checking HammerDB process status", timeout=30)
-                if success:
-                    process_count = int(output.strip()) if output.strip().isdigit() else 0
-                    if process_count > 0:
-                        logger.info(f"✓ HammerDB process confirmed running on {host} after migration")
-                    else:
-                        logger.warning(f"⚠ HammerDB process not found on {host} after migration - test may have completed or failed")
+            with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+                futures = {}
+                for host in config.db_hosts:
+                    vm_number = get_vm_number(host)
+                    cmd = f"ps aux | grep -E 'hammerdbcli.*runtest{vm_number}_mssql' | grep -v grep | wc -l"
+                    futures[pool.submit(executor.execute_command, host, cmd, "Checking HammerDB process status after migration", timeout=30)] = host
+                for future in as_completed(futures):
+                    host = futures[future]
+                    success, output = future.result()
+                    if success:
+                        process_count = int(output.strip()) if output.strip().isdigit() else 0
+                        if process_count > 0:
+                            logger.info(f"✓ HammerDB process confirmed running on {host} after migration")
+                        else:
+                            logger.warning(f"⚠ HammerDB process not found on {host} after migration - test may have completed or failed")
         
         # Wait for tests to complete
         logger.info(f"Waiting for performance tests with {user_count} users to complete...")
@@ -1657,7 +1664,7 @@ def run_tests(config: MSSQLTestConfig, executor: CommandExecutor, migration_moni
                 future = pool.submit(executor.execute_command, host, check_cmd, f"Checking test status on {host}", timeout=30)
                 futures.append((future, vm_number, host, output_file))
             
-            # Wait a bit for tests to start
+            # Wait for nohup processes to start in the background.
             time.sleep(5)
             
             # Monitor test completion
