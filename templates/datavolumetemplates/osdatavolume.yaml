@@ -1,0 +1,17 @@
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: centosdv
+  namespace: ekuric
+spec:
+  source:
+    http:
+      url: "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-20250812.1.x86_64.qcow2" 
+  pvc:
+    accessModes:
+      - ReadWriteMany
+    resources:
+      requests:
+        storage: 20Gi
+    storageClassName: ocs-storagecluster-ceph-rbd-virtualization
+    volumeMode: Block
