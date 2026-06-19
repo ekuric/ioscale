@@ -47,7 +47,7 @@ SCP_TIMEOUT = 300               # File copy (scp/virtctl scp) timeout
 DATASET_WRITE_BUFFER = 60      # Extra seconds for FIO dataset pre-write to finish
 CHECK_INTERVAL = 10             # Polling interval when waiting for background tasks
 MIGRATION_TIMEOUT = 600         # VM live migration timeout per host
-MAX_WORKERS = 50                # Default thread pool max workers
+DEFAULT_MAX_WORKERS = 50        # Default thread pool max workers
 VM_RESTART_WAIT = 60            # Seconds to wait for VM restart after virtctl restart
 
 # Import required dependencies
@@ -149,6 +149,14 @@ class FioTestConfig:
         self.monitor_vm = False
         self.monitor_vm_interval = 10
         self.migration_report = False
+        self.max_workers_cli = None
+
+    @property
+    def max_workers(self) -> int:
+        """Effective max workers: CLI override or DEFAULT_MAX_WORKERS."""
+        if self.max_workers_cli is not None:
+            return self.max_workers_cli
+        return DEFAULT_MAX_WORKERS
 
     def get_linux_hosts(self) -> List[str]:
         """
@@ -840,7 +848,7 @@ class CommandExecutor:
                             # Script executed but PID not found - verify process is actually running
                             logger.warning(f"PID not found in output for {host}, verifying FIO process is running...")
                             time.sleep(3)  # Give it a moment to start
-                            if self.check_task_running(host, "fio.*testfile|bash.*fio"):
+                            if self.check_task_running(host, f"fio.*testfile|bash.*{script_file}"):
                                 logger.info(f"Background FIO process confirmed running on {host}")
                                 return
                             else:
@@ -857,7 +865,7 @@ class CommandExecutor:
                         # Verify if process is actually running before reporting failure
                         logger.warning(f"SSH verification timed out on {host}, checking if process started...")
                         time.sleep(3)  # Give it a moment to start
-                        if self.check_task_running(host, "fio.*testfile|bash.*fio"):
+                        if self.check_task_running(host, f"fio.*testfile|bash.*{script_file}"):
                             logger.info(f"Process confirmed running on {host} despite SSH timeout - nohup started successfully")
                             return
                         # Check log file for errors (Linux only - Windows doesn't use log files)
@@ -1445,6 +1453,8 @@ def main():
                        help='VM monitor polling interval in seconds (default: 10)')
     parser.add_argument('--migration-report', action='store_true',
                        help='Query and display historical VM migration data from cluster (post-hoc)')
+    parser.add_argument('--max-workers', type=int, default=None,
+                       help='Override default max workers per pool (default: 50)')
     
     args = parser.parse_args()
     
@@ -1467,6 +1477,7 @@ def main():
     config.monitor_vm = args.monitor_vm
     config.monitor_vm_interval = args.monitor_vm_interval
     config.migration_report = args.migration_report
+    config.max_workers_cli = args.max_workers
     
     # Load configuration (YAML sets defaults)
     try:
@@ -1793,7 +1804,7 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
         logger.info(f"Ensuring Windows disk is provisioned for drive {drive_letter}: before FIO installation...")
         
         # Check if the drive exists, and if not, provision it -- all in parallel
-        with ThreadPoolExecutor(max_workers=len(windows_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
             provision_futures = []
             for host in windows_hosts:
                 device = config.windows_storage_devices.get(host, "1")
@@ -1828,7 +1839,7 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
         
         logger.info(f"Copying FIO from c:\\tools\\fio to {root_dir_ps_with_slash} on Windows hosts...")
         logger.info(f"Source path: c:\\tools\\fio, Destination path: {root_dir_ps_with_slash}")
-        with ThreadPoolExecutor(max_workers=len(windows_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
             futures = []
             for host in windows_hosts:
                 cmd = f"powershell -Command \"if (Test-Path 'c:\\tools\\fio') {{ copy-item -Path c:\\tools\\fio -Destination {root_dir_ps_with_slash} -recurse -force; Write-Host 'FIO_COPIED' }} else {{ Write-Host 'SOURCE_NOT_FOUND' }}\""
@@ -1857,7 +1868,7 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
         return
     
     # Check if FIO is already installed on each Linux host
-    with ThreadPoolExecutor(max_workers=len(linux_hosts)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(linux_hosts), config.max_workers)) as pool:
         futures = []
         for host in linux_hosts:
             # Format command as a single line with proper bash -c wrapping
@@ -1954,7 +1965,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     
     # Step 1: Validate devices (Linux only - Windows uses PowerShell script)
     logger.info("Step 1/7: Validating test devices on all hosts...")
-    with ThreadPoolExecutor(max_workers=len(config.vm_hosts)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
         futures = []
         for host in linux_hosts:
             device = config.storage_devices[host]
@@ -1978,7 +1989,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # Step 2: Unmount existing mounts (Linux only - Windows doesn't need this)
     logger.info("Step 2/7: Unmounting existing mounts on Linux hosts...")
     if linux_hosts:
-        with ThreadPoolExecutor(max_workers=len(linux_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(linux_hosts), config.max_workers)) as pool:
             futures = []
             for host in linux_hosts:
                 cmd = f"mountpoint -q {config.mount_point} && (echo 'Unmounting {config.mount_point}' && umount {config.mount_point} || true) || echo 'Mount point {config.mount_point} is not mounted'"
@@ -1992,7 +2003,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     if windows_hosts:
         logger.info("Step 3/7 (Windows): Preparing storage on Windows hosts using provision-data-disk.ps1...")
         logger.info("NOTE: This will partition and format the disk, creating the drive (e.g., d:)")
-        with ThreadPoolExecutor(max_workers=len(windows_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
             futures = []
             for host in windows_hosts:
                 device = config.windows_storage_devices.get(host, "1")
@@ -2009,7 +2020,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # Step 4: Create directories (Linux and Windows separately)
     # For Windows: This must be done AFTER disk provisioning (Step 3) so the drive exists
     logger.info("Step 4/7: Creating test directories on all hosts...")
-    with ThreadPoolExecutor(max_workers=len(config.vm_hosts)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
         futures = []
         for host in linux_hosts:
             cmd = f"mkdir -p {config.output_dir} {config.mount_point}"
@@ -2032,7 +2043,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # Step 5: Format devices (Linux only - Windows handled by provision script)
     if linux_hosts:
         logger.info("Step 5/7: Formatting devices on Linux hosts (WARNING: destructive operation)...")
-        with ThreadPoolExecutor(max_workers=len(linux_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(linux_hosts), config.max_workers)) as pool:
             futures = []
             for host in linux_hosts:
                 device = config.storage_devices[host]
@@ -2048,7 +2059,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # Step 6: Mount devices (Linux only - Windows handled by provision script in Step 3)
     if linux_hosts:
         logger.info("Step 6/7: Mounting devices on Linux hosts...")
-        with ThreadPoolExecutor(max_workers=len(linux_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(linux_hosts), config.max_workers)) as pool:
             futures = []
             for host in linux_hosts:
                 device = config.storage_devices[host]
@@ -2064,7 +2075,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # Step 7: Create /etc/fstab entries if persistent mount is enabled (Linux only)
     if config.persistent_mount and linux_hosts:
         logger.info("Step 7/7: Creating /etc/fstab entries for persistent mounts on Linux hosts...")
-        with ThreadPoolExecutor(max_workers=len(linux_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(linux_hosts), config.max_workers)) as pool:
             futures = []
             for host in linux_hosts:
                 device = config.storage_devices[host]
@@ -2168,7 +2179,7 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
         
         # Step 1: Verify directories exist in parallel for all Windows hosts
         logger.info(f"Ensuring mount point directories exist on {len(windows_hosts)} Windows hosts in parallel...")
-        with ThreadPoolExecutor(max_workers=len(windows_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
             dir_futures = []
             for host in windows_hosts:
                 ensure_dir_cmd = f"powershell -Command \"New-Item -ItemType Directory -Force -Path '{mount_point_win}' | Out-Null; if (Test-Path '{mount_point_win}') {{ Write-Host 'EXISTS' }} else {{ Write-Host 'NOT_FOUND' }}\""
@@ -2234,7 +2245,7 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
         all_done = True
         newly_completed = []
         
-        with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), MAX_WORKERS)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
             check_futures = []
             for host in config.vm_hosts:
                 if host in completed_hosts:
@@ -2350,6 +2361,42 @@ def is_migration_in_flight(namespace: str, vm_name: str) -> bool:
         return False
 
 
+def migrate_vm_if_needed(config: FioTestConfig, vm_name: str, *, retry: bool = False) -> Tuple[str, str]:
+    """
+    Migrate a VM unless a migration is already in progress.
+
+    Returns:
+        (status, vm_name) where status is 'skipped', 'ok', or 'failed'.
+    """
+    suffix = " (retry)" if retry else ""
+    if is_migration_in_flight(config.namespace, vm_name):
+        logger.info(f"IN_FLIGHT: VM {vm_name} already has migration in progress - skipping{suffix}")
+        return 'skipped', vm_name
+
+    if retry:
+        logger.info(f"Retrying migration for VM: {vm_name}")
+    else:
+        logger.info(f"Migrating VM: {vm_name}")
+
+    try:
+        result = subprocess.run(
+            ["virtctl", "-n", config.namespace, "migrate", vm_name],
+            capture_output=True,
+            timeout=config.timeout_migration
+        )
+        if result.returncode == 0:
+            logger.info(f"OK: Successfully migrated VM: {vm_name}{suffix}")
+            return 'ok', vm_name
+
+        logger.error(f"FAILED: Failed to migrate VM: {vm_name}{suffix}")
+        if result.stderr:
+            logger.error(f"  Error: {result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr}")
+        return 'failed', vm_name
+    except Exception as e:
+        logger.error(f"FAILED: Failed to migrate VM: {vm_name}{suffix} - {e}")
+        return 'failed', vm_name
+
+
 def migrate_vms_during_test(config: FioTestConfig, pattern: str, executor: Optional[CommandExecutor] = None) -> bool:
     """
     Trigger VM live migrations during FIO test.
@@ -2391,69 +2438,30 @@ def migrate_vms_during_test(config: FioTestConfig, pattern: str, executor: Optio
         
         # First attempt: migrate all VMs
         for vm in vms_to_migrate:
-            logger.info(f"Migrating VM: {vm}")
-            try:
-                result = subprocess.run(
-                    ["virtctl", "-n", config.namespace, "migrate", vm],
-                    capture_output=True,
-                    timeout=config.timeout_migration
-                )
-                if result.returncode == 0:
-                    logger.info(f"OK: Successfully migrated VM: {vm}")
-                else:
-                    logger.error(f"FAILED: Failed to migrate VM: {vm}")
-                    if result.stderr:
-                        logger.error(f"  Error: {result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr}")
-                    failed_vms.append(vm)
-                
-                if vm != vms_to_migrate[-1]:
-                    time.sleep(config.migrate_interval)
-            except Exception as e:
-                logger.error(f"FAILED: Failed to migrate VM: {vm} - {e}")
+            status, _ = migrate_vm_if_needed(config, vm)
+            if status == 'failed':
                 failed_vms.append(vm)
-        
+
+            if vm != vms_to_migrate[-1]:
+                time.sleep(config.migrate_interval)
+
         # Retry failed migrations (skip VMs that already have an active migration)
         if failed_vms:
-            actually_failed = []
+            logger.info(f"Retrying {len(failed_vms)} failed VM migrations: {', '.join(failed_vms)}")
+            retry_failed = []
             for vm in failed_vms:
-                if is_migration_in_flight(config.namespace, vm):
-                    logger.info(f"IN_FLIGHT: VM {vm} already has migration in progress - skipping retry")
-                else:
-                    actually_failed.append(vm)
-            
-            if actually_failed:
-                logger.info(f"Retrying {len(actually_failed)} failed VM migrations: {', '.join(actually_failed)}")
-                retry_failed = []
-                for vm in actually_failed:
-                    logger.info(f"Retrying migration for VM: {vm}")
-                    try:
-                        result = subprocess.run(
-                            ["virtctl", "-n", config.namespace, "migrate", vm],
-                            capture_output=True,
-                            timeout=config.timeout_migration
-                        )
-                        if result.returncode == 0:
-                            logger.info(f"OK: Successfully migrated VM: {vm} (retry)")
-                        else:
-                            logger.error(f"FAILED: Failed to migrate VM: {vm} (retry)")
-                            if result.stderr:
-                                logger.error(f"  Error: {result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr}")
-                            retry_failed.append(vm)
-                        
-                        if vm != actually_failed[-1]:
-                            time.sleep(config.migrate_interval)
-                    except Exception as e:
-                        logger.error(f"FAILED: Failed to migrate VM: {vm} (retry) - {e}")
-                        retry_failed.append(vm)
-                
-                if retry_failed:
-                    logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
-                    return False
-                else:
-                    logger.info(f"All failed migrations succeeded on retry")
-            else:
-                logger.info(f"All 'failed' VMs already have migrations in progress - no retry needed")
-            
+                status, _ = migrate_vm_if_needed(config, vm, retry=True)
+                if status == 'failed':
+                    retry_failed.append(vm)
+
+                if vm != failed_vms[-1]:
+                    time.sleep(config.migrate_interval)
+
+            if retry_failed:
+                logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
+                return False
+
+            logger.info(f"All failed migrations succeeded on retry")
             logger.info(f"All VM migrations completed successfully for pattern '{pattern}' (after retry)")
             return True
         
@@ -2463,64 +2471,40 @@ def migrate_vms_during_test(config: FioTestConfig, pattern: str, executor: Optio
         logger.info(f"Starting VM migrations for pattern '{pattern}' ({len(vms_to_migrate)} VMs, parallel)...")
         
         def migrate_vm(vm_name):
-            """Migrate a single VM and return (success, vm_name)"""
-            logger.info(f"Migrating VM: {vm_name}")
-            try:
-                result = subprocess.run(
-                    ["virtctl", "-n", config.namespace, "migrate", vm_name],
-                    capture_output=True,
-                    timeout=config.timeout_migration
-                )
-                if result.returncode == 0:
-                    logger.info(f"OK: Successfully migrated VM: {vm_name}")
-                    return True, vm_name
-                else:
-                    logger.error(f"FAILED: Failed to migrate VM: {vm_name}")
-                    if result.stderr:
-                        logger.error(f"  Error: {result.stderr.decode() if isinstance(result.stderr, bytes) else result.stderr}")
-                    return False, vm_name
-            except Exception as e:
-                logger.error(f"FAILED: Failed to migrate VM: {vm_name} - {e}")
-                return False, vm_name
-        
+            """Migrate a single VM and return (success, vm_name)."""
+            status, vm_name = migrate_vm_if_needed(config, vm_name)
+            return status != 'failed', vm_name
+
         # First attempt: migrate all VMs in parallel (cap threads at 50)
-        with ThreadPoolExecutor(max_workers=min(len(vms_to_migrate), MAX_WORKERS)) as pool:
-            futures = [pool.submit(migrate_vm, vm) for vm in vms_to_migrate]
+        with ThreadPoolExecutor(max_workers=min(len(vms_to_migrate), config.max_workers)) as pool:
+            migrate_futures = [pool.submit(migrate_vm, vm) for vm in vms_to_migrate]
             failed_vms = []
-            for future in as_completed(futures):
+            for future in as_completed(migrate_futures):
                 success, vm_name = future.result()
                 if not success:
                     failed_vms.append(vm_name)
-        
+
         # Retry failed migrations (skip VMs that already have an active migration)
         if failed_vms:
-            actually_failed = []
-            for vm in failed_vms:
-                if is_migration_in_flight(config.namespace, vm):
-                    logger.info(f"IN_FLIGHT: VM {vm} already has migration in progress - skipping retry")
-                else:
-                    actually_failed.append(vm)
-            
-            if actually_failed:
-                logger.info(f"Retrying {len(actually_failed)} failed VM migrations in parallel: {', '.join(actually_failed)}")
-                with ThreadPoolExecutor(max_workers=min(len(actually_failed), MAX_WORKERS)) as pool:
-                    futures = [pool.submit(migrate_vm, vm) for vm in actually_failed]
-                    retry_failed = []
-                    for future in as_completed(futures):
-                        success, vm_name = future.result()
-                        if not success:
-                            retry_failed.append(vm_name)
-                        else:
-                            logger.info(f"OK: Successfully migrated VM: {vm_name} (retry)")
-                
-                if retry_failed:
-                    logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
-                    return False
-                else:
-                    logger.info(f"All failed migrations succeeded on retry")
-            else:
-                logger.info(f"All 'failed' VMs already have migrations in progress - no retry needed")
-            
+            logger.info(f"Retrying {len(failed_vms)} failed VM migrations in parallel: {', '.join(failed_vms)}")
+
+            def migrate_vm_retry(vm_name):
+                status, vm_name = migrate_vm_if_needed(config, vm_name, retry=True)
+                return status != 'failed', vm_name
+
+            with ThreadPoolExecutor(max_workers=min(len(failed_vms), config.max_workers)) as pool:
+                retry_futures = [pool.submit(migrate_vm_retry, vm) for vm in failed_vms]
+                retry_failed = []
+                for future in as_completed(retry_futures):
+                    success, vm_name = future.result()
+                    if not success:
+                        retry_failed.append(vm_name)
+
+            if retry_failed:
+                logger.error(f"{len(retry_failed)}/{len(vms_to_migrate)} VM migrations failed after retry: {', '.join(retry_failed)}")
+                return False
+
+            logger.info(f"All failed migrations succeeded on retry")
             logger.info(f"All VM migrations completed successfully for pattern '{pattern}' (after retry)")
             return True
         
@@ -2702,7 +2686,7 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
                 check_failures = 0
                 
                 # Check all hosts in parallel using ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), MAX_WORKERS)) as pool:
+                with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
                     check_futures = {}
                     for host in config.vm_hosts:
                         if executor.is_windows_host(host):
@@ -2732,7 +2716,7 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
                     logger.warning(f"{running_count} hosts still have FIO processes running")
                     # Check if result files exist - if they do, the test likely completed
                     result_files_exist = 0
-                    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), MAX_WORKERS)) as pool:
+                    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
                         file_futures = {}
                         for host in config.vm_hosts:
                             if executor.is_windows_host(host):
@@ -2857,12 +2841,12 @@ def collect_results(config: FioTestConfig, executor: CommandExecutor, results_di
         
         return False, output
     
-    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), MAX_WORKERS)) as pool:
-        futures = []
+    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
+        archive_futures = []
         for host in config.vm_hosts:
             future = pool.submit(create_archive_with_restart, host, executor, config)
-            futures.append((future, host))
-        for future, host in futures:
+            archive_futures.append((future, host))
+        for future, host in archive_futures:
             success, output = future.result()
             if success:
                 if output:
@@ -2872,8 +2856,8 @@ def collect_results(config: FioTestConfig, executor: CommandExecutor, results_di
     
     # Copy results from VMs
     logger.info("Copying results from all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), MAX_WORKERS)) as pool:
-        futures = []
+    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
+        copy_futures = []
         for host in config.vm_hosts:
             host_dir = os.path.join(results_dir, host)
             # Use correct user and output directory based on host type
@@ -2943,9 +2927,9 @@ def collect_results(config: FioTestConfig, executor: CommandExecutor, results_di
                 except Exception as e:
                     logger.warning(f"Error copying results from {host_name}: {e}")
             
-            futures.append(pool.submit(copy_results, host, source, destination, host_dir))
-        
-        for future in as_completed(futures):
+            copy_futures.append(pool.submit(copy_results, host, source, destination, host_dir))
+
+        for future in as_completed(copy_futures):
             future.result()
     
     logger.info(f"All results collected in: {results_dir}")
@@ -3037,7 +3021,7 @@ def cleanup_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # Unmount mount points (Linux only - Windows doesn't need unmounting)
     if linux_hosts:
         logger.info("Step 1/3: Cleaning up storage mount points on Linux hosts...")
-        with ThreadPoolExecutor(max_workers=len(linux_hosts)) as pool:
+        with ThreadPoolExecutor(max_workers=min(len(linux_hosts), config.max_workers)) as pool:
             futures = []
             for host in linux_hosts:
                 cmd = f"mountpoint -q {config.mount_point} && (umount {config.mount_point} && echo 'Successfully unmounted {config.mount_point}') || echo 'Mount point {config.mount_point} is not mounted'"
@@ -3048,7 +3032,7 @@ def cleanup_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     
     # Clean up test results (both Linux and Windows)
     logger.info("Step 2/3: Cleaning up test results on all hosts...")
-    with ThreadPoolExecutor(max_workers=len(config.vm_hosts)) as pool:
+    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
         futures = []
         for host in linux_hosts:
             cmd = f"rm -rf {config.output_dir}/*.json 2>/dev/null || true && echo 'Test results cleanup completed'"

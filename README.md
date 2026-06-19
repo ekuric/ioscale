@@ -1,6 +1,6 @@
 ## Getting started
 
-In this repository we summarize the tools and processes used to run performance and scale tests. It can be used as a
+In this repository we summarize the tools and processes used to run performance and scale tests. It can be used as a 
 starting point for further investigation and testing. Scripts in this repository can be used to run the tests below on any storage, not only ioscale.
 
 
@@ -23,7 +23,10 @@ Please check these directories for specific information.
 # Database Testing Setup
 
 For database testing, the [HammerDB](https://www.hammerdb.com) tool is used. Small adaptations were necessary for the virtual machine test case.
-It is assumed we already have a test virtual machine up and running with SSH `root` access. An example virtual machine template `vmdbtest.yml` for database testing can be found in the [template](https://github.com/ekuric/ioscale/blob/main/templates/vmdbtest.yml) directory. Once the virtual machine is up and running, it is possible to test MariaDB /  PostgreSQL / MSSQL with HammerDB workloads. More details in [db](https://github.com/ekuric/ioscale/tree/main/db) section and regarding specific test [db-README](https://github.com/ekuric/ioscale/blob/main/db/db-README.md) is first thing to read. We recommend to read it before starting testing. 
+It is assumed we already have a test virtual machine up and running with SSH `root` access.
+
+
+An example virtual machine template `vmdbtest.yml` for database testing can be found in the [template](https://github.com/ekuric/ioscale/blob/main/templates/vmdbtest.yml) directory. Once the virtual machine is up and running, it is possible to test MariaDB /  PostgreSQL / MSSQL with HammerDB workloads. More details in [db](https://github.com/ekuric/ioscale/tree/main/db) section and regarding specific test [db-README](https://github.com/ekuric/ioscale/blob/main/db/db-README.md) is first thing to read. We recommend to read it before starting testing. 
 
 # I/O Generic Testing Setup
 
