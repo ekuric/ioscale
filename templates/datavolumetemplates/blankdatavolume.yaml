@@ -2,7 +2,7 @@ apiVersion: cdi.kubevirt.io/v1beta1
 kind: DataVolume
 metadata:
   name: blankdv
-  namespace: ekuric
+  namespace: default
 spec:
   source:
     blank: {}
