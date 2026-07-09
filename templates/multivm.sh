@@ -365,7 +365,7 @@ spec:
       annotations:
         vm.kubevirt.io/flavor: large
         vm.kubevirt.io/os: fedora
-        vm.kubefirt.io/workload: server
+        vm.kubevirt.io/workload: server
       labels:
         flavor.template.kubevirt.io/large: 'true'
         kubevirt.io/domain: $PREFIX-vmroot
