@@ -27,7 +27,9 @@ else
     WAREHOUSE_COUNT="${WAREHOUSE_COUNT:-50}"
     TEST_DURATION="${TEST_DURATION:-15}"
     USER_COUNT="${USER_COUNT:-1}"
-    HAMMERDB_REPO="${HAMMERDB_REPO:-https://github.com/ekuric/fusion-access.git}"
+    HAMMERDB_SOURCE="${HAMMERDB_SOURCE:-bundled}"
+    HAMMERDB_BUNDLED_PATH="${HAMMERDB_BUNDLED_PATH:-/work/hammerdb-bundled}"
+    HAMMERDB_REPO="${HAMMERDB_REPO:-https://github.com/ekuric/ioscale.git}"
     HAMMERDB_PATH="${HAMMERDB_PATH:-/root/hammerdb-tpcc-wrapper-scripts}"
     HAMMERDB_INSTALL_DIR="${HAMMERDB_INSTALL_DIR:-/usr/local/HammerDB}"
     MIGRATE_USER_COUNTS="${MIGRATE_USER_COUNTS:-}"
@@ -72,6 +74,11 @@ else
         MIGRATE_LINE="  user_counts: \"${MIGRATE_USER_COUNTS}\""
     fi
 
+    HAMMERDB_REPO_LINE=""
+    if [[ "${HAMMERDB_SOURCE}" == "remote_git" ]]; then
+        HAMMERDB_REPO_LINE="  repo: \"${HAMMERDB_REPO}\""
+    fi
+
     cat > "${CONFIG}" <<EOF
 description: "${DESCRIPTION}"
 
@@ -90,9 +97,11 @@ test:
   user_count: "${USER_COUNT}"
 
 hammerdb:
-  repo: "${HAMMERDB_REPO}"
+  source: "${HAMMERDB_SOURCE}"
+  bundled_path: "${HAMMERDB_BUNDLED_PATH}"
   path: "${HAMMERDB_PATH}"
   install_dir: "${HAMMERDB_INSTALL_DIR}"
+${HAMMERDB_REPO_LINE}
 
 retry:
   interval: ${RETRY_INTERVAL}

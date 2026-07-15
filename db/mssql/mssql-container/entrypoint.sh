@@ -29,10 +29,13 @@ else
     TEST_DURATION="${TEST_DURATION:-15}"
     USER_COUNT="${USER_COUNT:-1}"
     MSSQL_PASS="${MSSQL_PASS:-mssqlpasswd1!}"
+    MAX_SERVER_MEMORY_MB="${MAX_SERVER_MEMORY_MB:-}"
     REBUILDDB="${REBUILDDB:-true}"
     REBUILD_ONLY="${REBUILD_ONLY:-false}"
     TEST_ONLY="${TEST_ONLY:-false}"
-    HAMMERDB_REPO="${HAMMERDB_REPO:-https://github.com/ekuric/fusion-access.git}"
+    HAMMERDB_SOURCE="${HAMMERDB_SOURCE:-bundled}"
+    HAMMERDB_BUNDLED_PATH="${HAMMERDB_BUNDLED_PATH:-/work/hammerdb-bundled}"
+    HAMMERDB_REPO="${HAMMERDB_REPO:-https://github.com/ekuric/ioscale.git}"
     HAMMERDB_PATH="${HAMMERDB_PATH:-/root/hammerdb-tpcc-wrapper-scripts}"
     MIGRATE_USER_COUNTS="${MIGRATE_USER_COUNTS:-}"
     MIGRATE_INTERVAL="${MIGRATE_INTERVAL:-0}"
@@ -70,10 +73,21 @@ else
         RAMPUP_LINE=$'\n'"  rampup_time: ${RAMPUP_TIME}"
     fi
 
+    # Max server memory (optional)
+    MAX_SERVER_MEMORY_LINE=""
+    if [[ -n "${MAX_SERVER_MEMORY_MB}" ]]; then
+        MAX_SERVER_MEMORY_LINE=$'\n'"  max_server_memory_mb: ${MAX_SERVER_MEMORY_MB}"
+    fi
+
     # Migration
     MIGRATE_LINE="  user_counts: null"
     if [[ -n "${MIGRATE_USER_COUNTS}" ]]; then
         MIGRATE_LINE="  user_counts: \"${MIGRATE_USER_COUNTS}\""
+    fi
+
+    HAMMERDB_REPO_LINE=""
+    if [[ "${HAMMERDB_SOURCE}" == "remote_git" ]]; then
+        HAMMERDB_REPO_LINE="  repo: \"${HAMMERDB_REPO}\""
     fi
 
     cat > "${CONFIG}" <<EOF
@@ -90,7 +104,7 @@ ${HOST_BLOCK}
   warehouse_count: ${WAREHOUSE_COUNT}
   build_users: ${BUILD_USERS}
   test_duration: ${TEST_DURATION}${RAMPUP_LINE}
-  mssql_pass: "${MSSQL_PASS}"
+  mssql_pass: "${MSSQL_PASS}"${MAX_SERVER_MEMORY_LINE}
   rebuilddb: ${REBUILDDB}
   rebuild_only: ${REBUILD_ONLY}
   test_only: ${TEST_ONLY}
@@ -99,8 +113,10 @@ test:
   user_count: "${USER_COUNT}"
 
 hammerdb:
-  repo: "${HAMMERDB_REPO}"
+  source: "${HAMMERDB_SOURCE}"
+  bundled_path: "${HAMMERDB_BUNDLED_PATH}"
   path: "${HAMMERDB_PATH}"
+${HAMMERDB_REPO_LINE}
 
 retry:
   interval: ${RETRY_INTERVAL}

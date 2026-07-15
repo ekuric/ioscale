@@ -9,13 +9,22 @@ environment variables.
 
 ```bash
 cd containers-bench/mssql-container
-podman build -t quay.io/ekuric/mssqldb-benchmark:latest .
+podman build -t quay.io/ekuric/mssqllin-benchmark:latest .
 ```
 
-Override the virtctl version at build time:
+HammerDB MSSQL wrapper scripts from [ioscale](https://github.com/ekuric/ioscale) are
+baked into the image at `/work/hammerdb-bundled` at build time. Pin a specific version:
 
 ```bash
-podman build --build-arg VIRTCTL_VERSION=v1.8.0 -t quay.io/ekuric/mssqldb-benchmark:latest .
+podman build \
+  --build-arg IOSCALE_REF=main \
+  -t quay.io/ekuric/mssqllin-benchmark:latest .
+```
+
+Override the virtctl version at build time (base image):
+
+```bash
+podman build --build-arg VIRTCTL_VERSION=v1.8.0 -t quay.io/ekuric/mssqllin-benchmark:latest .
 ```
 
 ## Two Usage Modes
@@ -25,25 +34,25 @@ podman build --build-arg VIRTCTL_VERSION=v1.8.0 -t quay.io/ekuric/mssqldb-benchm
 Mount your `mssql-config.yaml`. Everything comes from the file.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./mssql-config.yaml:/work/mssql-config.yaml \
   -v /root/mssqldb-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest
+  quay.io/ekuric/mssqllin-benchmark:latest
 ```
 
 Or point to the baked-in example config:
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e CONFIG=/work/examples/mssql-config.yaml \
   -v /root/mssqldb-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest
+  quay.io/ekuric/mssqllin-benchmark:latest
 ```
 
 ### Mode 2: Env vars only (CI/CD)
@@ -52,7 +61,7 @@ No config file needed. The entrypoint generates it from env vars.
 At minimum, one host selection variable is required.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="mssql-{1..10}" \
   -e NAMESPACE="default" \
   -e DESCRIPTION="mssql perf test" \
@@ -63,13 +72,12 @@ podman run --rm \
   -e USER_COUNT="1 10 20 50" \
   -e MSSQL_PASS="mssqlpasswd1!" \
   -e REBUILDDB=true \
-  -e HAMMERDB_REPO="https://github.com/ekuric/fusion-access.git" \
   -e HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts" \
   -v /root/mssqldb-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest
+  quay.io/ekuric/mssqllin-benchmark:latest
 ```
 
 **How it works:** If a config file exists at the `CONFIG` path, it is used
@@ -103,8 +111,10 @@ Env vars are used when no config file is mounted (Mode 2).
 | `REBUILDDB` | `true` | Build database before tests (true/false) |
 | `REBUILD_ONLY` | `false` | Only rebuild database, skip tests (true/false) |
 | `TEST_ONLY` | `false` | Only run tests on existing database (true/false) |
-| `HAMMERDB_REPO` | `https://github.com/ekuric/fusion-access.git` | Git repo with HammerDB wrapper scripts |
-| `HAMMERDB_PATH` | `/root/hammerdb-tpcc-wrapper-scripts` | Clone path on remote hosts |
+| `HAMMERDB_SOURCE` | `bundled` | Script source: `bundled` (from image) or `remote_git` (clone on each VM) |
+| `HAMMERDB_BUNDLED_PATH` | `/work/hammerdb-bundled` | Path to bundled scripts inside the container |
+| `HAMMERDB_PATH` | `/root/hammerdb-tpcc-wrapper-scripts` | Deploy path on remote hosts |
+| `HAMMERDB_REPO` | `https://github.com/ekuric/ioscale.git` | Only used when `HAMMERDB_SOURCE=remote_git` |
 | `MIGRATE_USER_COUNTS` | -- | User counts that trigger VM migration (e.g. `"4 8"`) |
 | `MIGRATE_INTERVAL` | `0` | Seconds between migrations (0 = parallel) |
 | `RETRY_INTERVAL` | `30` | Retry interval in seconds |
@@ -123,11 +133,11 @@ after the image name are forwarded to `mssqldb.py`.
 Validate configuration and show what would be done without executing.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./mssql-config.yaml:/work/mssql-config.yaml \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest \
+  quay.io/ekuric/mssqllin-benchmark:latest \
   --dry-run
 ```
 
@@ -140,12 +150,12 @@ Enable verbose/debug output.
 Only install packages, clone repo, and set up MSSQL Server. Skip testing.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="mssql-{1..10}" \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest \
+  quay.io/ekuric/mssqllin-benchmark:latest \
   --prepare-hosts
 ```
 
@@ -154,13 +164,13 @@ podman run --rm \
 Only copy results from hosts (skip everything else).
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./mssql-config.yaml:/work/mssql-config.yaml \
   -v /root/mssqldb-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest \
+  quay.io/ekuric/mssqllin-benchmark:latest \
   --copy-results
 ```
 
@@ -173,19 +183,19 @@ Force plain SSH (overrides the default `--virtctl-only`).
 ### Config file only
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./mssql-config.yaml:/work/mssql-config.yaml \
   -v /root/mssqldb-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest
+  quay.io/ekuric/mssqllin-benchmark:latest
 ```
 
 ### Env vars only (all parameters)
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="mssql-{1..10}" \
   -e NAMESPACE="default" \
   -e DESCRIPTION="mssql linux perf test" \
@@ -210,32 +220,32 @@ podman run --rm \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest
+  quay.io/ekuric/mssqllin-benchmark:latest
 ```
 
 ### Dry run with verbose output
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="mssql-{1..5}" \
   -e DISK_LIST="/dev/vdc" \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest \
+  quay.io/ekuric/mssqllin-benchmark:latest \
   --dry-run --verbose
 ```
 
 ### With oc login
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e KUBEADMIN_PASSWORD="my-password" \
   -e API_URL="https://api.mycluster.example.com:6443" \
   -v ./mssql-config.yaml:/work/mssql-config.yaml \
   -v /root/mssqldb-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   --privileged \
-  quay.io/ekuric/mssqldb-benchmark:latest
+  quay.io/ekuric/mssqllin-benchmark:latest
 ```
 
 ## VM Live Migration During Tests
@@ -294,7 +304,7 @@ Windows VMs** with PowerShell scripts and Windows-specific template files.
 | Target OS | Linux | Windows |
 | SSH user | root | Administrator |
 | DB install | Script installs MSSQL on Linux | Pre-installed on Windows |
-| Templates | From git clone on remote hosts | Baked into container |
+| Templates | Baked into container, deployed to VMs | Baked into container |
 | HammerDB | Installed on remote hosts | Pre-installed on Windows |
 
 ## SSH Key
@@ -318,6 +328,7 @@ Or mount the entire `.ssh` directory:
 /work/
   mssqldb.py
   entrypoint.sh
+  hammerdb-bundled/         (ioscale templates/mssql, baked at image build)
   mssql-config.yaml         (mounted by user, or generated from env vars)
   examples/
     mssql-config.yaml       (baked-in reference config)

@@ -9,7 +9,7 @@ pipeline {
         string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP. Each user/team sets their own bastion here.')
         string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host (e.g. root, admin)')
         string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for this bastion SSH key. Each bastion needs its own key registered in Jenkins (Manage Credentials > Add > SSH Username with private key). Use a unique ID per bastion, e.g. team-a-bastion, lab2-bastion.')
-        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/mssqldb-benchmark:latest', description: 'Container image to run')
+        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/mssqllin-benchmark:latest', description: 'Container image to run')
 
         string(name: 'HOST_PATTERN',      defaultValue: 'mssql-{1..10}',      description: 'Linux VM host pattern')
         string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
@@ -21,13 +21,15 @@ pipeline {
         string(name: 'TEST_DURATION',     defaultValue: '15',                  description: 'Test duration in minutes')
         string(name: 'USER_COUNT',        defaultValue: '1 10 20 50',          description: 'Space-separated user counts to test')
         string(name: 'MSSQL_PASS',        defaultValue: 'mssqlpasswd1!',      description: 'SA password for sqlcmd/ODBC')
+        string(name: 'MAX_SERVER_MEMORY_MB', defaultValue: '',               description: 'SQL Server max server memory cap in MB (e.g. 38000 on ~50GB VM leaves headroom for HammerDB; empty = unlimited)')
 
         string(name: 'REBUILDDB',         defaultValue: 'true',                description: 'Build database before tests (true/false)')
         string(name: 'REBUILD_ONLY',      defaultValue: 'false',               description: 'Only rebuild database, skip tests (true/false)')
         string(name: 'TEST_ONLY',         defaultValue: 'false',               description: 'Only run tests on existing database (true/false)')
 
-        string(name: 'HAMMERDB_REPO',     defaultValue: 'https://github.com/ekuric/fusion-access.git', description: 'Git repo with HammerDB wrapper scripts')
-        string(name: 'HAMMERDB_PATH',     defaultValue: '/root/hammerdb-tpcc-wrapper-scripts',          description: 'Clone path on remote hosts')
+        string(name: 'HAMMERDB_PATH',     defaultValue: '/root/hammerdb-tpcc-wrapper-scripts', description: 'Deploy path for HammerDB scripts on remote hosts')
+        string(name: 'HAMMERDB_SOURCE',   defaultValue: 'bundled',           description: 'Script source: bundled (default) or remote_git')
+        string(name: 'HAMMERDB_REPO',     defaultValue: 'https://github.com/ekuric/ioscale.git', description: 'Only used when HAMMERDB_SOURCE=remote_git')
 
         string(name: 'RAMPUP_TIME',        defaultValue: '',                    description: 'Ramp-up time in minutes (empty = default 2 min)')
         string(name: 'MIGRATE_USER_COUNTS', defaultValue: '',                  description: 'User counts triggering VM migration (space-separated, empty = no migration)')
@@ -59,7 +61,7 @@ pipeline {
                 sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
-                            podman run --rm --pids-limit=-1 \
+                            podman run --rm --init --pids-limit=-1 \
                               -e HOST_PATTERN="${params.HOST_PATTERN}" \
                               -e NAMESPACE="${params.NAMESPACE}" \
                               -e DISK_LIST="${params.DISK_LIST}" \
@@ -69,11 +71,13 @@ pipeline {
                               -e TEST_DURATION=${params.TEST_DURATION} \
                               -e USER_COUNT="${params.USER_COUNT}" \
                               -e MSSQL_PASS="${params.MSSQL_PASS}" \
+                              -e MAX_SERVER_MEMORY_MB="${params.MAX_SERVER_MEMORY_MB}" \
                               -e REBUILDDB=${params.REBUILDDB} \
                               -e REBUILD_ONLY=${params.REBUILD_ONLY} \
                               -e TEST_ONLY=${params.TEST_ONLY} \
-                              -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
+                              -e HAMMERDB_SOURCE="${params.HAMMERDB_SOURCE}" \
                               -e HAMMERDB_PATH="${params.HAMMERDB_PATH}" \
+                              -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
                               -e RAMPUP_TIME="${params.RAMPUP_TIME}" \
                               -e MIGRATE_USER_COUNTS="${params.MIGRATE_USER_COUNTS}" \
                               -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \

@@ -11,6 +11,7 @@ import glob
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,8 @@ class PostgreSQLTestConfig:
         self.disk_list = None
         self.warehouse_count = None
         self.user_count = []
+        self.hammerdb_source = "bundled"
+        self.hammerdb_bundled_path = "/work/hammerdb-bundled"
         self.hammerdb_repo = None
         self.hammerdb_path = None
         self.hammerdb_dir = "/usr/local/HammerDB"
@@ -81,6 +84,17 @@ class PostgreSQLTestConfig:
         self.build_check_max_retries = 1  # Avoid retry storms during build polling
         self.monitor_vm = False
         self.monitor_vm_interval = 10
+
+    def max_pool_workers(self, task_count: int) -> int:
+        """Cap thread-pool parallelism by fleet size: <100→50, 100–500→100, >500→200."""
+        fleet_size = len(self.db_hosts)
+        if fleet_size > 500:
+            cap = 200
+        elif fleet_size >= 100:
+            cap = 100
+        else:
+            cap = 50
+        return min(task_count, cap)
 
 
 class VMMigrationMonitor:
@@ -210,6 +224,48 @@ def get_vm_number(hostname: str) -> str:
     return "1"
 
 
+def _extract_postgresql_tpm(text: str) -> Optional[int]:
+    """Extract PostgreSQL TPM from HammerDB TEST RESULT line (both output formats)."""
+    match = re.search(r'System achieved (\d+) PostgreSQL TPM at \d+ NOPM', text)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'System achieved \d+ NOPM from (\d+) PostgreSQL TPM', text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _find_postgresql_templates_dir(bundled_path: str) -> str:
+    """Locate templates/postgresql inside a bundled HammerDB scripts tree."""
+    candidates = [
+        os.path.join(bundled_path, "templates", "postgresql"),
+        os.path.join(bundled_path, "db", "templates", "postgresql"),
+        os.path.join(bundled_path, "scripts", "templates", "postgresql"),
+        os.path.join(bundled_path, "scripts", "postgresql"),
+    ]
+    for candidate in candidates:
+        install_script = os.path.join(candidate, "Hammerdb-postgres-install-script")
+        if os.path.isfile(install_script):
+            return candidate
+    raise FileNotFoundError(
+        f"PostgreSQL templates not found under {bundled_path}. Checked: {', '.join(candidates)}"
+    )
+
+
+def _create_postgresql_templates_archive(bundled_path: str) -> str:
+    """Create a tar.gz archive with templates/postgresql/ layout for remote extraction."""
+    templates_dir = _find_postgresql_templates_dir(bundled_path)
+    tmp = tempfile.NamedTemporaryFile(prefix="postgresql-templates-", suffix=".tar.gz", delete=False)
+    tmp.close()
+    with tarfile.open(tmp.name, "w:gz") as tar:
+        for entry in os.listdir(templates_dir):
+            tar.add(
+                os.path.join(templates_dir, entry),
+                arcname=os.path.join("templates", "postgresql", entry),
+            )
+    return tmp.name
+
+
 class CommandExecutor:
     """Handles command execution via virtctl or SSH"""
     
@@ -294,7 +350,25 @@ class CommandExecutor:
                 "-o", "UserKnownHostsFile=/dev/null",
                 ssh_source, destination
             ]
-    
+
+    def get_scp_to_host_command(self, host: str, local_source: str, remote_dest: str) -> List[str]:
+        """Get SCP command for copying a local file to a remote host."""
+        if self.is_vm_host(host):
+            if not self.config.namespace or self.config.namespace == "N/A":
+                raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
+            remote = f"root@vmi/{host}:{remote_dest}"
+            return [
+                "virtctl", "-n", self.config.namespace, "scp",
+                "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
+                local_source, remote
+            ]
+        return [
+            "scp", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            local_source, f"root@{host}:{remote_dest}"
+        ]
+
     def execute_command(self, host: str, command: str, description: str = "command",
                        timeout: Optional[int] = None,
                        max_retries: Optional[int] = None,
@@ -471,11 +545,23 @@ class ConfigLoader:
         
         # Load HammerDB configuration
         hammerdb = yaml_data.get('hammerdb', {})
+        hammerdb_source = hammerdb.get('source', 'bundled')
+        if hammerdb_source == "null" or not hammerdb_source:
+            hammerdb_source = 'bundled'
+        self.config.hammerdb_source = str(hammerdb_source).lower()
+        self.config.hammerdb_bundled_path = hammerdb.get('bundled_path', '/work/hammerdb-bundled')
+        if self.config.hammerdb_bundled_path == "null" or not self.config.hammerdb_bundled_path:
+            self.config.hammerdb_bundled_path = "/work/hammerdb-bundled"
         self.config.hammerdb_repo = hammerdb.get('repo')
-        self.config.hammerdb_path = hammerdb.get('path')
+        self.config.hammerdb_path = hammerdb.get('path', '/root/hammerdb-tpcc-wrapper-scripts')
+        if self.config.hammerdb_path == "null" or not self.config.hammerdb_path:
+            self.config.hammerdb_path = '/root/hammerdb-tpcc-wrapper-scripts'
         self.config.hammerdb_dir = hammerdb.get('install_dir', '/usr/local/HammerDB')
         if self.config.hammerdb_dir == "null" or not self.config.hammerdb_dir:
             self.config.hammerdb_dir = "/usr/local/HammerDB"
+        if self.config.hammerdb_source == 'remote_git' and not self.config.hammerdb_repo:
+            logger.error("hammerdb.repo is required when hammerdb.source is remote_git")
+            sys.exit(1)
         
         # Load retry configuration
         retry = yaml_data.get('retry', {})
@@ -673,6 +759,14 @@ def validate_inputs(config: PostgreSQLTestConfig) -> None:
     if config.mount_point == "none" and config.disk_list == "none":
         logger.error("Either storage.disk_list or storage.mount_point must be specified in config")
         sys.exit(1)
+
+    if not config.dry_run and config.hammerdb_source == 'bundled':
+        try:
+            _find_postgresql_templates_dir(config.hammerdb_bundled_path)
+        except FileNotFoundError as exc:
+            logger.error(str(exc))
+            logger.error("Rebuild the container image or set hammerdb.source to remote_git")
+            sys.exit(1)
     
     # Validate hosts are reachable (skip in dry-run mode and SSH-only mode)
     if not config.dry_run and config.use_virtctl is not False:
@@ -715,11 +809,17 @@ def display_config(config: PostgreSQLTestConfig) -> None:
     if config.mount_point != "none":
         logger.info(f"Mount point: {config.mount_point}")
     logger.info(f"Persistent mount: {'ENABLED (will create /etc/fstab entries)' if config.persistent_mount else 'DISABLED (temporary mounts only)'}")
-    logger.info(f"HammerDB repo: {config.hammerdb_repo}")
+    logger.info(f"HammerDB source: {config.hammerdb_source}")
+    if config.hammerdb_source == 'bundled':
+        logger.info(f"HammerDB bundled path: {config.hammerdb_bundled_path}")
+    elif config.hammerdb_repo:
+        logger.info(f"HammerDB repo: {config.hammerdb_repo}")
     logger.info(f"HammerDB path: {config.hammerdb_path}")
     logger.info(f"HammerDB install dir: {config.hammerdb_dir}")
     logger.info(f"Log level: {config.log_level}")
     logger.info(f"Retry interval: {config.retry_interval}s")
+    logger.info(f"Thread pool cap: {config.max_pool_workers(len(config.db_hosts))} "
+                f"(fleet size {len(config.db_hosts)})")
     logger.info(f"Max retries: {config.max_retries}")
     logger.info(f"Skip connectivity test: {'ENABLED' if config.skip_connectivity_test else 'DISABLED'}")
     logger.info(f"Task monitor interval: {config.task_monitor_interval}s")
@@ -739,15 +839,16 @@ def display_config(config: PostgreSQLTestConfig) -> None:
 def ensure_packages_installed(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
     """Ensure required packages are installed on all hosts"""
     logger.info("Checking if required packages are installed on all hosts...")
+    git_pkg = "" if config.hammerdb_source == 'bundled' else "git "
+    pg_pkgs = "postgresql postgresql-contrib postgresql-server glibc-langpack-en libpq"
     
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
-            # Check and install basic packages and PostgreSQL packages
             cmd = (
                 "bash -c '"
                 "packages_installed=true; "
-                "for pkg in git curl vim wget postgresql postgresql-contrib postgresql-server glibc-langpack-en libpq; do "
+                f"for pkg in {git_pkg}curl vim wget {pg_pkgs}; do "
                 "  if ! rpm -q $pkg &>/dev/null; then "
                 "    packages_installed=false; "
                 "    break; "
@@ -757,7 +858,7 @@ def ensure_packages_installed(config: PostgreSQLTestConfig, executor: CommandExe
                 "  echo \"All required packages are already installed\"; "
                 "else "
                 "  echo \"Installing required packages...\"; "
-                "  dnf -y --nobest install curl vim wget git postgresql.x86_64 postgresql-contrib.x86_64 postgresql-server.x86_64 glibc-langpack-en libpq; "
+                f"  dnf -y --nobest install {git_pkg}curl vim wget postgresql.x86_64 postgresql-contrib.x86_64 postgresql-server.x86_64 glibc-langpack-en libpq; "
                 "  echo \"Package installation completed\"; "
                 "fi"
                 "'"
@@ -798,101 +899,27 @@ def install_dependencies(config: PostgreSQLTestConfig, executor: CommandExecutor
     ensure_packages_installed(config, executor)
 
 
-def deploy_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
-    """Deploy HammerDB scripts to VMs"""
-    logger.info("Deploying HammerDB scripts to VMs...")
-    
-    # Step 1: Prepare directories
-    logger.info("Step 1/3: Preparing scripts directory on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
-        futures = []
-        for host in config.db_hosts:
-            cmd = f"rm -rf '{config.hammerdb_path}' && mkdir -p '{config.hammerdb_path}'"
-            future = pool.submit(executor.execute_command, host, cmd, "Preparing scripts directory")
-            futures.append(future)
-        for future in as_completed(futures):
-            future.result()
-    
-    # Step 2: Clone repositories
-    logger.info("Step 2/3: Cloning HammerDB scripts on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
-        futures = []
-        for host in config.db_hosts:
-            # Improved git clone with better error handling and diagnostics
-            # Use bash -c with proper quoting to ensure consistent execution for both SSH and virtctl
-            # This ensures the same shell behavior regardless of connection method
-            hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
-            hammerdb_repo_escaped = config.hammerdb_repo.replace("'", "'\"'\"'")
-            hammerdb_path_display = config.hammerdb_path.replace("'", "'\"'\"'")
-            cmd = (
-                f"bash -c '"
-                f"cd \"{hammerdb_path_escaped}\" && "
-                f"export GIT_SSL_NO_VERIFY=true && "
-                f"echo \"Starting git clone...\" && "
-                f"git clone --recursive \"{hammerdb_repo_escaped}\" . 2>&1 && "
-                f"if [ $? -eq 0 ]; then "
-                f"  echo \"Git clone completed successfully\"; "
-                f"  echo \"Initializing submodules if any...\"; "
-                f"  git submodule update --init --recursive 2>&1 || echo \"No submodules found or already initialized\"; "
-                f"  if [ -d \"templates/postgresql\" ]; then "
-                f"    echo \"Clone successful - templates/postgresql directory exists\"; "
-                f"  else "
-                f"    echo \"ERROR: Clone completed but templates/postgresql directory not found\"; "
-                f"    echo \"Current branch: $(git branch --show-current 2>&1 || echo 'unknown')\"; "
-                f"    echo \"Repository structure (top level):\"; "
-                f"    ls -la . 2>&1; "
-                f"    echo \"Checking scripts directory:\"; "
-                f"    ls -la scripts/ 2>&1 | head -20 || echo \"scripts directory does not exist\"; "
-                f"    echo \"Checking for any postgresql-related directories:\"; "
-                f"    find . -type d -iname '*postgresql*' 2>&1 | head -10; "
-                f"    echo \"Checking for templates directories:\"; "
-                f"    find . -type d -iname 'templates' 2>&1 | head -10; "
-                f"    exit 1; "
-                f"  fi; "
-                f"else "
-                f"  echo \"ERROR: Git clone failed with exit code $?\"; "
-                f"  exit 1; "
-                f"fi"
-                f"'"
-            )
-            future = pool.submit(executor.execute_command, host, cmd, "Cloning HammerDB scripts", timeout=600)
-            futures.append(future)
-        for future in as_completed(futures):
-            success, output = future.result()
-            if not success:
-                logger.error(f"Failed to clone repository on host")
-                logger.error(f"Error output: {output}")
-                logger.error(f"Please check:")
-                logger.error(f"  1. Repository URL is correct: {config.hammerdb_repo}")
-                logger.error(f"  2. Host has internet access")
-                logger.error(f"  3. Git is installed on the host")
-                sys.exit(1)
-    
-    # Step 3: Set permissions
-    logger.info("Step 3/3: Setting execute permissions on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+def _set_postgresql_script_permissions(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+    """Set execute permissions on the PostgreSQL install script on all hosts."""
+    logger.info("Setting execute permissions on all hosts...")
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             script_path = f"{config.hammerdb_path}/templates/postgresql/Hammerdb-postgres-install-script"
-            # Check if file exists before chmod, and verify git clone was successful
-            # Use bash -c for consistent execution across SSH and virtctl
             script_path_escaped = script_path.replace("'", "'\"'\"'")
             hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
-            hammerdb_path_display = config.hammerdb_path.replace("'", "'\"'\"'")
             cmd = (
                 f"bash -c '"
-                f"if [ -f \"{hammerdb_path_escaped}/templates/postgresql/Hammerdb-postgres-install-script\" ]; then "
-                f"chmod +x \"{hammerdb_path_escaped}/templates/postgresql/Hammerdb-postgres-install-script\" && echo \"Permissions set successfully\"; "
+                f"if [ -f \"{script_path_escaped}\" ]; then "
+                f"chmod +x \"{script_path_escaped}\" && echo \"Permissions set successfully\"; "
                 f"else "
-                f"echo \"ERROR: Script file not found at {hammerdb_path_display}/templates/postgresql/Hammerdb-postgres-install-script\"; "
-                f"echo \"Checking if git clone was successful...\"; "
+                f"echo \"ERROR: Script file not found at {script_path_escaped}\"; "
                 f"ls -la \"{hammerdb_path_escaped}/templates/postgresql/\" 2>&1 || echo \"Directory does not exist\"; "
                 f"exit 1; "
                 f"fi"
                 f"'"
             )
-            future = pool.submit(executor.execute_command, host, cmd, "Setting script permissions")
-            futures.append(future)
+            futures.append(pool.submit(executor.execute_command, host, cmd, "Setting script permissions"))
         for future in as_completed(futures):
             success, output = future.result()
             if not success:
@@ -900,11 +927,137 @@ def deploy_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
                 sys.exit(1)
 
 
+def _deploy_bundled_scripts_to_host(
+    config: PostgreSQLTestConfig,
+    executor: CommandExecutor,
+    host: str,
+    archive_path: str,
+) -> Tuple[bool, str]:
+    """Copy bundled PostgreSQL templates archive to a single host and extract it."""
+    remote_archive = "/tmp/postgresql-templates.tar.gz"
+    hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
+    remote_archive_escaped = remote_archive.replace("'", "'\"'\"'")
+
+    try:
+        scp_cmd = executor.get_scp_to_host_command(host, archive_path, remote_archive)
+        result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            logger.warning(f"{host}: SCP failed, trying base64 fallback...")
+            with open(archive_path, "rb") as archive_file:
+                encoded = base64.b64encode(archive_file.read()).decode("ascii")
+            upload_cmd = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(remote_archive)}"
+            success, output = executor.execute_command(
+                host, upload_cmd, f"Uploading bundled templates to {host}", timeout=300
+            )
+            if not success:
+                return False, output or "base64 upload failed"
+        install_script_escaped = (
+            f"{config.hammerdb_path}/templates/postgresql/Hammerdb-postgres-install-script"
+        ).replace("'", "'\"'\"'")
+        extract_cmd = (
+            f"bash -c '"
+            f"rm -rf {hammerdb_path_escaped} && "
+            f"mkdir -p {hammerdb_path_escaped} && "
+            f"tar xzf {remote_archive_escaped} -C {hammerdb_path_escaped} && "
+            f"rm -f {remote_archive_escaped} && "
+            f"test -f \"{install_script_escaped}\""
+            f"'"
+        )
+        return executor.execute_command(host, extract_cmd, f"Extracting bundled templates on {host}", timeout=300)
+    except subprocess.TimeoutExpired:
+        return False, "timeout copying bundled templates"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _deploy_bundled_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+    """Deploy PostgreSQL templates from the container image to all hosts."""
+    if config.dry_run:
+        logger.info(
+            f"DRY-RUN: Would deploy bundled templates from {config.hammerdb_bundled_path} "
+            f"to {config.hammerdb_path} on all hosts"
+        )
+        return
+
+    logger.info(
+        f"Deploying bundled PostgreSQL templates from {config.hammerdb_bundled_path} "
+        f"to {config.hammerdb_path} on all hosts..."
+    )
+    archive_path = _create_postgresql_templates_archive(config.hammerdb_bundled_path)
+    try:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
+            futures = {
+                pool.submit(_deploy_bundled_scripts_to_host, config, executor, host, archive_path): host
+                for host in config.db_hosts
+            }
+            for future in as_completed(futures):
+                host = futures[future]
+                success, output = future.result()
+                if not success:
+                    logger.error(f"Failed to deploy bundled templates on {host}")
+                    logger.error(f"Error output: {output}")
+                    sys.exit(1)
+                logger.info(f"{host}: Bundled templates deployed successfully")
+    finally:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+
+
+def _deploy_remote_git_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+    """Deploy PostgreSQL templates by cloning a git repository on each host (legacy mode)."""
+    logger.info("Step 1/3: Preparing scripts directory on all hosts...")
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
+        futures = []
+        for host in config.db_hosts:
+            cmd = f"rm -rf '{config.hammerdb_path}' && mkdir -p '{config.hammerdb_path}'"
+            futures.append(pool.submit(executor.execute_command, host, cmd, "Preparing scripts directory"))
+        for future in as_completed(futures):
+            future.result()
+
+    logger.info("Step 2/3: Cloning HammerDB scripts on all hosts...")
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
+        futures = []
+        for host in config.db_hosts:
+            hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
+            hammerdb_repo_escaped = config.hammerdb_repo.replace("'", "'\"'\"'")
+            cmd = (
+                f"bash -c '"
+                f"cd \"{hammerdb_path_escaped}\" && "
+                f"export GIT_SSL_NO_VERIFY=true && "
+                f"git clone --recursive \"{hammerdb_repo_escaped}\" . 2>&1 && "
+                f"test -d \"templates/postgresql\""
+                f"'"
+            )
+            futures.append(pool.submit(executor.execute_command, host, cmd, "Cloning HammerDB scripts", timeout=600))
+        for future in as_completed(futures):
+            success, output = future.result()
+            if not success:
+                logger.error("Failed to clone repository on host")
+                logger.error(f"Error output: {output}")
+                logger.error(f"Please check hammerdb.repo: {config.hammerdb_repo}")
+                sys.exit(1)
+
+
+def deploy_scripts(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
+    """Deploy HammerDB scripts to VMs"""
+    logger.info("Deploying HammerDB scripts to VMs...")
+
+    if config.hammerdb_source == 'remote_git':
+        _deploy_remote_git_scripts(config, executor)
+    else:
+        _deploy_bundled_scripts(config, executor)
+
+    if not config.dry_run:
+        _set_postgresql_script_permissions(config, executor)
+
+
 def install_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> None:
     """Install PostgreSQL on VMs"""
     logger.info("Installing PostgreSQL on VMs...")
     
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             if config.mount_point == "none":
@@ -928,7 +1081,7 @@ def install_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) 
     # Create /etc/fstab entries if persistent mount is enabled
     if config.persistent_mount:
         logger.info("Creating /etc/fstab entries for persistent mounts...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 # Determine device and mount point
@@ -1023,13 +1176,18 @@ def manage_postgresql_service(config: PostgreSQLTestConfig, executor: CommandExe
     executor.execute_command(host, cmd, description)
 
 
+def _build_process_check_cmd(build_script: str) -> str:
+    """Return ps pipeline that matches only the given HammerDB build script."""
+    return f"ps aux | grep -F '{build_script}' | grep -v grep | wc -l"
+
+
 def _build_output_verify_cmd(hammerdb_dir: str, output_file: str) -> str:
     """Remote command to inspect HammerDB build log for completion/errors."""
     return (
         f"cd {hammerdb_dir} && "
         f"if [ -f {output_file} ] && [ -s {output_file} ]; then "
-        f"  tail -30 {output_file} | grep -iE '(complete|success|finished|VU.*complete|build.*complete)' || echo 'NO_COMPLETE_MARKER'; "
-        f"  tail -30 {output_file} | grep -iE '(error|failed|fatal)' | tail -5 || echo 'NO_ERRORS'; "
+        f"  grep -q 'ALL VIRTUAL USERS COMPLETE' {output_file} && echo 'BUILD_DONE' || echo 'BUILD_NOT_DONE'; "
+        f"  tail -50 {output_file} | grep -iE '(error|failed|fatal)' | tail -5 || echo 'NO_ERRORS'; "
         f"else "
         f"  echo 'FILE_MISSING_OR_EMPTY'; "
         f"fi"
@@ -1037,13 +1195,18 @@ def _build_output_verify_cmd(hammerdb_dir: str, output_file: str) -> str:
 
 
 def _parse_build_verify_output(verify_output: str) -> Tuple[bool, bool, bool]:
-    """Return (has_complete_marker, has_errors, file_missing)."""
+    """Return (build_done, has_errors, file_missing)."""
     if not verify_output:
         return False, False, False
     file_missing = 'FILE_MISSING_OR_EMPTY' in verify_output
-    has_complete = 'NO_COMPLETE_MARKER' not in verify_output
+    build_done = 'BUILD_DONE' in verify_output
     has_errors = 'NO_ERRORS' not in verify_output and not file_missing
-    return has_complete, has_errors, file_missing
+    return build_done, has_errors, file_missing
+
+
+def _build_log_indicates_complete(verify_output: str) -> bool:
+    """True only when the full HammerDB build finished (monitor Vuser 1 done)."""
+    return 'BUILD_DONE' in verify_output
 
 
 def _get_build_output_size(
@@ -1092,7 +1255,22 @@ def _poll_build_host_status(
         'check_failed'   - virtctl/SSH check failed (treat as still running)
     """
     poll_retries = max_retries if max_retries is not None else config.build_check_max_retries
-    check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
+    build_script = f"build{vm_number}_pg.tcl"
+
+    verify_success, verify_output = executor.execute_command(
+        host,
+        _build_output_verify_cmd(config.hammerdb_dir, output_file),
+        f"Verifying build completion on {host}",
+        timeout=config.build_check_timeout,
+        max_retries=poll_retries,
+        quiet=quiet,
+    )
+    if verify_success and _build_log_indicates_complete(verify_output):
+        return 'complete'
+    elif not verify_success and not quiet:
+        logger.debug(f"Build log verify failed on {host}")
+
+    check_cmd = _build_process_check_cmd(build_script)
     success, output = executor.execute_command(
         host,
         check_cmd,
@@ -1106,21 +1284,22 @@ def _poll_build_host_status(
 
     process_count = int(output.strip()) if output.strip().isdigit() else 0
     if process_count > 0:
+        current_size = _get_build_output_size(
+            executor, config, host, output_file, quiet=quiet, max_retries=poll_retries
+        )
+        previous_size = last_output_sizes.get(host)
+        if current_size is not None:
+            if previous_size is None or current_size > previous_size:
+                last_output_sizes[host] = current_size
+                return 'running'
+            last_output_sizes[host] = current_size
         return 'running'
 
-    verify_success, verify_output = executor.execute_command(
-        host,
-        _build_output_verify_cmd(config.hammerdb_dir, output_file),
-        f"Verifying build completion on {host}",
-        timeout=config.build_check_timeout,
-        max_retries=poll_retries,
-        quiet=quiet,
-    )
     if not verify_success:
         return 'check_failed'
 
-    has_complete, has_errors, file_missing = _parse_build_verify_output(verify_output)
-    if has_complete:
+    build_done, has_errors, file_missing = _parse_build_verify_output(verify_output)
+    if build_done:
         return 'complete'
     if file_missing:
         return 'running'
@@ -1152,7 +1331,7 @@ def _finalize_build_hosts(
     failed_builds = []
     last_output_sizes: Dict[str, int] = {}
 
-    with ThreadPoolExecutor(max_workers=min(len(hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(hosts))) as pool:
         futures = {
             pool.submit(
                 _poll_build_host_status,
@@ -1178,7 +1357,7 @@ def _finalize_build_hosts(
                 continue
 
             if status == 'complete':
-                logger.info(f"✓ Database build completed on {host}")
+                logger.info(f"Database build completed for all virtual users on {host}")
             elif status == 'running':
                 logger.error(
                     f"Database build on {host} still running after {config.build_time_limit}s "
@@ -1206,7 +1385,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
     
     # Step 1: Restart PostgreSQL services
     logger.info("Step 1/5: Restarting PostgreSQL services on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             future = pool.submit(manage_postgresql_service, config, executor, host, "restart", "Restarting PostgreSQL service")
@@ -1220,7 +1399,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
     
     # Step 3: Clean existing databases
     logger.info("Step 3/5: Cleaning existing databases on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             cmd = (
@@ -1235,7 +1414,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
     
     # Step 4: Copy and configure build scripts
     logger.info("Step 4/5: Preparing build scripts on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             vm_number = get_vm_number(host)
@@ -1257,7 +1436,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
     
     # Start build processes - use nohup with immediate verification
     host_build_info = {}  # Map host -> (vm_number, output_file)
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             vm_number = get_vm_number(host)
@@ -1276,7 +1455,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
             if not success:
                 # Even if command timed out, verify the process might still be running
                 logger.warning(f"Command to start database build on {host} may have timed out, verifying process...")
-                verify_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
+                verify_cmd = _build_process_check_cmd(f"build{vm_number}_pg.tcl")
                 verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build process on {host}", timeout=30)
                 if verify_success:
                     process_count = int(verify_output.strip()) if verify_output.strip().isdigit() else 0
@@ -1292,7 +1471,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
                 if output and 'started' in output.strip().lower():
                     logger.info(f"✓ Database build started on {host}")
                 else:
-                    verify_cmd = f"ps aux | grep -E 'hammerdbcli.*build{vm_number}_pg' | grep -v grep | wc -l"
+                    verify_cmd = _build_process_check_cmd(f"build{vm_number}_pg.tcl")
                     verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build on {host}", timeout=30)
                     verify_output_stripped = verify_output.strip() if verify_output else ""
                     process_count = int(verify_output_stripped) if verify_success and verify_output_stripped.isdigit() else 0
@@ -1346,7 +1525,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
         still_building = []
         check_failed_hosts = []
 
-        with ThreadPoolExecutor(max_workers=len(hosts_to_check)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(hosts_to_check))) as pool:
             futures = {
                 pool.submit(
                     _poll_build_host_status,
@@ -1369,7 +1548,7 @@ def build_database(config: PostgreSQLTestConfig, executor: CommandExecutor) -> N
                     continue
 
                 if status == 'complete':
-                    logger.info(f"✓ Database build completed on {host}")
+                    logger.info(f"Database build completed for all virtual users on {host}")
                     completed_hosts.add(host)
                 elif status == 'check_failed':
                     still_building.append(host)
@@ -1515,7 +1694,7 @@ def migrate_vms_during_test(config: PostgreSQLTestConfig, executor: CommandExecu
                 return False, vm_name
         
         # First attempt: migrate all VMs in parallel
-        with ThreadPoolExecutor(max_workers=len(vms_to_migrate)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(vms_to_migrate))) as pool:
             futures = [pool.submit(migrate_vm, vm) for vm in vms_to_migrate]
             failed_vms = []
             for future in as_completed(futures):
@@ -1526,7 +1705,7 @@ def migrate_vms_during_test(config: PostgreSQLTestConfig, executor: CommandExecu
         # Retry failed migrations
         if failed_vms:
             logger.info(f"Retrying {len(failed_vms)} failed VM migrations in parallel: {', '.join(failed_vms)}")
-            with ThreadPoolExecutor(max_workers=len(failed_vms)) as pool:
+            with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(failed_vms))) as pool:
                 futures = [pool.submit(migrate_vm, vm) for vm in failed_vms]
                 retry_failed = []
                 for future in as_completed(futures):
@@ -1563,7 +1742,7 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor, migration
         
         # Step 1: Setup test scripts
         logger.info(f"Preparing test scripts for {user_count} users...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 vm_number = get_vm_number(host)
@@ -1590,7 +1769,7 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor, migration
         test_start_time = time.time()
         logger.info(f"Starting performance tests at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 vm_number = get_vm_number(host)
@@ -1623,7 +1802,7 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor, migration
             logger.info("Verifying that performance tests actually started on all hosts...")
             time.sleep(2)  # Give processes a moment to start
             failed_starts = []
-            with ThreadPoolExecutor(max_workers=len(hosts_to_verify)) as verify_pool:
+            with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(hosts_to_verify))) as verify_pool:
                 verify_futures = []
                 for vm_number, host, output_file in hosts_to_verify:
                     # Check both process and output file
@@ -1693,7 +1872,7 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor, migration
             
             # Verify HammerDB processes are still running after migration
             logger.info("Verifying HammerDB processes are still running after migration...")
-            with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+            with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
                 futures = {}
                 for host in config.db_hosts:
                     vm_number = get_vm_number(host)
@@ -1711,7 +1890,7 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor, migration
         
         # Wait for tests to complete
         logger.info(f"Waiting for performance tests with {user_count} users to complete...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 vm_number = get_vm_number(host)
@@ -1774,10 +1953,14 @@ def run_tests(config: PostgreSQLTestConfig, executor: CommandExecutor, migration
             vm_number = get_vm_number(host)
             output_file = f"test_postgresql_pg_{run_date}_{num_hosts}pod_pod{vm_number}_{user_count}.out"
             if not config.dry_run:
-                cmd = f"cd {config.hammerdb_dir}; grep TPM '{output_file}' | awk '{{print $7}}' || echo 'No results found'"
+                cmd = f"cd {config.hammerdb_dir}; grep 'TEST RESULT' '{output_file}' | tail -1"
                 success, result = executor.execute_command(host, cmd, "Collecting TPM results", timeout=30)
                 if success:
-                    logger.info(f"Host {host}: {result.strip()} TPM")
+                    tpm = _extract_postgresql_tpm(result)
+                    if tpm is not None:
+                        logger.info(f"Host {host}: {tpm} TPM")
+                    else:
+                        logger.warning(f"Host {host}: Could not parse TPM from result line: {result.strip()!r}")
                 else:
                     logger.warning(f"Host {host}: Error collecting results")
             else:
@@ -1899,7 +2082,7 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
             logger.error(f"{host}: Error copying results: {e}")
             return host, False
     
-    max_workers = min(len(config.db_hosts), 50)
+    max_workers = config.max_pool_workers(len(config.db_hosts))
     logger.info(f"Collecting results from {len(config.db_hosts)} hosts (max {max_workers} parallel)...")
     
     succeeded = []
@@ -1954,11 +2137,11 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
                     if test_file.startswith("test_postgresql_pg_") and test_file.endswith(".out"):
                         test_file_path = os.path.join(host_path, test_file)
                         try:
-                            with open(test_file_path, 'r') as f:
+                            with open(test_file_path, 'r', encoding='utf-8', errors='ignore') as f:
                                 content = f.read()
-                                tpm_match = re.search(r'TPM.*?(\d+)', content)
-                                if tpm_match:
-                                    logger.info(f"    {test_file}: TPM {tpm_match.group(1)}")
+                                tpm = _extract_postgresql_tpm(content)
+                                if tpm is not None:
+                                    logger.info(f"    {test_file}: TPM {tpm}")
                         except Exception:
                             pass
 
@@ -1969,7 +2152,7 @@ def stop_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> 
     
     # Step 1: Stop PostgreSQL services
     logger.info("Step 1/3: Stopping PostgreSQL services on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             future = pool.submit(manage_postgresql_service, config, executor, host, "stop", "Stopping PostgreSQL service")
@@ -1980,7 +2163,7 @@ def stop_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> 
     # Step 2: Cleanup storage
     if config.mount_point != "none" and config.mount_point != "null":
         logger.info("Step 2/3: Cleaning up storage mount points on all hosts...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 cmd = (
@@ -1999,7 +2182,7 @@ def stop_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> 
                 future.result()
     elif config.disk_list != "none" and config.disk_list != "null":
         logger.info("Step 2/3: Cleaning up disk device mount points on all hosts...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 cmd = (
@@ -2018,7 +2201,7 @@ def stop_postgresql(config: PostgreSQLTestConfig, executor: CommandExecutor) -> 
                 future.result()
     else:
         logger.info("Step 2/3: No storage configuration detected - only cleaning up temporary files")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 cmd = f"cd {config.hammerdb_dir} && rm -f postgresql-results.tar.gz 2>/dev/null || true"
@@ -2101,7 +2284,7 @@ WORKFLOW:
     parser.add_argument('--dry-run', action='store_true',
                        help='Validate configuration and show what would be done without executing')
     parser.add_argument('--prepare-hosts', action='store_true',
-                       help='Only run preparation steps (install packages, git clone, PostgreSQL setup)')
+                       help='Only run preparation steps (install packages, deploy scripts, PostgreSQL setup)')
     parser.add_argument('--copy-results', action='store_true',
                        help='Only copy results from hosts (skip installation, building, and testing)')
     parser.add_argument('--ssh-only', action='store_true',

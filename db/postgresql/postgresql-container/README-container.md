@@ -24,7 +24,7 @@ podman build --build-arg VIRTCTL_VERSION=v1.8.0 -t quay.io/ekuric/postgresql-ben
 Mount your `postgresql-config.yaml`. Everything comes from the file.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./postgresql-config.yaml:/work/postgresql-config.yaml \
   -v /root/postgresql-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -36,7 +36,7 @@ podman run --rm \
 Or point to the baked-in example config:
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e CONFIG=/work/examples/postgresql-config.yaml \
   -v /root/postgresql-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -51,7 +51,7 @@ No config file needed. The entrypoint generates it from env vars.
 At minimum, one host selection variable is required.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="pg-{1..10}" \
   -e NAMESPACE="default" \
   -e DESCRIPTION="postgresql perf test" \
@@ -116,7 +116,7 @@ after the image name are forwarded to `postgresql.py`.
 Validate configuration and show what would be done without executing.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./postgresql-config.yaml:/work/postgresql-config.yaml \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
@@ -133,7 +133,7 @@ Enable verbose/debug output.
 Only install packages, clone repo, and set up PostgreSQL. Skip testing.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="pg-{1..10}" \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
@@ -147,7 +147,7 @@ podman run --rm \
 Only copy results from hosts (skip everything else).
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./postgresql-config.yaml:/work/postgresql-config.yaml \
   -v /root/postgresql-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -166,7 +166,7 @@ Force plain SSH (overrides the default `--virtctl-only`).
 ### Config file only
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./postgresql-config.yaml:/work/postgresql-config.yaml \
   -v /root/postgresql-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -178,7 +178,7 @@ podman run --rm \
 ### Env vars only (all parameters)
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="pg-{1..10}" \
   -e NAMESPACE="default" \
   -e DESCRIPTION="postgresql perf test" \
@@ -205,7 +205,7 @@ podman run --rm \
 ### Dry run with verbose output
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="pg-{1..5}" \
   -e DISK_LIST="/dev/vdc" \
   -v /root/.kube/config:/root/.kube/config \
@@ -217,7 +217,7 @@ podman run --rm \
 ### With oc login
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e KUBEADMIN_PASSWORD="my-password" \
   -e API_URL="https://api.mycluster.example.com:6443" \
   -v ./postgresql-config.yaml:/work/postgresql-config.yaml \

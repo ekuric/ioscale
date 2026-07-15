@@ -20,8 +20,9 @@ pipeline {
         string(name: 'TEST_DURATION',     defaultValue: '15',                  description: 'Test duration in minutes')
         string(name: 'USER_COUNT',        defaultValue: '1 10 20 50',          description: 'Space-separated user counts to test')
 
-        string(name: 'HAMMERDB_REPO',     defaultValue: 'https://github.com/ekuric/fusion-access.git', description: 'Git repo with HammerDB wrapper scripts')
-        string(name: 'HAMMERDB_PATH',     defaultValue: '/root/hammerdb-tpcc-wrapper-scripts',          description: 'Clone path on remote hosts')
+        string(name: 'HAMMERDB_PATH',     defaultValue: '/root/hammerdb-tpcc-wrapper-scripts', description: 'Deploy path for HammerDB scripts on remote hosts')
+        string(name: 'HAMMERDB_SOURCE',   defaultValue: 'bundled',           description: 'Script source: bundled (default) or remote_git')
+        string(name: 'HAMMERDB_REPO',     defaultValue: 'https://github.com/ekuric/ioscale.git', description: 'Only used when HAMMERDB_SOURCE=remote_git')
         string(name: 'HAMMERDB_INSTALL_DIR', defaultValue: '/usr/local/HammerDB',                       description: 'HammerDB installation directory')
 
         string(name: 'RAMPUP_TIME',        defaultValue: '',                    description: 'Ramp-up time in minutes (empty = default 2 min)')
@@ -54,7 +55,7 @@ pipeline {
                 sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
-                            podman run --rm --pids-limit=-1 \
+                            podman run --rm --init --pids-limit=-1 \
                               -e HOST_PATTERN="${params.HOST_PATTERN}" \
                               -e NAMESPACE="${params.NAMESPACE}" \
                               -e DISK_LIST="${params.DISK_LIST}" \
@@ -62,8 +63,9 @@ pipeline {
                               -e WAREHOUSE_COUNT=${params.WAREHOUSE_COUNT} \
                               -e TEST_DURATION=${params.TEST_DURATION} \
                               -e USER_COUNT="${params.USER_COUNT}" \
-                              -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
+                              -e HAMMERDB_SOURCE="${params.HAMMERDB_SOURCE}" \
                               -e HAMMERDB_PATH="${params.HAMMERDB_PATH}" \
+                              -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
                               -e HAMMERDB_INSTALL_DIR="${params.HAMMERDB_INSTALL_DIR}" \
                               -e RAMPUP_TIME="${params.RAMPUP_TIME}" \
                               -e MIGRATE_USER_COUNTS="${params.MIGRATE_USER_COUNTS}" \

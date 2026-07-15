@@ -6,14 +6,17 @@ Configuration is read from a YAML file instead of command line arguments
 """
 
 import argparse
+import base64
 import glob
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -55,6 +58,8 @@ class MariaDBTestConfig:
         self.disk_list = None
         self.warehouse_count = None
         self.user_count = []
+        self.hammerdb_source = "bundled"
+        self.hammerdb_bundled_path = "/work/hammerdb-bundled"
         self.hammerdb_repo = None
         self.hammerdb_path = None
         self.hammerdb_dir = None
@@ -73,8 +78,22 @@ class MariaDBTestConfig:
         # Monitoring configuration
         self.task_monitor_interval = 60  # Check task status every N seconds for long-running tasks
         self.build_time_limit = 14400  # Hard limit for database build (4 hours)
+        self.build_poll_interval = 30  # Seconds between build status polls
+        self.build_check_timeout = 60  # Per-poll virtctl/SSH timeout during build monitoring
+        self.build_check_max_retries = 1  # Avoid retry storms during build polling
         self.monitor_vm = False
         self.monitor_vm_interval = 10
+
+    def max_pool_workers(self, task_count: int) -> int:
+        """Cap thread-pool parallelism by fleet size: <100→50, 100–500→100, >500→200."""
+        fleet_size = len(self.db_hosts)
+        if fleet_size > 500:
+            cap = 200
+        elif fleet_size >= 100:
+            cap = 100
+        else:
+            cap = 50
+        return min(task_count, cap)
 
 
 class VMMigrationMonitor:
@@ -210,6 +229,48 @@ class VMMigrationMonitor:
             })
 
 
+def _extract_mariadb_tpm(text: str) -> Optional[int]:
+    """Extract MariaDB TPM from HammerDB TEST RESULT line (both output formats)."""
+    match = re.search(r'System achieved (\d+) MySQL TPM at \d+ NOPM', text)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'System achieved \d+ NOPM from (\d+) MySQL TPM', text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _find_mariadb_templates_dir(bundled_path: str) -> str:
+    """Locate templates/mariadb inside a bundled HammerDB scripts tree."""
+    candidates = [
+        os.path.join(bundled_path, "templates", "mariadb"),
+        os.path.join(bundled_path, "db", "templates", "mariadb"),
+        os.path.join(bundled_path, "scripts", "templates", "mariadb"),
+        os.path.join(bundled_path, "scripts", "mariadb"),
+    ]
+    for candidate in candidates:
+        install_script = os.path.join(candidate, "Hammerdb-mariadb-install-script")
+        if os.path.isfile(install_script):
+            return candidate
+    raise FileNotFoundError(
+        f"MariaDB templates not found under {bundled_path}. Checked: {', '.join(candidates)}"
+    )
+
+
+def _create_mariadb_templates_archive(bundled_path: str) -> str:
+    """Create a tar.gz archive with templates/mariadb/ layout for remote extraction."""
+    templates_dir = _find_mariadb_templates_dir(bundled_path)
+    tmp = tempfile.NamedTemporaryFile(prefix="mariadb-templates-", suffix=".tar.gz", delete=False)
+    tmp.close()
+    with tarfile.open(tmp.name, "w:gz") as tar:
+        for entry in os.listdir(templates_dir):
+            tar.add(
+                os.path.join(templates_dir, entry),
+                arcname=os.path.join("templates", "mariadb", entry),
+            )
+    return tmp.name
+
+
 class CommandExecutor:
     """Handles command execution via virtctl or SSH"""
     
@@ -266,7 +327,25 @@ class CommandExecutor:
                 "-o", "ControlPath=/tmp/mariadb-ssh-%r@%h:%p",
                 f"root@{host}", command
             ]
-    
+
+    def get_scp_to_host_command(self, host: str, local_source: str, remote_dest: str) -> List[str]:
+        """Get SCP command for copying a local file to a remote host."""
+        if self.is_vm_host(host):
+            if not self.config.namespace or self.config.namespace == "N/A":
+                raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
+            remote = f"root@vmi/{host}:{remote_dest}"
+            return [
+                "virtctl", "-n", self.config.namespace, "scp",
+                "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
+                local_source, remote
+            ]
+        return [
+            "scp", "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            local_source, f"root@{host}:{remote_dest}"
+        ]
+
     def execute_command(self, host: str, command: str, description: str = "command",
                        timeout: Optional[int] = None,
                        max_retries: Optional[int] = None,
@@ -459,11 +538,23 @@ class ConfigLoader:
         
         # Load HammerDB configuration
         hammerdb = yaml_data.get('hammerdb', {})
+        hammerdb_source = hammerdb.get('source', 'bundled')
+        if hammerdb_source == "null" or not hammerdb_source:
+            hammerdb_source = 'bundled'
+        self.config.hammerdb_source = str(hammerdb_source).lower()
+        self.config.hammerdb_bundled_path = hammerdb.get('bundled_path', '/work/hammerdb-bundled')
+        if self.config.hammerdb_bundled_path == "null" or not self.config.hammerdb_bundled_path:
+            self.config.hammerdb_bundled_path = "/work/hammerdb-bundled"
         self.config.hammerdb_repo = hammerdb.get('repo')
-        self.config.hammerdb_path = hammerdb.get('path')
+        self.config.hammerdb_path = hammerdb.get('path', '/root/hammerdb-tpcc-wrapper-scripts')
+        if self.config.hammerdb_path == "null" or not self.config.hammerdb_path:
+            self.config.hammerdb_path = '/root/hammerdb-tpcc-wrapper-scripts'
         self.config.hammerdb_dir = hammerdb.get('install_dir', '/usr/local/HammerDB')
         if self.config.hammerdb_dir == "null" or not self.config.hammerdb_dir:
             self.config.hammerdb_dir = "/usr/local/HammerDB"
+        if self.config.hammerdb_source == 'remote_git' and not self.config.hammerdb_repo:
+            logger.error("hammerdb.repo is required when hammerdb.source is remote_git")
+            sys.exit(1)
         
         # Load retry configuration
         retry = yaml_data.get('retry', {})
@@ -499,6 +590,24 @@ class ConfigLoader:
             self.config.build_time_limit = 14400
         else:
             self.config.build_time_limit = int(self.config.build_time_limit)
+
+        self.config.build_poll_interval = monitoring.get('build_poll_interval', 30)
+        if self.config.build_poll_interval == "null" or not self.config.build_poll_interval:
+            self.config.build_poll_interval = 30
+        else:
+            self.config.build_poll_interval = int(self.config.build_poll_interval)
+
+        self.config.build_check_timeout = monitoring.get('build_check_timeout', 60)
+        if self.config.build_check_timeout == "null" or not self.config.build_check_timeout:
+            self.config.build_check_timeout = 60
+        else:
+            self.config.build_check_timeout = int(self.config.build_check_timeout)
+
+        self.config.build_check_max_retries = monitoring.get('build_check_max_retries', 1)
+        if self.config.build_check_max_retries == "null" or self.config.build_check_max_retries == "":
+            self.config.build_check_max_retries = 1
+        else:
+            self.config.build_check_max_retries = int(self.config.build_check_max_retries)
     
     def _get_db_hosts(self, yaml_data: Dict) -> List[str]:
         """Get database hosts from various methods"""
@@ -628,6 +737,14 @@ def validate_inputs(config: MariaDBTestConfig) -> None:
     if config.mount_point == "none" and config.disk_list == "none":
         logger.error("Either storage.disk_list or storage.mount_point must be specified in config")
         sys.exit(1)
+
+    if not config.dry_run and config.hammerdb_source == 'bundled':
+        try:
+            _find_mariadb_templates_dir(config.hammerdb_bundled_path)
+        except FileNotFoundError as exc:
+            logger.error(str(exc))
+            logger.error("Rebuild the container image or set hammerdb.source to remote_git")
+            sys.exit(1)
     
     # Validate hosts are reachable (skip in dry-run mode and SSH-only mode)
     if not config.dry_run and config.use_virtctl is not False:
@@ -673,14 +790,23 @@ def display_config(config: MariaDBTestConfig) -> None:
     if config.mount_point != "none":
         logger.info(f"Mount point: {config.mount_point}")
     logger.info(f"Persistent mount: {'ENABLED (will create /etc/fstab entries)' if config.persistent_mount else 'DISABLED (temporary mounts only)'}")
-    logger.info(f"HammerDB repo: {config.hammerdb_repo}")
+    logger.info(f"HammerDB source: {config.hammerdb_source}")
+    if config.hammerdb_source == 'bundled':
+        logger.info(f"HammerDB bundled path: {config.hammerdb_bundled_path}")
+    elif config.hammerdb_repo:
+        logger.info(f"HammerDB repo: {config.hammerdb_repo}")
     logger.info(f"HammerDB path: {config.hammerdb_path}")
     logger.info(f"HammerDB install dir: {config.hammerdb_dir}")
     logger.info(f"Log level: {config.log_level}")
     logger.info(f"Retry interval: {config.retry_interval}s")
+    logger.info(f"Thread pool cap: {config.max_pool_workers(len(config.db_hosts))} "
+                f"(fleet size {len(config.db_hosts)})")
     logger.info(f"Max retries: {config.max_retries}")
     logger.info(f"Skip connectivity test: {'ENABLED' if config.skip_connectivity_test else 'DISABLED'}")
     logger.info(f"Task monitor interval: {config.task_monitor_interval}s")
+    logger.info(f"Build time limit: {config.build_time_limit}s")
+    logger.info(f"Build poll interval: {config.build_poll_interval}s")
+    logger.info(f"Build check timeout: {config.build_check_timeout}s (max_retries={config.build_check_max_retries})")
     if config.migrate_user_counts:
         if config.migrate_interval > 0:
             logger.info(f"VM Migration: ENABLED for user_counts: {' '.join(config.migrate_user_counts)} "
@@ -694,15 +820,16 @@ def display_config(config: MariaDBTestConfig) -> None:
 def ensure_packages_installed(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
     """Ensure required packages are installed on all hosts"""
     logger.info("Checking if required packages are installed on all hosts...")
+    git_pkg = "" if config.hammerdb_source == 'bundled' else "git "
+    mariadb_pkgs = "mariadb mariadb-server mariadb-server-utils mariadb-errmsg mysql-libs"
     
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
-            # Check and install basic packages and MariaDB packages
             cmd = (
                 "bash -c '"
                 "packages_installed=true; "
-                "for pkg in git curl vim wget mariadb mariadb-server mariadb-server-utils mariadb-errmsg mysql-libs; do "
+                f"for pkg in {git_pkg}curl vim wget {mariadb_pkgs}; do "
                 "  if ! rpm -q $pkg &>/dev/null; then "
                 "    packages_installed=false; "
                 "    break; "
@@ -712,7 +839,7 @@ def ensure_packages_installed(config: MariaDBTestConfig, executor: CommandExecut
                 "  echo \"All required packages are already installed\"; "
                 "else "
                 "  echo \"Installing required packages...\"; "
-                "  dnf -y --nobest install git curl vim wget mariadb mariadb-server mariadb-server-utils mariadb-errmsg mysql-libs; "
+                f"  dnf -y --nobest install {git_pkg}curl vim wget {mariadb_pkgs}; "
                 "  if [ -L /usr/lib64/libmysqlclient.so.21 ]; then rm -f /usr/lib64/libmysqlclient.so.21; fi; "
                 "  ldconfig; "
                 "  echo \"Package installation completed\"; "
@@ -755,100 +882,13 @@ def install_dependencies(config: MariaDBTestConfig, executor: CommandExecutor) -
     ensure_packages_installed(config, executor)
 
 
-def deploy_scripts(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
-    """Deploy HammerDB scripts to VMs"""
-    logger.info("Deploying HammerDB scripts to VMs...")
-    
-    # Step 1: Prepare directories - remove existing HammerDB install (if any) to ensure clean state
-    logger.info("Step 1/3: Preparing scripts directory on all hosts...")
-    logger.warning(f"Removing existing HammerDB installation at {config.hammerdb_path} (if any) to ensure clean state")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
-        futures = []
-        for host in config.db_hosts:
-            cmd = f"rm -rf '{config.hammerdb_path}' && mkdir -p '{config.hammerdb_path}'"
-            future = pool.submit(executor.execute_command, host, cmd, "Preparing scripts directory")
-            futures.append(future)
-        for future in as_completed(futures):
-            future.result()
-    
-    # Step 2: Clone repositories
-    logger.info("Step 2/3: Cloning HammerDB scripts on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
-        futures = []
-        for host in config.db_hosts:
-            # Improved git clone with better error handling and diagnostics
-            # Use bash -c with proper quoting to ensure consistent execution for both SSH and virtctl
-            # This ensures the same shell behavior regardless of connection method
-            # Check multiple possible locations for templates directory
-            hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
-            hammerdb_repo_escaped = config.hammerdb_repo.replace("'", "'\"'\"'")
-            hammerdb_path_display = config.hammerdb_path.replace("'", "'\"'\"'")
-            cmd = (
-                f"bash -c '"
-                f"cd \"{hammerdb_path_escaped}\" && "
-                f"export GIT_SSL_NO_VERIFY=true && "
-                f"echo \"Starting git clone...\" && "
-                f"git clone --recursive \"{hammerdb_repo_escaped}\" . 2>&1 && "
-                f"if [ $? -eq 0 ]; then "
-                f"  echo \"Git clone completed successfully\"; "
-                f"  echo \"Initializing submodules if any...\"; "
-                f"  git submodule update --init --recursive 2>&1 || echo \"No submodules found or already initialized\"; "
-                f"  echo \"Checking for templates directory in various locations...\"; "
-                f"  if [ -d \"templates/mariadb\" ]; then "
-                f"    echo \"Found templates/mariadb directory\"; "
-                f"  elif [ -d \"scripts/templates/mariadb\" ]; then "
-                f"    echo \"Found scripts/templates/mariadb directory - creating symlink\"; "
-                f"    mkdir -p templates && ln -sf ../scripts/templates/mariadb templates/mariadb && echo \"Symlink created\"; "
-                f"  elif [ -d \"scripts/mariadb\" ]; then "
-                f"    echo \"Found scripts/mariadb directory - creating symlink\"; "
-                f"    mkdir -p templates && ln -sf ../scripts/mariadb templates/mariadb && echo \"Symlink created\"; "
-                f"  else "
-                f"    echo \"ERROR: templates/mariadb directory not found in any expected location\"; "
-                f"    echo \"Current branch: $(git branch --show-current 2>&1 || echo 'unknown')\"; "
-                f"    echo \"Available branches: $(git branch -a 2>&1 | head -10)\"; "
-                f"    echo \"Repository structure (top level):\"; "
-                f"    ls -la . 2>&1; "
-                f"    echo \"Checking scripts directory:\"; "
-                f"    ls -la scripts/ 2>&1 | head -20 || echo \"scripts directory does not exist\"; "
-                f"    echo \"Checking for any mariadb-related directories:\"; "
-                f"    find . -type d -iname '*mariadb*' 2>&1 | head -10; "
-                f"    echo \"Checking for templates directories:\"; "
-                f"    find . -type d -iname 'templates' 2>&1 | head -10; "
-                f"    exit 1; "
-                f"  fi; "
-                f"  if [ -d \"templates/mariadb\" ]; then "
-                f"    echo \"Clone successful - templates/mariadb directory exists\"; "
-                f"  else "
-                f"    echo \"ERROR: Failed to locate or create templates/mariadb directory\"; "
-                f"    exit 1; "
-                f"  fi; "
-                f"else "
-                f"  echo \"ERROR: Git clone failed with exit code $?\"; "
-                f"  exit 1; "
-                f"fi"
-                f"'"
-            )
-            future = pool.submit(executor.execute_command, host, cmd, "Cloning HammerDB scripts", timeout=600)
-            futures.append(future)
-        for future in as_completed(futures):
-            success, output = future.result()
-            if not success:
-                logger.error(f"Failed to clone repository on host")
-                logger.error(f"Error output: {output}")
-                logger.error(f"Please check:")
-                logger.error(f"  1. Repository URL is correct: {config.hammerdb_repo}")
-                logger.error(f"  2. Host has internet access")
-                logger.error(f"  3. Git is installed on the host")
-                sys.exit(1)
-    
-    # Step 3: Set permissions
-    logger.info("Step 3/3: Setting execute permissions on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+def _set_mariadb_script_permissions(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
+    """Set execute permissions on the MariaDB install script on all hosts."""
+    logger.info("Setting execute permissions on all hosts...")
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             script_path = f"{config.hammerdb_path}/templates/mariadb/Hammerdb-mariadb-install-script"
-            # Check if file exists before chmod, and verify git clone was successful
-            # Use bash -c for consistent execution across SSH and virtctl
             script_path_escaped = script_path.replace("'", "'\"'\"'")
             hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
             cmd = (
@@ -857,14 +897,12 @@ def deploy_scripts(config: MariaDBTestConfig, executor: CommandExecutor) -> None
                 f"chmod +x \"{script_path_escaped}\" && echo \"Permissions set successfully\"; "
                 f"else "
                 f"echo \"ERROR: Script file not found at {script_path_escaped}\"; "
-                f"echo \"Checking if git clone was successful...\"; "
                 f"ls -la \"{hammerdb_path_escaped}/templates/mariadb/\" 2>&1 || echo \"Directory does not exist\"; "
                 f"exit 1; "
                 f"fi"
                 f"'"
             )
-            future = pool.submit(executor.execute_command, host, cmd, "Setting execute permissions")
-            futures.append(future)
+            futures.append(pool.submit(executor.execute_command, host, cmd, "Setting script permissions"))
         for future in as_completed(futures):
             success, output = future.result()
             if not success:
@@ -872,11 +910,141 @@ def deploy_scripts(config: MariaDBTestConfig, executor: CommandExecutor) -> None
                 sys.exit(1)
 
 
+def _deploy_bundled_scripts_to_host(
+    config: MariaDBTestConfig,
+    executor: CommandExecutor,
+    host: str,
+    archive_path: str,
+) -> Tuple[bool, str]:
+    """Copy bundled MariaDB templates archive to a single host and extract it."""
+    remote_archive = "/tmp/mariadb-templates.tar.gz"
+    hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
+    remote_archive_escaped = remote_archive.replace("'", "'\"'\"'")
+
+    try:
+        scp_cmd = executor.get_scp_to_host_command(host, archive_path, remote_archive)
+        result = subprocess.run(scp_cmd, capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            logger.warning(f"{host}: SCP failed, trying base64 fallback...")
+            with open(archive_path, "rb") as archive_file:
+                encoded = base64.b64encode(archive_file.read()).decode("ascii")
+            upload_cmd = f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(remote_archive)}"
+            success, output = executor.execute_command(
+                host, upload_cmd, f"Uploading bundled templates to {host}", timeout=300
+            )
+            if not success:
+                return False, output or "base64 upload failed"
+        install_script_escaped = (
+            f"{config.hammerdb_path}/templates/mariadb/Hammerdb-mariadb-install-script"
+        ).replace("'", "'\"'\"'")
+        extract_cmd = (
+            f"bash -c '"
+            f"rm -rf {hammerdb_path_escaped} && "
+            f"mkdir -p {hammerdb_path_escaped} && "
+            f"tar xzf {remote_archive_escaped} -C {hammerdb_path_escaped} && "
+            f"rm -f {remote_archive_escaped} && "
+            f"test -f \"{install_script_escaped}\""
+            f"'"
+        )
+        return executor.execute_command(host, extract_cmd, f"Extracting bundled templates on {host}", timeout=300)
+    except subprocess.TimeoutExpired:
+        return False, "timeout copying bundled templates"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _deploy_bundled_scripts(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
+    """Deploy MariaDB templates from the container image to all hosts."""
+    if config.dry_run:
+        logger.info(
+            f"DRY-RUN: Would deploy bundled templates from {config.hammerdb_bundled_path} "
+            f"to {config.hammerdb_path} on all hosts"
+        )
+        return
+
+    logger.info(
+        f"Deploying bundled MariaDB templates from {config.hammerdb_bundled_path} "
+        f"to {config.hammerdb_path} on all hosts..."
+    )
+    archive_path = _create_mariadb_templates_archive(config.hammerdb_bundled_path)
+    try:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
+            futures = {
+                pool.submit(_deploy_bundled_scripts_to_host, config, executor, host, archive_path): host
+                for host in config.db_hosts
+            }
+            for future in as_completed(futures):
+                host = futures[future]
+                success, output = future.result()
+                if not success:
+                    logger.error(f"Failed to deploy bundled templates on {host}")
+                    logger.error(f"Error output: {output}")
+                    sys.exit(1)
+                logger.info(f"{host}: Bundled templates deployed successfully")
+    finally:
+        try:
+            os.remove(archive_path)
+        except OSError:
+            pass
+
+
+def _deploy_remote_git_scripts(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
+    """Deploy MariaDB templates by cloning a git repository on each host (legacy mode)."""
+    logger.info("Step 1/3: Preparing scripts directory on all hosts...")
+    logger.warning(f"Removing existing HammerDB installation at {config.hammerdb_path} (if any) to ensure clean state")
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
+        futures = []
+        for host in config.db_hosts:
+            cmd = f"rm -rf '{config.hammerdb_path}' && mkdir -p '{config.hammerdb_path}'"
+            futures.append(pool.submit(executor.execute_command, host, cmd, "Preparing scripts directory"))
+        for future in as_completed(futures):
+            future.result()
+
+    logger.info("Step 2/3: Cloning HammerDB scripts on all hosts...")
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
+        futures = []
+        for host in config.db_hosts:
+            hammerdb_path_escaped = config.hammerdb_path.replace("'", "'\"'\"'")
+            hammerdb_repo_escaped = config.hammerdb_repo.replace("'", "'\"'\"'")
+            cmd = (
+                f"bash -c '"
+                f"cd \"{hammerdb_path_escaped}\" && "
+                f"export GIT_SSL_NO_VERIFY=true && "
+                f"git clone --recursive \"{hammerdb_repo_escaped}\" . 2>&1 && "
+                f"if [ -d \"templates/mariadb\" ]; then true; "
+                f"elif [ -d \"scripts/templates/mariadb\" ]; then mkdir -p templates && ln -sf ../scripts/templates/mariadb templates/mariadb; "
+                f"elif [ -d \"scripts/mariadb\" ]; then mkdir -p templates && ln -sf ../scripts/mariadb templates/mariadb; "
+                f"else echo \"ERROR: templates/mariadb directory not found\"; exit 1; fi"
+                f"'"
+            )
+            futures.append(pool.submit(executor.execute_command, host, cmd, "Cloning HammerDB scripts", timeout=600))
+        for future in as_completed(futures):
+            success, output = future.result()
+            if not success:
+                logger.error("Failed to clone repository on host")
+                logger.error(f"Error output: {output}")
+                logger.error(f"Please check hammerdb.repo: {config.hammerdb_repo}")
+                sys.exit(1)
+
+
+def deploy_scripts(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
+    """Deploy HammerDB scripts to VMs"""
+    logger.info("Deploying HammerDB scripts to VMs...")
+
+    if config.hammerdb_source == 'remote_git':
+        _deploy_remote_git_scripts(config, executor)
+    else:
+        _deploy_bundled_scripts(config, executor)
+
+    if not config.dry_run:
+        _set_mariadb_script_permissions(config, executor)
+
+
 def install_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
     """Install MariaDB on VMs"""
     logger.info("Installing MariaDB on VMs...")
     
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             cmd = (
@@ -926,7 +1094,7 @@ def install_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> Non
     # Create /etc/fstab entries if persistent mount is enabled
     if config.persistent_mount:
         logger.info("Creating /etc/fstab entries for persistent mounts...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 # Determine device and mount point
@@ -1024,6 +1192,208 @@ def manage_mariadb_service(config: MariaDBTestConfig, executor: CommandExecutor,
     return success
 
 
+def _build_process_check_cmd(build_script: str) -> str:
+    """Return ps pipeline that matches only the given HammerDB build script."""
+    return f"ps aux | grep -F '{build_script}' | grep -v grep | wc -l"
+
+
+def _build_output_verify_cmd(hammerdb_dir: str, output_file: str) -> str:
+    """Remote command to inspect HammerDB build log for completion/errors."""
+    return (
+        f"cd '{hammerdb_dir}' && "
+        f"if [ -f {output_file} ] && [ -s {output_file} ]; then "
+        f"  grep -q 'ALL VIRTUAL USERS COMPLETE' {output_file} && echo 'BUILD_DONE' || echo 'BUILD_NOT_DONE'; "
+        f"  tail -50 {output_file} | grep -iE '(error|failed|fatal)' | tail -5 || echo 'NO_ERRORS'; "
+        f"else "
+        f"  echo 'FILE_MISSING_OR_EMPTY'; "
+        f"fi"
+    )
+
+
+def _parse_build_verify_output(verify_output: str) -> Tuple[bool, bool, bool]:
+    """Return (build_done, has_errors, file_missing)."""
+    if not verify_output:
+        return False, False, False
+    file_missing = 'FILE_MISSING_OR_EMPTY' in verify_output
+    build_done = 'BUILD_DONE' in verify_output
+    has_errors = 'NO_ERRORS' not in verify_output and not file_missing
+    return build_done, has_errors, file_missing
+
+
+def _build_log_indicates_complete(verify_output: str) -> bool:
+    """True only when the full HammerDB build finished (monitor Vuser 1 done)."""
+    return 'BUILD_DONE' in verify_output
+
+
+def _get_build_output_size(
+    executor: 'CommandExecutor',
+    config: MariaDBTestConfig,
+    host: str,
+    output_file: str,
+    *,
+    quiet: bool = True,
+    max_retries: Optional[int] = None,
+) -> Optional[int]:
+    """Return build log size in bytes, or None if the check failed."""
+    size_cmd = f"stat -c '%s' {config.hammerdb_dir}/{output_file} 2>/dev/null || echo -1"
+    success, output = executor.execute_command(
+        host,
+        size_cmd,
+        f"Checking build output size on {host}",
+        timeout=config.build_check_timeout,
+        max_retries=max_retries if max_retries is not None else config.build_check_max_retries,
+        quiet=quiet,
+    )
+    if not success or not output.strip().lstrip('-').isdigit():
+        return None
+    size = int(output.strip())
+    return size if size >= 0 else None
+
+
+def _poll_build_host_status(
+    executor: 'CommandExecutor',
+    config: MariaDBTestConfig,
+    host: str,
+    build_id: int,
+    output_file: str,
+    last_output_sizes: Dict[str, int],
+    *,
+    quiet: bool = True,
+    max_retries: Optional[int] = None,
+) -> str:
+    """
+    Poll one host during MariaDB build monitoring.
+
+    Returns:
+        'complete'     - build finished successfully (log markers; process may linger)
+        'running'      - build still in progress
+        'failed'       - build log shows errors and no progress
+        'check_failed' - virtctl/SSH check failed (treat as still running)
+    """
+    poll_retries = max_retries if max_retries is not None else config.build_check_max_retries
+    build_script = f"build{build_id}_mariadb.tcl"
+
+    verify_success, verify_output = executor.execute_command(
+        host,
+        _build_output_verify_cmd(config.hammerdb_dir, output_file),
+        f"Verifying build completion on {host}",
+        timeout=config.build_check_timeout,
+        max_retries=poll_retries,
+        quiet=quiet,
+    )
+    if verify_success and _build_log_indicates_complete(verify_output):
+        return 'complete'
+    elif not verify_success and not quiet:
+        logger.debug(f"Build log verify failed on {host}")
+
+    check_cmd = _build_process_check_cmd(build_script)
+    success, output = executor.execute_command(
+        host,
+        check_cmd,
+        f"Checking build status on {host}",
+        timeout=config.build_check_timeout,
+        max_retries=poll_retries,
+        quiet=quiet,
+    )
+    if not success:
+        return 'check_failed'
+
+    process_count = int(output.strip()) if output.strip().isdigit() else 0
+    if process_count > 0:
+        current_size = _get_build_output_size(
+            executor, config, host, output_file, quiet=quiet, max_retries=poll_retries
+        )
+        previous_size = last_output_sizes.get(host)
+        if current_size is not None:
+            if previous_size is None or current_size > previous_size:
+                last_output_sizes[host] = current_size
+                return 'running'
+            last_output_sizes[host] = current_size
+        return 'running'
+
+    if not verify_success:
+        return 'check_failed'
+
+    build_done, has_errors, file_missing = _parse_build_verify_output(verify_output)
+    if build_done:
+        return 'complete'
+    if file_missing:
+        return 'running'
+
+    current_size = _get_build_output_size(
+        executor, config, host, output_file, quiet=quiet, max_retries=poll_retries
+    )
+    previous_size = last_output_sizes.get(host)
+    if current_size is not None:
+        if previous_size is None or current_size > previous_size:
+            last_output_sizes[host] = current_size
+            return 'running'
+        last_output_sizes[host] = current_size
+
+    if has_errors:
+        return 'failed'
+
+    return 'running'
+
+
+def _finalize_build_hosts(
+    executor: 'CommandExecutor',
+    config: MariaDBTestConfig,
+    host_build_info: Dict[str, Tuple[int, str]],
+    hosts: List[str],
+) -> List[str]:
+    """Run a final strict verification pass; return hosts that failed."""
+    failed_builds = []
+    last_output_sizes: Dict[str, int] = {}
+
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(hosts))) as pool:
+        futures = {
+            pool.submit(
+                _poll_build_host_status,
+                executor,
+                config,
+                host,
+                host_build_info[host][0],
+                host_build_info[host][1],
+                last_output_sizes,
+                quiet=False,
+                max_retries=config.max_retries,
+            ): host
+            for host in hosts
+        }
+        for future in as_completed(futures):
+            host = futures[future]
+            build_id, output_file = host_build_info[host]
+            try:
+                status = future.result()
+            except Exception as e:
+                logger.error(f"Final build verification error on {host}: {e}")
+                failed_builds.append(host)
+                continue
+
+            if status == 'complete':
+                logger.info(f"Database build completed for all virtual users on {host}")
+            elif status == 'running':
+                logger.error(
+                    f"Database build on {host} still running after {config.build_time_limit}s "
+                    f"- check {output_file}"
+                )
+                failed_builds.append(host)
+            elif status == 'check_failed':
+                logger.error(
+                    f"Could not verify database build on {host} after {config.build_time_limit}s "
+                    f"- check connectivity and {output_file}"
+                )
+                failed_builds.append(host)
+            else:
+                logger.error(
+                    f"Database build on {host} may have failed - check {output_file}"
+                )
+                failed_builds.append(host)
+
+    return failed_builds
+
+
 def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
     """Build TPCC database"""
     logger.info("Building TPCC database with parallel execution...")
@@ -1031,7 +1401,7 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     # Step 1: Restart MariaDB services
     logger.info("Step 1/5: Restarting MariaDB services on all hosts...")
     failed_hosts = []
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             future = pool.submit(manage_mariadb_service, config, executor, host, "restart", "Restarting MariaDB service")
@@ -1049,7 +1419,7 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     
     # Step 3: Clean existing databases
     logger.info("Step 3/5: Cleaning existing databases on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             cmd = "mariadb --no-defaults -u root -S /var/lib/mysql/mysql.sock -e 'DROP DATABASE IF EXISTS tpcc;' 2>/dev/null || mariadb --no-defaults -u root -pmysql -S /var/lib/mysql/mysql.sock -e 'DROP DATABASE IF EXISTS tpcc;'"
@@ -1060,7 +1430,7 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     
     # Step 4: Copy and configure build scripts
     logger.info("Step 4/5: Preparing build scripts on all hosts...")
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         counter = 1
         for host in config.db_hosts:
@@ -1085,7 +1455,7 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
     
     # Start build processes - use nohup with immediate verification
     host_build_info = {}  # Map host -> (counter, output_file)
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         counter = 1
         for host in config.db_hosts:
@@ -1103,7 +1473,7 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
             if not success:
                 # Even if command timed out, verify the process might still be running
                 logger.warning(f"Command to start database build on {host} may have timed out, verifying process...")
-                verify_cmd = f"ps aux | grep -E 'hammerdbcli.*build{counter}_mariadb' | grep -v grep | wc -l"
+                verify_cmd = _build_process_check_cmd(f"build{counter}_mariadb.tcl")
                 verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build process on {host}", timeout=30)
                 if verify_success:
                     process_count = int(verify_output.strip()) if verify_output.strip().isdigit() else 0
@@ -1121,7 +1491,7 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
                     logger.info(f"✓ Database build started on {host}")
                 else:
                     # Verify process is actually running
-                    verify_cmd = f"ps aux | grep -E 'hammerdbcli.*build{counter}_mariadb' | grep -v grep | wc -l"
+                    verify_cmd = _build_process_check_cmd(f"build{counter}_mariadb.tcl")
                     verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build on {host}", timeout=30)
                     process_count = int(verify_output.strip()) if verify_success and verify_output.strip().isdigit() else 0
                     if process_count > 0:
@@ -1135,148 +1505,103 @@ def build_database(config: MariaDBTestConfig, executor: CommandExecutor) -> None
             sys.exit(1)
     
     logger.info("All database build processes started. Monitoring build progress...")
-    
-    # Monitor build completion by checking if hammerdbcli processes are still running
-    # Database builds can take a very long time (30+ minutes for large warehouses),
-    # so we keep waiting with a soft warning at 1h and a hard timeout of build_time_limit
-    # (default 4h, configurable via monitoring.build_time_limit in YAML).
-    if config.build_time_limit <= config.retry_interval:
-        logger.error("monitoring.build_time_limit must be greater than retry_interval")
+
+    if config.build_time_limit <= config.build_poll_interval:
+        logger.error("monitoring.build_time_limit must be greater than build_poll_interval")
         sys.exit(1)
-    check_interval = 30  # Check every 30 seconds
+
     start_time = time.time()
-    warned_soft = False
-    completed_hosts = set()  # Track hosts that have completed (successfully or with errors)
-    
+    warned_long_build = False
+    completed_hosts = set()
+    last_output_sizes: Dict[str, int] = {}
+
     while True:
         if time.time() - start_time >= config.build_time_limit:
             remaining = [h for h in config.db_hosts if h not in completed_hosts]
-            logger.error(
-                f"Database build timed out after {config.build_time_limit}s. "
-                f"{len(remaining)} host(s) still building: {', '.join(remaining)}. "
-                f"Check build output files for details."
+            logger.warning(
+                f"Database build reached time limit ({config.build_time_limit}s). "
+                f"Running final verification on {len(remaining)} host(s): {', '.join(remaining)}"
             )
-            sys.exit(1)
-        still_building = []
+            failed_builds = _finalize_build_hosts(
+                executor, config, host_build_info, remaining
+            )
+            if failed_builds:
+                logger.error(
+                    f"Database build failed or timed out on {len(failed_builds)} host(s): "
+                    f"{', '.join(failed_builds)}"
+                )
+                logger.error("Cannot proceed with tests - database must be built successfully first")
+                sys.exit(1)
+            if remaining:
+                logger.info("All remaining database builds verified successfully after time limit")
+            break
+
         hosts_to_check = [h for h in config.db_hosts if h not in completed_hosts]
-        
         if not hosts_to_check:
-            # All hosts have completed
             logger.info("All database builds completed!")
             break
-        
-        with ThreadPoolExecutor(max_workers=len(hosts_to_check)) as pool:
-            futures = []
-            for host in hosts_to_check:
-                counter, output_file = host_build_info[host]
-                # Check if hammerdbcli build process is still running
-                check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{counter}_mariadb' | grep -v grep | wc -l"
-                future = pool.submit(executor.execute_command, host, check_cmd, f"Checking build status on {host}", timeout=30)
-                futures.append((future, counter, host, output_file))
-            
-            for future, counter, host, output_file in futures:
+
+        still_building = []
+        check_failed_hosts = []
+
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(hosts_to_check))) as pool:
+            futures = {
+                pool.submit(
+                    _poll_build_host_status,
+                    executor,
+                    config,
+                    host,
+                    host_build_info[host][0],
+                    host_build_info[host][1],
+                    last_output_sizes,
+                ): host
+                for host in hosts_to_check
+            }
+            for future in as_completed(futures):
+                host = futures[future]
                 try:
-                    success, output = future.result()
-                    if success:
-                        process_count = int(output.strip()) if output.strip().isdigit() else 0
-                        if process_count > 0:
-                            still_building.append(host)
-                        else:
-                            # Process finished - verify build completed successfully by checking output file
-                            # Check if output file exists and has content, and look for completion indicators
-                            verify_cmd = (
-                                f"cd '{config.hammerdb_dir}' && "
-                                f"if [ -f {output_file} ] && [ -s {output_file} ]; then "
-                                f"  tail -30 {output_file} | grep -iE '(complete|success|finished|VU.*complete|build.*complete)' || echo 'NO_COMPLETE_MARKER'; "
-                                f"  tail -30 {output_file} | grep -iE '(error|failed|fatal)' | tail -5 || echo 'NO_ERRORS'; "
-                                f"else "
-                                f"  echo 'FILE_MISSING_OR_EMPTY'; "
-                                f"fi"
-                            )
-                            verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Verifying build completion on {host}", timeout=30)
-                            if verify_success:
-                                if 'FILE_MISSING_OR_EMPTY' in verify_output:
-                                    logger.warning(f"Build output file missing or empty on {host} - build may have failed, will verify at end")
-                                    completed_hosts.add(host)  # Mark as checked, will verify at end
-                                elif 'NO_COMPLETE_MARKER' in verify_output and 'NO_ERRORS' not in verify_output:
-                                    # No completion marker but has errors - likely failed
-                                    logger.warning(f"Build on {host} may have failed - no completion marker and errors found - will verify at end")
-                                    completed_hosts.add(host)  # Mark as checked, will verify at end
-                                else:
-                                    # Build appears to have completed successfully
-                                    logger.info(f"✓ Database build completed on {host}")
-                                    completed_hosts.add(host)
-                            else:
-                                logger.warning(f"Could not verify build completion on {host} - will check again")
-                                still_building.append(host)
+                    status = future.result()
                 except Exception as e:
                     logger.warning(f"Error checking build status on {host}: {e}")
-                    # Assume still building if we can't check
                     still_building.append(host)
-        
-        if not still_building:
-            # All processes have finished (may need final verification)
-            logger.info("All database build processes have finished. Performing final verification...")
-            break
-        
+                    continue
+
+                if status == 'complete':
+                    logger.info(f"Database build completed for all virtual users on {host}")
+                    completed_hosts.add(host)
+                elif status == 'check_failed':
+                    still_building.append(host)
+                    check_failed_hosts.append(host)
+                elif status == 'failed':
+                    output_file = host_build_info[host][1]
+                    logger.warning(
+                        f"Build on {host} may have errors in {output_file} - will re-check before failing"
+                    )
+                    still_building.append(host)
+                else:
+                    still_building.append(host)
+
+        if check_failed_hosts:
+            logger.warning(
+                "Could not reach %d host(s) for build status check (virtctl/SSH timeout); "
+                "assuming still building: %s",
+                len(check_failed_hosts),
+                ', '.join(check_failed_hosts),
+            )
+
         elapsed = int(time.time() - start_time)
-        if elapsed > config.build_time_limit // 4 and not warned_soft:
+        if elapsed > config.build_time_limit // 4 and not warned_long_build:
             logger.warning(
                 f"Database builds are taking longer than {config.build_time_limit // 4}s; "
                 f"hard timeout at {config.build_time_limit}s"
             )
-            warned_soft = True
-        logger.info(f"Waiting for database builds to complete... ({len(still_building)} hosts still building: {', '.join(still_building)}, {elapsed}s elapsed)")
-        time.sleep(check_interval)
-    
-    # Final verification - check all hosts one more time
-    failed_builds = []
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
-        futures = []
-        for host in config.db_hosts:
-            counter, output_file = host_build_info[host]
-            check_cmd = f"ps aux | grep -E 'hammerdbcli.*build{counter}_mariadb' | grep -v grep | wc -l"
-            future = pool.submit(executor.execute_command, host, check_cmd, f"Final build status check on {host}", timeout=30)
-            futures.append((future, counter, host, output_file))
-        
-        for future, counter, host, output_file in futures:
-            success, output = future.result()
-            if success:
-                process_count = int(output.strip()) if output.strip().isdigit() else 0
-                if process_count > 0:
-                    # Build still running; continue waiting rather than failing
-                    logger.info(f"Database build on {host} is still running - continuing to wait (output: {output_file})")
-                else:
-                    # Verify build completed successfully by checking output file
-                    verify_cmd = (
-                        f"cd '{config.hammerdb_dir}' && "
-                        f"if [ -f {output_file} ] && [ -s {output_file} ]; then "
-                        f"  tail -30 {output_file} | grep -iE '(complete|success|finished|VU.*complete|build.*complete)' || echo 'NO_COMPLETE_MARKER'; "
-                        f"  tail -30 {output_file} | grep -iE '(error|failed|fatal)' | tail -5 || echo 'NO_ERRORS'; "
-                        f"else "
-                        f"  echo 'FILE_MISSING_OR_EMPTY'; "
-                        f"fi"
-                    )
-                    verify_success, verify_output = executor.execute_command(host, verify_cmd, f"Checking final build output on {host}", timeout=30)
-                    if verify_success:
-                        if 'FILE_MISSING_OR_EMPTY' in verify_output:
-                            logger.error(f"Database build on {host} failed - output file missing or empty - check {output_file}")
-                            failed_builds.append(host)
-                        elif 'NO_COMPLETE_MARKER' in verify_output and 'NO_ERRORS' not in verify_output:
-                            logger.error(f"Database build on {host} may have failed - no completion marker and errors found - check {output_file}")
-                            logger.error(f"Error output: {verify_output}")
-                            failed_builds.append(host)
-                        else:
-                            logger.info(f"✓ Database build completed on {host}")
-                    else:
-                        logger.warning(f"Could not verify build completion on {host} - check {output_file} manually")
-                        # Don't fail if we can't verify - let user check manually
-    
-    if failed_builds:
-        logger.error(f"Database build failed or timed out on {len(failed_builds)} host(s): {', '.join(failed_builds)}")
-        logger.error("Cannot proceed with tests - database must be built successfully first")
-        sys.exit(1)
-    
+            warned_long_build = True
+        logger.info(
+            f"Waiting for database builds to complete... "
+            f"({len(still_building)} hosts still building: {', '.join(still_building)}, {elapsed}s elapsed)"
+        )
+        time.sleep(config.build_poll_interval)
+
     logger.info("Database building completed successfully on all hosts!")
 
 
@@ -1394,7 +1719,7 @@ def migrate_vms_during_test(config: MariaDBTestConfig, executor: CommandExecutor
                 return False, vm_name
         
         # First attempt: migrate all VMs in parallel
-        with ThreadPoolExecutor(max_workers=len(vms_to_migrate)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(vms_to_migrate))) as pool:
             futures = [pool.submit(migrate_vm, vm) for vm in vms_to_migrate]
             failed_vms = []
             for future in as_completed(futures):
@@ -1405,7 +1730,7 @@ def migrate_vms_during_test(config: MariaDBTestConfig, executor: CommandExecutor
         # Retry failed migrations
         if failed_vms:
             logger.info(f"Retrying {len(failed_vms)} failed VM migrations in parallel: {', '.join(failed_vms)}")
-            with ThreadPoolExecutor(max_workers=len(failed_vms)) as pool:
+            with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(failed_vms))) as pool:
                 futures = [pool.submit(migrate_vm, vm) for vm in failed_vms]
                 retry_failed = []
                 for future in as_completed(futures):
@@ -1442,7 +1767,7 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
         
         # Step 1: Setup test scripts
         logger.info(f"Preparing test scripts for {user_count} users...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             counter = 1
             for host in config.db_hosts:
@@ -1471,7 +1796,7 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
         test_start_time = time.time()
         logger.info(f"Starting performance tests at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             counter = 1
             for host in config.db_hosts:
@@ -1505,7 +1830,7 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
             logger.info("Verifying that performance tests actually started on all hosts...")
             time.sleep(2)  # Give processes a moment to start
             failed_starts = []
-            with ThreadPoolExecutor(max_workers=len(hosts_to_verify)) as verify_pool:
+            with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(hosts_to_verify))) as verify_pool:
                 verify_futures = []
                 for counter, host, output_file in hosts_to_verify:
                     # Check both process and output file
@@ -1593,7 +1918,7 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
         
         # Wait for tests to complete
         logger.info(f"Waiting for performance tests with {user_count} users to complete...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             start_time = time.time()
             check_interval = 30  # Check every 30 seconds
             max_wait_time = rampup_time_seconds + test_duration_seconds + 600  # rampup + test + 10 min buffer
@@ -1670,10 +1995,14 @@ def run_tests(config: MariaDBTestConfig, executor: CommandExecutor, migration_mo
         for host in config.db_hosts:
             output_file = f"test_mariadb_{run_date}_{num_hosts}pod_pod{counter}_{user_count}.out"
             if not config.dry_run:
-                cmd = f"cd '{config.hammerdb_dir}'; grep TPM '{output_file}' | awk '{{print $7}}' || echo 'No results found'"
+                cmd = f"cd '{config.hammerdb_dir}'; grep 'TEST RESULT' '{output_file}' | tail -1"
                 success, result = executor.execute_command(host, cmd, "Collecting TPM results", timeout=30)
                 if success:
-                    logger.info(f"Host {host}: {result.strip()} TPM")
+                    tpm = _extract_mariadb_tpm(result)
+                    if tpm is not None:
+                        logger.info(f"Host {host}: {tpm} TPM")
+                    else:
+                        logger.warning(f"Host {host}: Could not parse TPM from result line: {result.strip()!r}")
                 else:
                     logger.warning(f"Host {host}: Error collecting results")
             else:
@@ -1803,7 +2132,7 @@ def collect_results(config: MariaDBTestConfig, executor: CommandExecutor, result
             return host, False
     
     # Run collection in parallel
-    max_workers = min(len(config.db_hosts), 50)
+    max_workers = config.max_pool_workers(len(config.db_hosts))
     logger.info(f"Collecting results from {len(config.db_hosts)} hosts (max {max_workers} parallel)...")
     
     succeeded = []
@@ -1858,11 +2187,11 @@ def collect_results(config: MariaDBTestConfig, executor: CommandExecutor, result
                     if test_file.startswith("test_mariadb_") and test_file.endswith(".out"):
                         test_file_path = os.path.join(host_path, test_file)
                         try:
-                            with open(test_file_path, 'r') as f:
+                            with open(test_file_path, 'r', encoding='utf-8', errors='ignore') as f:
                                 content = f.read()
-                                tpm_match = re.search(r'TPM.*?(\d+)', content)
-                                if tpm_match:
-                                    logger.info(f"    {test_file}: TPM {tpm_match.group(1)}")
+                                tpm = _extract_mariadb_tpm(content)
+                                if tpm is not None:
+                                    logger.info(f"    {test_file}: TPM {tpm}")
                         except Exception:
                             pass
 
@@ -1874,7 +2203,7 @@ def stop_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
     # Step 1: Stop MariaDB services
     logger.info("Step 1/3: Stopping MariaDB services on all hosts...")
     failed_hosts = []
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
         futures = []
         for host in config.db_hosts:
             future = pool.submit(manage_mariadb_service, config, executor, host, "stop", "Stopping MariaDB service")
@@ -1888,7 +2217,7 @@ def stop_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
     # Step 2: Cleanup storage
     if config.mount_point != "none" and config.mount_point != "null":
         logger.info("Step 2/3: Cleaning up storage mount points on all hosts...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 cmd = (
@@ -1907,7 +2236,7 @@ def stop_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
                 future.result()
     elif config.disk_list != "none" and config.disk_list != "null":
         logger.info("Step 2/3: Cleaning up disk device mount points on all hosts...")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 cmd = (
@@ -1926,7 +2255,7 @@ def stop_mariadb(config: MariaDBTestConfig, executor: CommandExecutor) -> None:
                 future.result()
     else:
         logger.info("Step 2/3: No storage configuration detected - only cleaning up temporary files")
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=config.max_pool_workers(len(config.db_hosts))) as pool:
             futures = []
             for host in config.db_hosts:
                 cmd = f"cd '{config.hammerdb_dir}' && rm -f mariadb-results.tar.gz 2>/dev/null || true"
@@ -2009,7 +2338,7 @@ WORKFLOW:
     parser.add_argument('--dry-run', action='store_true',
                        help='Validate configuration and show what would be done without executing')
     parser.add_argument('--prepare-hosts', action='store_true',
-                       help='Only run preparation steps (install packages, git clone, MariaDB setup)')
+                       help='Only run preparation steps (install packages, deploy scripts, MariaDB setup)')
     parser.add_argument('--copy-results', action='store_true',
                        help='Only copy results from hosts (skip installation, building, and testing)')
     parser.add_argument('--ssh-only', action='store_true',

@@ -37,6 +37,7 @@ database:
   test_duration: 15              # Test duration in minutes
   # rampup_time: 2               # Ramp-up time in minutes (defaults to 2 if not set)
   mssql_pass: "mssqlpasswd1!"    # SA password for sqlcmd/ODBC
+  # max_server_memory_mb: 38000   # SQL Server memory cap in MB (e.g. 38000 on ~50GB VM; omit = unlimited)
   rebuilddb: true                # Build database before tests
   rebuild_only: false            # Only rebuild database, skip tests/results
   test_only: false               # Only run tests on existing database
@@ -48,8 +49,10 @@ test:
 
 # HammerDB Configuration
 hammerdb:
-  repo: "https://github.com/ekuric/fusion-access.git"  # Git repository URL
-  path: "/root/hammerdb-tpcc-wrapper-scripts"          # Scripts directory path
+  source: "bundled"                                      # bundled (default) or remote_git
+  bundled_path: "/work/hammerdb-bundled"                   # Path inside the benchmark container
+  path: "/root/hammerdb-tpcc-wrapper-scripts"            # Deploy path on each test VM
+  # repo: "https://github.com/ekuric/ioscale.git"        # Only used when source: remote_git
 
 # Retry and Monitoring Configuration
 retry:
@@ -72,6 +75,11 @@ monitoring:
   # Only tasks running longer than 60 seconds will be monitored for reboots
   # The script will detect if a host reboots during a long-running task and restart it
   task_monitor_interval: 60
+  # Database build monitoring (HammerDB schema build can take hours at scale)
+  build_time_limit: 14400       # Hard stop + final verify (seconds, default 4h)
+  build_poll_interval: 30       # Seconds between build status polls
+  build_check_timeout: 60       # Per-poll SSH/virtctl timeout during build monitoring
+  build_check_max_retries: 1    # Retries per poll (keep low to avoid virtctl storms)
 
 # VM Migration Configuration (optional - virtctl mode only)
 # This allows VMs to be migrated during test execution to test migration resilience
