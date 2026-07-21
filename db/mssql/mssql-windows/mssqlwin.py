@@ -398,6 +398,7 @@ class CommandExecutor:
                 )
                 output_lines = []
                 start_time = time.time()
+                timed_out = False
                 while True:
                     line = process.stdout.readline() if process.stdout else ""
                     if line:
@@ -409,35 +410,47 @@ class CommandExecutor:
                         break
                     if cmd_timeout and (time.time() - start_time) > cmd_timeout:
                         process.kill()
-                        if attempt < max_retries:
-                            if not quiet:
-                                logger.warning(f"Command timeout on {host} (attempt {attempt}/{max_retries}): {description} (timeout: {cmd_timeout}s)")
-                                logger.warning(f"Retrying in {retry_interval}s...")
-                            time.sleep(retry_interval)
-                            break
-                        else:
-                            if not quiet:
-                                logger.error(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s) after {max_retries} attempts")
-                            return False, "Command timeout"
-                else:
-                    returncode = process.wait()
-                    output = "".join(output_lines)
-                    if returncode == 0:
-                        return True, output
+                        timed_out = True
+                        break
+
+                if timed_out:
                     if attempt < max_retries:
                         if not quiet:
-                            logger.warning(f"Command failed on {host} (attempt {attempt}/{max_retries}): {description}")
-                            logger.warning(f"Exit code: {returncode}")
+                            logger.warning(
+                                f"Command timeout on {host} (attempt {attempt}/{max_retries}): "
+                                f"{description} (timeout: {cmd_timeout}s)"
+                            )
                             logger.warning(f"Retrying in {retry_interval}s...")
                         time.sleep(retry_interval)
                         continue
                     if not quiet:
-                        logger.error(f"Failed to execute '{description}' on {host} after {max_retries} attempts")
-                    error_output = output.strip() or f"Exit code: {returncode}"
+                        logger.error(
+                            f"Command timeout on {host}: {description} "
+                            f"(timeout: {cmd_timeout}s) after {max_retries} attempts"
+                        )
+                    return False, "Command timeout"
+
+                returncode = process.wait()
+                output = "".join(output_lines)
+                if returncode == 0:
+                    return True, output
+                if attempt < max_retries:
                     if not quiet:
-                        logger.error(f"Error output: {error_output}")
-                    return False, error_output
-                continue
+                        logger.warning(
+                            f"Command failed on {host} (attempt {attempt}/{max_retries}): {description}"
+                        )
+                        logger.warning(f"Exit code: {returncode}")
+                        logger.warning(f"Retrying in {retry_interval}s...")
+                    time.sleep(retry_interval)
+                    continue
+                if not quiet:
+                    logger.error(
+                        f"Failed to execute '{description}' on {host} after {max_retries} attempts"
+                    )
+                error_output = output.strip() or f"Exit code: {returncode}"
+                if not quiet:
+                    logger.error(f"Error output: {error_output}")
+                return False, error_output
             except Exception as e:
                 if attempt < max_retries:
                     if not quiet:

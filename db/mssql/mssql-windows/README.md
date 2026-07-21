@@ -1,277 +1,397 @@
-# Testing MSSQL on Windows Server using HammerDB 
+# mssqlwin.py Container
 
-In this document we will summarize steps how to run HammerDB workload against MSSQL server running on windows server. We will present steps how to run test on baremetal and/or kvm virtual machines, and how to efecifelly use it to test MSSQL server running in OpenShift virtualization virtual machines.
+Run HammerDB TPCC tests against Windows MSSQL VMs from a container.
+Template files are baked in. Configuration can be provided three ways:
+mount a config file, use environment variables, or both.
 
+## Building
 
-## Prerequestis 
-
-This tool expects that: 
-
-- MSSQL server is installed and running on test machine(s). We do not do Windows MSSQL setup steps. We only need `mssql_pass` to know in advance in order to be able to create test database. 
-Get necessary MSSQL bits from official Microsoft channels
-
-- HammerDB tool installed on test machines, easy to get from [this link](https://www.hammerdb.com/download.html)
-
-The Tool will build database ( assuming MSSQL server process is up and running ) and start test.
-
-## Example of Usage 
-
+```bash
+cd mssqlwin-container
+podman build -t quay.io/ekuric/mssqlwin-benchmark:latest .
 ```
-# python mssqlwin.py -h
-usage: mssqlwin.py [-h] [-c CONFIG] [-v] [--dry-run] [--copy-results] [--ssh-only] [--virtctl-only] [--test-script TEST_SCRIPT] [--rebuild-script REBUILD_SCRIPT] [--create-db CREATE_DB]
-                   [--hammerdb-test-script HAMMERDB_TEST_SCRIPT] [--build-schema-file BUILD_SCHEMA_FILE] [--generate-only] [--rebuild-always] [--prepare-machine]
 
-MSSQL HammerDB Windows Testing Script (YAML Configuration Version)
+Override the virtctl version at build time:
 
-optional arguments:
-  -h, --help            show this help message and exit
-  -c CONFIG, --config CONFIG
-                        Path to YAML configuration file (default: mssql-config.yaml)
-  -v, --verbose         Verbose output
-  --dry-run             Validate configuration and show what would be done without executing
-  --copy-results        Only copy results from hosts (skip rebuild and tests)
-  --ssh-only            Force SSH for all hosts (baremetal/KVM, no virtctl)
-  --virtctl-only        Force virtctl for all hosts (OpenShift VMs)
-  --test-script TEST_SCRIPT
-                        Local test script to copy to Windows hosts and run
-  --rebuild-script REBUILD_SCRIPT
-                        Local rebuild script to copy to Windows hosts and run
-  --create-db CREATE_DB
-                        Local create_db.sql to copy to Windows hosts
-  --hammerdb-test-script HAMMERDB_TEST_SCRIPT
-                        Local HammerDB test script to copy to Windows hosts
-  --build-schema-file BUILD_SCHEMA_FILE
-                        Local build schema TCL to customize and copy to Windows hosts
-  --generate-only       Only generate per-user files locally and exit
-  --rebuild-always      Rebuild database before each user-count test run
-  --prepare-machine     Prepare Windows machines by formatting the data disk and exit
-
-EXAMPLES:
-    python3 mssqlwin.py                          # Use default mssql-config.yaml
-    python3 mssqlwin.py -c mssql-config.yaml     # Use custom configuration file
-    python3 mssqlwin.py -c mssql-config.yaml -v  # Verbose output
-    python3 mssqlwin.py --copy-results           # Only copy results
-        
-``` 
-
-Content of configuration file is presented below 
-
-`mssql-configwin.yaml` 
-
+```bash
+podman build --build-arg VIRTCTL_VERSION=v1.8.0 -t quay.io/ekuric/mssqlwin-benchmark:latest .
 ```
-# Minimal MSSQL HammerDB Windows Configuration (mssqlwin.py)
 
-description: "1-100-users-hammerdb-2win-parallel"
+## Two Usage Modes
+
+### Mode 1: Config file (recommended)
+
+Mount your `mssql-configwin.yaml`. Everything comes from the file.
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+```
+
+### Mode 2: Env vars only (CI/CD)
+
+No config file needed. The entrypoint generates it from env vars.
+At minimum, one host selection variable is required (`HOSTS`, `HOST_PATTERN`,
+`HOST_LABELS`, or `PIN_NODES`).
+
+Working example (single Windows VM):
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -e HOST_PATTERN="winm-1" \
+  -e NAMESPACE="default" \
+  -e WAREHOUSE_COUNT=100 \
+  -e BUILD_USERS=10 \
+  -e USER_COUNT="1" \
+  -e TEST_DURATION=1 \
+  -e MSSQL_TOTAL_ITERATIONS=10000000 \
+  -e RAMPUP_TIME="1" \
+  -e MSSQL_PASS="YourSaPassword" \
+  -e DISK_ID="1" \
+  -e REBUILDDB=true \
+  -e REBUILD_ALWAYS=false \
+  -e TEST_ONLY=false \
+  -e DESCRIPTION="jenkins-mssql-test-new-db-test" \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+```
+
+Multi-VM pattern example:
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -e HOST_PATTERN="winm-{1..10}" \
+  -e NAMESPACE="default" \
+  -e WAREHOUSE_COUNT=100 \
+  -e BUILD_USERS=10 \
+  -e USER_COUNT="1 10" \
+  -e TEST_DURATION=15 \
+  -e RAMPUP_TIME="1" \
+  -e MSSQL_PASS="YourSaPassword" \
+  -e DISK_ID="1" \
+  -e REBUILDDB=true \
+  -e REBUILD_ALWAYS=false \
+  -e TEST_ONLY=false \
+  -e DESCRIPTION="mssqlwin-scale-test" \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+```
+
+**How it works:** If a config file exists at the `CONFIG` path, it is used
+as-is. If no file is found, the entrypoint generates one from env vars.
+No merging or patching -- it is one or the other.
+
+**Important:**
+- Use `--pids-limit=-1` (HammerDB / nested tools can exceed the default PID limit).
+- Mount `/work/results` to a host directory (e.g. `/root/mssqlwin-results`) to keep
+  results after the container exits. Without this mount and with `--rm`, results are lost.
+- Mount the full SSH directory (`-v /root/.ssh:/root/.ssh:ro`) so `virtctl ssh` can
+  authenticate to Windows VMs.
+- Set `DISK_ID` to the Windows data disk number (`Get-Disk` on the guest). Often `1`
+  (OS is disk `0`); some images with an extra device use `2`.
+
+## Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `CONFIG` | `/work/mssql-configwin.yaml` | Path to the YAML config file inside the container |
+| `HOSTS` | -- | Space-separated VM names (pick one of HOSTS / HOST_PATTERN / HOST_LABELS / PIN_NODES) |
+| `HOST_PATTERN` | -- | Brace-expansion pattern, e.g. `winm-{1..10}` or a single name `winm-1` |
+| `HOST_LABELS` | -- | OCP label selector for VMs |
+| `PIN_NODES` | -- | Alias for HOST_LABELS |
+| `NAMESPACE` | `default` | OpenShift namespace |
+| `WAREHOUSE_COUNT` | `50` | TPCC warehouse count |
+| `BUILD_USERS` | `50` | Virtual users for schema build |
+| `USER_COUNT` | `1 10 20 50 100` | Space-separated user counts (e.g. `"1 10"`, not comma-separated) |
+| `TEST_DURATION` | `15` | Test duration in minutes |
+| `RAMPUP_TIME` | -- | Ramp-up time in minutes |
+| `MSSQL_TOTAL_ITERATIONS` | `10000000` | Iteration limit |
+| `MSSQL_PASS` | -- | MSSQL server password |
+| `HAMMERDB_PATH` | `C:\tools\Hammerdb-4.12` | HammerDB install path on Windows |
+| `DISK_ID` | `1` | Data disk ID to format (`Get-Disk` number) |
+| `SSH_USER` | `Administrator` | SSH user on Windows VMs |
+| `REBUILDDB` | `true` | Rebuild database before test |
+| `REBUILD_ONLY` | `false` | Only rebuild, skip test |
+| `TEST_ONLY` | `false` | Only test, skip rebuild |
+| `REBUILD_ALWAYS` | `false` | Rebuild before every user-count iteration |
+| `DESCRIPTION` | -- | Test run description |
+| `KUBEADMIN_PASSWORD` | -- | If set, runs `oc login` before the test |
+| `API_URL` | `https://api.ocp.example.com:6443` | Cluster API URL for `oc login` |
+
+## Config File Reference
+
+Edit `mssql-configwin.yaml` to configure your test. A copy is baked into the
+image at `/work/examples/mssql-configwin.yaml`. Key sections:
+
+```yaml
+description: "mssqlwin-example"
 
 database:
-  # Choose ONE of: hosts, host_pattern, host_labels, host_file
-  hosts: "192.168.122.201 192.168.122.200"   # Space-separated list of hosts
-  # host_pattern: "winvm-{1..3}"              # Expands to winvm-1 winvm-2 winvm-3
-  # host_labels: "app=mssql,role=primary"     # OpenShift VM labels (virtctl)
-  # host_file: "mssql_hosts.txt"              # File with one host per line
-  namespace: "default"                       # Only used for virtctl mode
-  test_duration: 1                           # Test duration in minutes
-  # mssql_total_iterations: 10000000         # can be set - we use default from HammerDB
-  # warehouse_count: 500                     # if used - must be consistent accross runs
-  user_count: "1 100"                        # list of HammerDB test user "1 10 20 30 60 100" 
-  # mssql_pass: "mypass"                     # msssql database password 
+  host_pattern: "winm-{1..10}"   # or hosts, host_labels, host_file
+  namespace: "default"
+  warehouse_count: 100
+  build_users: 10
+  user_count: "1 10"             # space-separated, NOT comma-separated
+  test_duration: 15
+  rampup_time: 1
+  mssql_total_iterations: 10000000
+  mssql_pass: "YourSaPassword"
 
 windows:
   hammerdb_path: "C:\\tools\\Hammerdb-4.12"
-  test_script: ""
-  hammerdb_test_script: "" 
-  result_dir: "C:\\tools\\Hammerdb-4.12\\results"
-  rebuild_script: "" 
-  create_db_sql: ""
+  disk_id: "1"
   ssh_user: "Administrator"
-  rebuilddb: false                            # rebuild database prior testing
-  rebuild_always: false                       # rebuild database before each user count
-  rebuild_only: false                         # only rebuild db 
-  test_only: true                             # only test - no rebuild, assuming rebuild was done before
-
+  rebuilddb: true
+  rebuild_always: false
+  rebuild_only: false
+  test_only: false
 ```
 
-As shown in above `mssql-configwin.yaml` example we can specify test host on four different ways
+See the full example for all available fields including timeouts and
+`mssql_service_name`.
 
-1. space separted hosts eg. `hosts: "host1 host2` 
-2. hostname pattern, eg. `host_pattern: "winvm-{1..3}"` this is useful if there are many test hosts
-3. host labels , eg. `host_labels: "app=mssql,role=primary"` useful in OCP environments
-4. host_file: "mssql_hosts.txt" in this case we put hostnames for example 
-```
-host1
-host2 
-host3 
-```
+## mssqlwin.py CLI Parameters
 
-The workflow we follow here is 
+The entrypoint passes `--virtctl-only` and the template file paths automatically.
+Any extra arguments after the image name are forwarded to `mssqlwin.py`.
 
-1. Build database 
+### `-v`, `--verbose`
 
-`python mssqlwin.py -c mssql-configwin.yaml --rebuild-script rebuild-db.ps1 --create-db create_db.sql` 
+Enable verbose/debug output.
 
-2. Generate configuration files 
-
-Assuming MSSQL server is up and running, then we can build database for testing. It will be achieved with above command. Rebuild script `rebuild-db.ps1` and `create-db.sql` are part of this repository.
-This tool accepts any rebuld / create database scripts. It only passes them to powershell on windows side and execute them. 
-
-2. Generate test files
-
-In this step we generate test files based on sample input specified with `--test-script` , `--hammerdb-test-script` 
-
-We can run test directly without generating files, but this is best practice as it allows to check test configuration and if eventually change it locally. 
-
-` # python  mssqlwin.py -c mssql-configwin.yaml  --test-script hammerdb-sa-test.ps1 --hammerdb-test-script mssqls_tprocc_run.tcl --ssh-only --generate-only` 
-
-`--generate-only` hammerdb / powershell test scripts will be generated from `hammerdb-sa-test.ps1` and `mssqls_tprocc_run.tcl` and saved locally. 
-If `windows.build_schema_file` is set, the build schema TCL is updated with `database.warehouse_count`
-(`diset tpcc mssqls_count_ware <count>`) and saved locally as well. In generate-only mode, if
-`windows.create_db_sql` is provided, a sized `create_db.sql` is generated with:
-- data `SIZE` = `warehouse_count * 150MB`
-- log `SIZE` = `warehouse_count * 75MB`
-- log `MAXSIZE` = data size
-The generated `create_db.sql` is written to `.mssqltestfiles-generated/` as `create_db-wh<COUNT>.sql`.
-
-```
- ls -l .mssqltestfiles-generated/
-total 16
--rw-r--r--. 1 root root  346 Mar 25 05:11 hammerdb-sa-test_100.ps1
--rw-r--r--. 1 root root  344 Mar 25 05:11 hammerdb-sa-test_1.ps1
--rw-r--r--. 1 root root 1100 Mar 25 05:11 mssqls_tprocc_run100.tcl
--rw-r--r--. 1 root root 1098 Mar 25 05:11 mssqls_tprocc_run1.tcl
-
-```
-Test can be started with 
-
-`python  mssqlwin.py -c mssql-configwin.yaml` 
-
-it will pick up configuration files from `.mssqltestfiles-generated/` scp-copy them to test hosts and execute them. 
-
-Required Windows setup
-
-- Passwordless SSH access works for the Windows user (default: `Administrator`). Ensure that proper keys are copied / integrated to test machines. For KVM they can be injected on virtual machine creation, for OCP VM ssh keys can be passed to VMs using kubernetes secrets. 
-
-- HammerDB tools are preinstalled on the Windows image (default: `C:\tools\Hammerdb-4.12`).
-- Database has to be created and rebuild, one can use as example `rebuild-db.ps1`, `create_db.sql`, but any rebuild/created scripts will work, they are transfered to host(s) and executed. 
-
-Configuration (mssql-configwin.yaml)
-- `windows.hammerdb_path`: path to HammerDB tools on Windows.
-- `windows.test_script`: PowerShell script to execute for the test run.
-- `windows.result_dir`: directory on Windows where test outputs are written.
-- `windows.ssh_user`: SSH user for Windows hosts (default `Administrator`).
-- `windows.rebuilddb`: `true` to run `rebuild-db.ps1` before tests, `false` to skip.
-- `windows.rebuild_always`: `true` to rebuild before each user-count test run.
-- `windows.rebuild_timeout`: optional timeout in seconds for rebuild step (omit to disable).
-- `windows.rebuild_script`: optional path to a custom rebuild script on the host.
-- `windows.create_db_sql`: optional path to `create_db.sql` on the host (if provided locally, it is copied to the host).
-- `windows.hammerdb_test_script`: optional HammerDB test TCL path on the host.
-- `windows.build_schema_file`: optional build schema TCL path used for rebuild (local file is patched with `warehouse_count`).
-- `windows.mssql_pass`: Required MSSQL password override used to patch generated TCL files. This is password used to connect to MSSQL database. 
-- `windows.mssql_service_name`: optional service name override (defaults to auto-detecting MSSQLSERVER/MSSQL$*).
-- `database.warehouse_count`: optional warehouse count override for generated TCL files.
-- `database.mssql_total_iterations`: optional iteration override for generated TCL files.
-- CLI override: `mssqlwin.py --test-script <local.ps1>` copies the script to the host and runs it.
-- CLI override: `mssqlwin.py --rebuild-script <local.ps1>` copies the script to the host and runs it.
-- CLI override: `mssqlwin.py --hammerdb-test-script <local.tcl>` copies the test file to the host.
-- `windows.rebuild_only`: `true` to run rebuild only and exit.
-- CLI override: `mssqlwin.py --create-db <local.sql>` copies `create_db.sql` to the host.
-- CLI override: `mssqlwin.py --rebuild-always` rebuilds before each user count.
-- `--prepare-machine` formats the data disk (per `windows.disk_id`) and exits.
-- For script paths: if the value points to a local file (e.g., `./rebuild-db.ps1`), it is copied to the Windows host; if it points to a Windows path (e.g., `C:\tools\...`), it is assumed to already exist on the host.
-
-What the script does in Windows mode
-
-- Skips Linux package install, git clone, and MSSQL install.
-- Optionally runs `rebuild-db.ps1` (controlled by `windows.rebuilddb`) and streams output.
-- Generates per-user PowerShell/TCL scripts locally and copies them to each host.
-- Runs per-user tests in parallel across hosts.
-- Collects results back to the bastion from `windows.result_dir` and extracts them locally.
-- Cleans up result files in `windows.result_dir` on each host after a successful copy.
-- Copies `.mssqltestfiles-generated` into results as `mssqltestfiles-generated`.
-- When using virtctl, collects VM domain details under `vm-dump/<host>/` (dumpxml, dominfo, domstats, etc.).
-
-Environment variables passed to Windows scripts
-
-- `HAMMERDB_PATH`: base HammerDB directory on the host (rebuild step).
-- `CREATE_DB_SQL`: path to `create_db.sql` on the host (rebuild step).
-- `MSSQL_PASS`: MSSQL password used by rebuild script (if set).
-- `HAMMERDB_TEST_SCRIPT`: TCL test file path on the host (test step).
-- `BUILD_SCHEMA_TCL`: build schema TCL path on the host (rebuild step).
-- `HAMMERDB_WAREHOUSE_COUNT`: warehouse count (from config).
-- `HAMMERDB_TEST_DURATION`: test duration in minutes (from config).
-- `HAMMERDB_USER_COUNT`: user count for the current run.
-- `HAMMERDB_RESULT_DIR`: results directory on the host (test step).
-- `RESULT_DIR`: alias for `HAMMERDB_RESULT_DIR` (test step).
-
-Notes on test scripts
-
-- For `--test-script`, use `$env:HAMMERDB_RESULT_DIR` (or `$RESULT_DIR`) in the PowerShell template so output goes to `windows.result_dir`.
-- The generator replaces `mssqls_tprocc_run_$user_count.tcl` and `mssqls_tprocc_010vu_run1` with per-user values when creating per-user scripts.
-- You can set `database.mssql_pass` in the config to patch `diset connection mssqls_pass` in generated TCL files (Windows-specific override: `windows.mssql_pass`).
-- If `database.warehouse_count` is set, the generator updates the `diset tpcc mssqls_count_ware` line in the TCL template. If it is not set, the template value is left unchanged.
-- If `database.mssql_total_iterations` is set, the generator updates the `diset tpcc mssqls_total_iterations` line in the TCL template; otherwise it keeps the template default.
-- If a cached `create_db-wh<COUNT>.sql` exists in `.mssqltestfiles-generated`, `mssqlwin.py` uses it automatically and logs the selected path.
-
-Generated files cache
-- Generated per-user PowerShell/TCL files are written to `.mssqltestfiles-generated`.
-- If that directory already contains all required per-user files, you can run `mssqlwin.py` without `--test-script` or `--hammerdb-test-script`.
-- To refresh cached files, re-run with `--test-script` and `--hammerdb-test-script` (optionally `--generate-only`).
-- Empty strings in config (for example `windows.test_script: ""`) are treated as unset so CLI overrides still apply.
-- If `windows.test_script` or `windows.hammerdb_test_script` are unset, the script will use cached generated files when available.
-
-# Test results
-
-After test is done, results will be collected from test machines and copied to localhost, example is below where we see that results are collected per machine and per number of test users. 
-
-
-```
-# cd mssql-results-20260325-062555-1_20_40_50_60_80_100_users_running_parallel_on_2windows_kvm
-[root@perf-intel-3 mssql-results-20260325-062555-1_20_40_50_60_80_100_users_running_parallel_on_2windows_kvm]# tree .
-.
-├── 192.168.122.200
-│   ├── mssqls_tprocc_001vu_run1.json
-│   ├── mssqls_tprocc_001vu_run1.out
-│   ├── mssqls_tprocc_020vu_run1.json
-│   ├── mssqls_tprocc_020vu_run1.out
-│   ├── mssqls_tprocc_040vu_run1.json
-│   ├── mssqls_tprocc_040vu_run1.out
-│   ├── mssqls_tprocc_050vu_run1.json
-│   ├── mssqls_tprocc_050vu_run1.out
-│   ├── mssqls_tprocc_060vu_run1.json
-│   ├── mssqls_tprocc_060vu_run1.out
-│   ├── mssqls_tprocc_080vu_run1.json
-│   ├── mssqls_tprocc_080vu_run1.out
-│   ├── mssqls_tprocc_100vu_run1.json
-│   └── mssqls_tprocc_100vu_run1.out
-├── 192.168.122.201
-│   ├── mssqls_tprocc_001vu_run1.json
-│   ├── mssqls_tprocc_001vu_run1.out
-│   ├── mssqls_tprocc_020vu_run1.json
-│   ├── mssqls_tprocc_020vu_run1.out
-│   ├── mssqls_tprocc_040vu_run1.json
-│   ├── mssqls_tprocc_040vu_run1.out
-│   ├── mssqls_tprocc_050vu_run1.json
-│   ├── mssqls_tprocc_050vu_run1.out
-│   ├── mssqls_tprocc_060vu_run1.json
-│   ├── mssqls_tprocc_060vu_run1.out
-│   ├── mssqls_tprocc_080vu_run1.json
-│   ├── mssqls_tprocc_080vu_run1.out
-│   ├── mssqls_tprocc_100vu_run1.json
-│   └── mssqls_tprocc_100vu_run1.out
-└── mssqlwin-20260325-1_20_40_50_60_80_100_users_running_parallel_on_2windows_kvm.txt
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
+  --verbose
 ```
 
-In collected `.json` files we have TPM values for particular test 
+### `--dry-run`
+
+Validate configuration and show what would be done without executing.
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
+  --dry-run
 ```
-HAMMERDB RESULT
-[
-  "69C3E265AB0603E203438303",
-  "2026-03-25 06:25:57",
-  "1 Active Virtual Users configured",
-  "TEST RESULT : System achieved 29051 NOPM from 67250 SQL Server TPM"
-]
+
+### `--copy-results`
+
+Only copy results from hosts (skip rebuild and tests).
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
+  --copy-results
+```
+
+### `--ssh-only`
+
+Force plain SSH for all hosts (overrides the default `--virtctl-only`).
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/.ssh:/root/.ssh:ro \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
+  --ssh-only
+```
+
+### `--generate-only`
+
+Only generate per-user config files locally and exit (no SSH, no tests).
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/mssqlwin-results:/work/results \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
+  --generate-only
+```
+
+### `--rebuild-always`
+
+Rebuild the database before every user-count iteration (not just once).
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
+  --rebuild-always
+```
+
+### `--prepare-machine`
+
+Prepare Windows machines by formatting the data disk and exit (no tests).
+Note: a normal full run already prepares disks before rebuild/test.
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
+  --prepare-machine
+```
+
+## Usage Examples
+
+### Config file only
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+```
+
+### Env vars only (known-good CLI)
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -e HOST_PATTERN="winm-1" \
+  -e NAMESPACE="default" \
+  -e WAREHOUSE_COUNT=100 \
+  -e BUILD_USERS=10 \
+  -e USER_COUNT="1" \
+  -e TEST_DURATION=1 \
+  -e MSSQL_TOTAL_ITERATIONS=10000000 \
+  -e RAMPUP_TIME="1" \
+  -e MSSQL_PASS="YourSaPassword" \
+  -e DISK_ID="1" \
+  -e REBUILDDB=true \
+  -e REBUILD_ALWAYS=false \
+  -e TEST_ONLY=false \
+  -e DESCRIPTION="jenkins-mssql-test-new-db-test" \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+```
+
+### Dry run with verbose output
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
+  --dry-run --verbose
+```
+
+### Override template files at runtime
+
+Mount your own files over the baked-in defaults:
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v ./my-rebuild.ps1:/work/templates/rebuild-db.ps1 \
+  -v ./my-create-db.sql:/work/templates/create_db.sql \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+```
+
+### With oc login
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -e KUBEADMIN_PASSWORD="my-password" \
+  -e API_URL="https://api.mycluster.example.com:6443" \
+  -e HOST_PATTERN="winm-1" \
+  -e NAMESPACE="default" \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+```
+
+## SSH Key
+
+`virtctl ssh` uses keys under `/root/.ssh` inside the container. Preferred mount
+(matches the working CLI / Jenkins style):
+
+```bash
+-v /root/.ssh:/root/.ssh:ro
+```
+
+If you only mount a single key:
+
+```bash
+-v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro
+```
+
+If your key is at a non-standard path, mount it to the expected location:
+
+```bash
+-v /root/mno/my-key:/root/.ssh/id_rsa:ro
+```
+
+## Container Layout
 
 ```
-We work to create script to draw these results automatically. 
+/work/
+  mssqlwin.py
+  entrypoint.sh
+  examples/
+    mssql-configwin.yaml         (baked-in reference config)
+  mssql-configwin.yaml           (mounted by user, or generated from env)
+  templates/
+    hammerdb-sa-test.ps1
+    mssqls_tprocc_run.tcl
+    mssqls_tprocc_buildschema.tcl
+    rebuild-db.ps1
+    create_db.sql
+  results/                       (output directory)
+```
 
+## Notes
 
-
+- If a config file is mounted, it is used as-is. If not, env vars generate one. No merging.
+- `--privileged` is needed for the virtctl SSH proxy to work.
+- `/root/.kube/config` mount gives the container access to the OCP cluster.
+- Mount `/root/.ssh` (or at least `id_rsa`) so `virtctl ssh` can authenticate.
+- Prepare formats the Windows data disk via `C:\tools\setup\provision-data-disk.ps1`
+  using `DISK_ID`, then copies HammerDB tools to `D:` when present.
+- Template files baked into `/work/templates/` at build time are silently overridden when you mount a file to the same path.
+- `user_count` is space-separated (e.g. `"1 10 50 100"`), not comma-separated.
+- The entrypoint always prints the config before running, so you can see exactly what values are used.

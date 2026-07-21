@@ -1,20 +1,25 @@
-# Minimal MSSQL HammerDB Windows Configuration (mssqlwin.py)
+# MSSQL HammerDB Windows configuration for mssqlwin.py
+# Use with:
+#   podman run ... -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml ...
+# Or omit the mount and pass the same settings via env vars (see README-container.md).
 
-description: ""
+description: "mssqlwin-example"
 
 database:
   # Choose ONE of: hosts, host_pattern, host_labels, host_file
-  hosts: "vm1 vm2"        # Space-separated list of hosts
-  # host_pattern: "winvm-{1..3}"          # Expands to winvm-1 winvm-2 winvm-3
-  # host_labels: "app=mssql,role=primary" # OpenShift VM labels (virtctl)
-  # host_file: "mssql_hosts.txt"          # File with one host per line
-  namespace: "default"  # only used for virtctl mode 
-  warehouse_count: 50            # Number of warehouses for TPCC test
-  build_users: 50                # Virtual users for schema build step
-  mssql_total_iterations: 10000000              # Number of iterations to run
-  test_duration: 15              # Test duration in minutes
-  user_count: "1 10 20 50 100"   # Space-separated list of user counts to test, eg "1 2 4 8"
-  # mssql_pass: "Password123"       # MSSQL server password
+  # hosts: "winm-1 winm-2"
+  host_pattern: "winm-{1..2}"          # Expands to winm-1 winm-2 (or use a single name: "winm-1")
+  # host_labels: "app=mssql,role=primary"
+  # host_file: "mssql_hosts.txt"
+  namespace: "default"                  # Required for virtctl / OpenShift VMs
+
+  warehouse_count: 100                 # TPCC warehouses
+  build_users: 10                      # HammerDB build (schema load) virtual users
+  mssql_total_iterations: 10000000
+  test_duration: 15                    # Minutes
+  rampup_time: 1                       # Minutes
+  user_count: "1 10"                   # Space-separated run-user counts (NOT commas)
+  # mssql_pass: "YourSaPassword"       # SA password; omit for Windows auth if configured
 
 windows:
   hammerdb_path: "C:\\tools\\Hammerdb-4.12"
@@ -24,12 +29,25 @@ windows:
   result_dir: "C:\\tools\\Hammerdb-4.12\\results"
   rebuild_script: "C:\\tools\\Hammerdb-4.12\\rebuild-db.ps1"
   create_db_sql: "C:\\tools\\Hammerdb-4.12\\create_db.sql"
-  disk_id: "1"  # data disk id to format and use for testing
-  ssh_user: "Administrator"
-  # mssql_service_name: "MSSQLSERVER"  # Optional service name override
-  rebuilddb: true
-  # rebuild_timeout: 7200  # Optional timeout in seconds (omit to disable)
-  rebuild_always: false
-  rebuild_only: false
-  test_only: false
 
+  # Windows Get-Disk number for the data disk (OS is usually 0).
+  # Prepare runs: C:\tools\setup\provision-data-disk.ps1 -DiskID <disk_id>
+  disk_id: "1"
+  ssh_user: "Administrator"
+  # mssql_service_name: "MSSQLSERVER"
+
+  rebuilddb: true                      # Rebuild TPCC before tests
+  # rebuild_timeout: 7200              # Optional rebuild timeout (seconds)
+  rebuild_always: false                # Rebuild before every user_count iteration
+  rebuild_only: false                  # Only rebuild, then exit
+  test_only: false                     # Skip rebuild; run tests only
+
+# Timeouts (seconds). Uncomment/adjust as needed.
+timeouts:
+  default: 300                         # Default remote command timeout
+  scp: 300                             # File copy timeout
+  test: 7200                           # Per user_count test timeout
+  prepare: 1200                        # Disk prepare (provision-data-disk.ps1)
+  vm_lookup: 10                        # oc get vm/vmi
+  label_query: 30                      # Label-based VM discovery
+  oc_command: 15                       # Other oc/virtctl helper commands
