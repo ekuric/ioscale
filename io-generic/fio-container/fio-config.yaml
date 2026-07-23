@@ -69,6 +69,10 @@ fio:
   # Direct I/O (bypass page cache)
   direct_io: "1"
 
+  # Optional: FIO --fsync=N (call fsync after every N writes). Omit or leave empty to disable.
+  # Examples: "1" (every write), "32" (every 32 writes). Strongly impacts write IOPS/BW.
+  # fsync: "32"
+
   # Golden image support: set true when Linux VMs were built with imagecreator.sh
   # (fio, xfsprogs, util-linux pre-installed). Skips dnf/yum install; verifies only.
   # Default false = install packages via dnf if missing (legacy behavior).

@@ -38,6 +38,7 @@ windows:
     numjobs: 1
     iodepth: 16
     direct_io: 1
+    # fsync: 32   # optional: --fsync=N (omit to disable)
   
   # Windows Output Configuration
   output_win:

@@ -134,6 +134,7 @@ Env vars are used when no config file is mounted (Modes 2 and 3).
 | `NUMJOBS` | `4` | Number of parallel FIO jobs |
 | `IODEPTH` | `16` | I/O depth |
 | `DIRECT_IO` | `1` | Direct I/O (1=bypass page cache) |
+| `FSYNC` | -- | Optional FIO `--fsync=N` (empty/unset = disabled; e.g. `1` or `32`) |
 | `FIO_INSTALLED` | `false` | Golden Linux image with FIO baked in (`true` = skip package check/install; `false` = install if missing) |
 | `RATE_IOPS` | -- | Optional IOPS rate limit |
 | `OUTPUT_DIR` | `/root/fio-results` | Result directory on remote hosts |
@@ -165,6 +166,7 @@ Set `WIN_HOSTS` or `WIN_HOST_PATTERN` to activate the Windows section.
 | `WIN_NUMJOBS` | `8` | Number of parallel FIO jobs |
 | `WIN_IODEPTH` | `16` | I/O depth |
 | `WIN_DIRECT_IO` | `1` | Direct I/O (1=yes) |
+| `WIN_FSYNC` | -- | Optional FIO `--fsync=N` (empty/unset = disabled; e.g. `1` or `32`) |
 | `WIN_RATE_IOPS` | -- | Optional IOPS rate limit |
 | `WIN_OUTPUT_DIR` | `d:/fio/results` | Result directory on Windows hosts |
 | `WIN_OUTPUT_FORMAT` | `json+` | FIO output format |
@@ -688,5 +690,30 @@ When using env vars (no config file), set:
 - Mount your SSH private key to `/root/.ssh/id_rsa` so `virtctl ssh` can authenticate.
 - `--yes-i-mean-it` is passed automatically to skip the device formatting confirmation prompt.
 - Set `fio_installed: true` (or `FIO_INSTALLED=true`) when using golden Linux images with FIO pre-baked; leave `false` for stock cloud images.
+- Optional `FSYNC` / `WIN_FSYNC` (or YAML `fio.fsync` / `windows.fio_win.fsync`) adds FIO `--fsync=N`. Empty/unset disables it (default). Values like `1` or `32` call `fsync` after every N writes — this measures durable-write cost and typically lowers write IOPS/BW sharply. Applied to dataset pre-write and performance jobs when set.
 - The entrypoint always prints the config before running, so you can see exactly what values are used.
 - Example configs are available inside the container at `/work/examples/`.
+
+## Optional FIO fsync
+
+By default FIO runs **without** `--fsync` (throughput-oriented). To simulate commit-style durable writes:
+
+**Podman / env:**
+```bash
+-e FSYNC=32          # Linux → --fsync=32
+-e WIN_FSYNC=1       # Windows → --fsync=1
+```
+
+**YAML:**
+```yaml
+fio:
+  fsync: "32"        # Linux
+
+windows:
+  fio_win:
+    fsync: 1         # Windows
+```
+
+**Jenkins:** set parameter `FSYNC` or `WIN_FSYNC` (leave empty to disable).
+
+`0`, empty, `null`, or omitted → no `--fsync` flag.

@@ -127,6 +127,12 @@ else
             RATE_IOPS_LINE=$'\n'"  rate_iops: \"${RATE_IOPS}\""
         fi
 
+        FSYNC_LINE=""
+        if [[ -n "${FSYNC:-}" && "${FSYNC}" != "null" && "${FSYNC}" != "0" ]]; then
+            FSYNC_LINE=$'\n'"  fsync: \"${FSYNC}\""
+            echo "Linux FSYNC=${FSYNC} — FIO will use --fsync=${FSYNC}"
+        fi
+
         RUNTIME_LINE=""
         if [[ -n "${RUNTIME}" && "${RUNTIME}" != "null" && "${RUNTIME}" != "0" ]]; then
             RUNTIME_LINE=$'\n'"  runtime: \"${RUNTIME}\""
@@ -151,7 +157,7 @@ fio:
   numjobs: \"${NUMJOBS}\"
   iodepth: \"${IODEPTH}\"
   ioengine: \"${IOENGINE}\"
-  direct_io: \"${DIRECT_IO}\"
+  direct_io: \"${DIRECT_IO}\"${FSYNC_LINE}
   fio_installed: ${FIO_INSTALLED_VALUE}${RATE_IOPS_LINE}
 
 output:
@@ -203,6 +209,12 @@ output:
             WIN_RATE_IOPS_LINE=$'\n'"    rate_iops: ${WIN_RATE_IOPS}"
         fi
 
+        WIN_FSYNC_LINE=""
+        if [[ -n "${WIN_FSYNC:-}" && "${WIN_FSYNC}" != "null" && "${WIN_FSYNC}" != "0" ]]; then
+            WIN_FSYNC_LINE=$'\n'"    fsync: ${WIN_FSYNC}"
+            echo "Windows WIN_FSYNC=${WIN_FSYNC} — FIO will use --fsync=${WIN_FSYNC}"
+        fi
+
         WIN_RUNTIME_LINE=""
         if [[ -n "${WIN_RUNTIME}" && "${WIN_RUNTIME}" != "null" && "${WIN_RUNTIME}" != "0" ]]; then
             WIN_RUNTIME_LINE=$'\n'"    runtime: ${WIN_RUNTIME}"
@@ -225,7 +237,7 @@ ${WIN_DEVICE_BLOCK}    mount_point: '${WIN_MOUNT_POINT}'
     io_patterns: '${WIN_IO_PATTERNS}'
     numjobs: ${WIN_NUMJOBS}
     iodepth: ${WIN_IODEPTH}
-    direct_io: ${WIN_DIRECT_IO}${WIN_RATE_IOPS_LINE}
+    direct_io: ${WIN_DIRECT_IO}${WIN_FSYNC_LINE}${WIN_RATE_IOPS_LINE}
 
   output_win:
     directory: '${WIN_OUTPUT_DIR}'

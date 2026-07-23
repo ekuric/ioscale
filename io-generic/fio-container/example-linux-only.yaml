@@ -26,6 +26,7 @@ fio:
   numjobs: 1
   iodepth: 16
   direct_io: 1
+  # fsync: 32   # optional: --fsync=N (omit to disable)
   # rate_iops: 1000  # Optional rate limiting
 
 # Output Configuration

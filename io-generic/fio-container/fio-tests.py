@@ -112,6 +112,29 @@ def linux_fio_uses_threads(ioengine: str) -> bool:
     return ioengine.lower() in LINUX_THREAD_IOENGINES
 
 
+def normalize_optional_fsync(value) -> Optional[str]:
+    """Parse optional FIO fsync interval; None means do not pass --fsync."""
+    if value is None or value is False:
+        return None
+    s = str(value).strip()
+    if not s or s.lower() in ("null", "none", "off", "false", "no", "0"):
+        return None
+    try:
+        n = int(s)
+    except (TypeError, ValueError) as e:
+        raise FioConfigError(f"CRITICAL: fsync must be a positive integer (got {value!r})") from e
+    if n < 1:
+        return None
+    return str(n)
+
+
+def build_fio_fsync_option(fsync: Optional[str]) -> str:
+    """Return '--fsync=N ' for FIO cmdline, or '' when fsync is disabled."""
+    if not fsync:
+        return ""
+    return f"--fsync={fsync} "
+
+
 def build_linux_fio_thread_option(ioengine: str) -> str:
     """Return '--thread ' for async Linux engines, else empty string."""
     return "--thread " if linux_fio_uses_threads(ioengine) else ""
@@ -119,10 +142,11 @@ def build_linux_fio_thread_option(ioengine: str) -> str:
 
 def parse_optional_runtime(value) -> Optional[int]:
     """
-    Parse FIO runtime in seconds.
+    Parse FIO performance-test runtime in seconds.
 
-    Returns None when runtime is omitted/empty/null/non-positive — FIO then runs
-    size-based (writes/reads the configured --size and exits; no --time_based).
+    Returns None when runtime is omitted/empty/null/non-positive — tests then
+    run size-based (complete --size and exit; no --time_based). Dataset
+    pre-write always ignores runtime and is size-based.
     """
     if value is None:
         return None
@@ -144,7 +168,10 @@ def parse_optional_runtime(value) -> Optional[int]:
 
 
 def fio_runtime_flags(runtime) -> str:
-    """Return '--runtime=N --time_based=1 ' or '' for size-complete mode."""
+    """Return '--runtime=N --time_based=1 ' for FIO tests, or '' when omitted.
+
+    Used only for performance tests. Dataset pre-write never includes these flags.
+    """
     secs = parse_optional_runtime(runtime)
     if secs is None:
         return ""
@@ -180,6 +207,7 @@ class FioTestConfig:
         self.iodepth = 1
         self.ioengine = DEFAULT_LINUX_IOENGINE
         self.direct_io = "1"
+        self.fsync = None  # Optional: FIO --fsync=N (None = omit)
         self.rate_iops = None
         self.fio_installed = False
         self.output_dir = None
@@ -202,6 +230,7 @@ class FioTestConfig:
         self.windows_numjobs = 1
         self.windows_iodepth = 1
         self.windows_direct_io = "1"
+        self.windows_fsync = None  # Optional: FIO --fsync=N (None = omit)
         self.windows_rate_iops = None
         self.windows_output_dir = None
         self.windows_output_format = None
@@ -1639,6 +1668,7 @@ class ConfigLoader:
             self.config.iodepth = int(fio.get('iodepth', 1))
             self.config.ioengine = str(fio.get('ioengine', DEFAULT_LINUX_IOENGINE)).strip() or DEFAULT_LINUX_IOENGINE
             self.config.direct_io = str(fio.get('direct_io', 1))
+            self.config.fsync = normalize_optional_fsync(fio.get('fsync'))
             self.config.rate_iops = fio.get('rate_iops')
             if self.config.rate_iops == "null" or not self.config.rate_iops:
                 self.config.rate_iops = None
@@ -1795,6 +1825,7 @@ class ConfigLoader:
                     self.config.windows_numjobs = int(fio_win.get('numjobs', 1))
                     self.config.windows_iodepth = int(fio_win.get('iodepth', 1))
                     self.config.windows_direct_io = str(fio_win.get('direct_io', 1))
+                    self.config.windows_fsync = normalize_optional_fsync(fio_win.get('fsync'))
                     self.config.windows_rate_iops = fio_win.get('rate_iops')
                     if self.config.windows_rate_iops == "null" or not self.config.windows_rate_iops:
                         self.config.windows_rate_iops = None
@@ -2163,15 +2194,19 @@ def main():
         logger.info(f"FIO directory (Windows): {config.windows_fio_dir}")
     logger.info(f"Persistent mount: {'ENABLED (will create /etc/fstab entries)' if config.persistent_mount else 'DISABLED (temporary mounts only)'}")
     logger.info(f"Test size: {config.test_size}")
+    logger.info(
+        "Dataset write: always size-based (full --size, no --runtime); "
+        "runtime below applies to FIO performance tests only"
+    )
     if config.test_runtime:
-        logger.info(f"Runtime (Linux): {config.test_runtime}s")
+        logger.info(f"Test runtime (Linux): {config.test_runtime}s (--time_based)")
     elif linux_hosts:
-        logger.info("Runtime (Linux): omitted (size-based — complete --size then stop)")
+        logger.info("Test runtime (Linux): omitted (size-based — complete --size then stop)")
     if windows_hosts:
         if config.windows_test_runtime:
-            logger.info(f"Runtime (Windows): {config.windows_test_runtime}s")
+            logger.info(f"Test runtime (Windows): {config.windows_test_runtime}s (--time_based)")
         else:
-            logger.info("Runtime (Windows): omitted (size-based — complete --size then stop)")
+            logger.info("Test runtime (Windows): omitted (size-based — complete --size then stop)")
     logger.info(f"Block sizes: {' '.join(config.block_sizes)}")
     logger.info(f"I/O patterns: {' '.join(config.io_patterns)}")
     if linux_hosts:
@@ -2180,6 +2215,15 @@ def main():
             f"{'pre-installed (skip package check/install)' if config.fio_installed else 'install via dnf if missing'}"
         )
         logger.info(f"IO engine (Linux): {config.ioengine}")
+        logger.info(
+            f"fsync (Linux): {config.fsync} (--fsync={config.fsync})"
+            if config.fsync else "fsync (Linux): disabled (no --fsync)"
+        )
+    if windows_hosts:
+        logger.info(
+            f"fsync (Windows): {config.windows_fsync} (--fsync={config.windows_fsync})"
+            if config.windows_fsync else "fsync (Windows): disabled (no --fsync)"
+        )
     
     if config.migrate_workloads:
         if config.migrate_interval > 0:
@@ -2897,15 +2941,11 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
 
 
 def _dataset_hard_timeout_seconds(config: FioTestConfig) -> int:
-    """Legacy helper (unused): previously max wait before kill/retry."""
+    """Max wait hint for size-based dataset write (no --runtime on dataset)."""
     if config.timeout_dataset_hard is not None:
         return int(config.timeout_dataset_hard)
-    linux_runtime = parse_optional_runtime(config.test_runtime) or 0
-    windows_runtime = parse_optional_runtime(config.windows_test_runtime) or 0
-    runtime = max(linux_runtime, windows_runtime)
-    if runtime <= 0:
-        return max(int(config.timeout_dataset_stall) * 3, 3600) + int(config.timeout_dataset_buffer)
-    return runtime * 2 + int(config.timeout_dataset_buffer)
+    # Dataset is always size-based; do not derive wait from test runtime.
+    return max(int(config.timeout_dataset_stall) * 3, 3600) + int(config.timeout_dataset_buffer)
 
 
 def _parse_fio_size_to_bytes(size_str: Optional[str]) -> Optional[int]:
@@ -2960,7 +3000,8 @@ def _dataset_files_full_size(nbytes: int, expected_bytes: Optional[int]) -> bool
 
 
 def _linux_dataset_fio_cmd(config: FioTestConfig) -> str:
-    # Omit --runtime/--time_based when runtime unset: FIO exits after writing --size (100%).
+    # Dataset pre-write is always size-based: write full --size then exit.
+    # Configured --runtime applies only to the later FIO performance tests.
     return (
         f"cd {config.output_dir} && fio "
         f"--ioengine={config.ioengine} "
@@ -2969,8 +3010,8 @@ def _linux_dataset_fio_cmd(config: FioTestConfig) -> str:
         f"--size={config.test_size} "
         f"--rw=randwrite "
         f"--bs=4k "
-        f"{fio_runtime_flags(config.test_runtime)}"
         f"--direct={config.direct_io} "
+        f"{build_fio_fsync_option(config.fsync)}"
         f"--numjobs={config.numjobs} "
         f"--iodepth={config.iodepth} "
         f"{build_linux_fio_thread_option(config.ioengine)}"
@@ -2981,6 +3022,7 @@ def _linux_dataset_fio_cmd(config: FioTestConfig) -> str:
 
 
 def _windows_dataset_fio_cmd(config: FioTestConfig) -> str:
+    # Dataset pre-write is always size-based (no --runtime / --time_based).
     fio_dir = normalize_windows_path(config.windows_fio_dir)
     mount_point_win = normalize_windows_path(config.windows_mount_point)
     output_dir_win = normalize_windows_path(config.windows_output_dir)
@@ -2997,8 +3039,8 @@ def _windows_dataset_fio_cmd(config: FioTestConfig) -> str:
         f"--size={config.windows_test_size} "
         f"--rw=randwrite "
         f"--bs=4k "
-        f"{fio_runtime_flags(config.windows_test_runtime)}"
         f"--direct={config.windows_direct_io} "
+        f"{build_fio_fsync_option(config.windows_fsync)}"
         f"--numjobs={config.windows_numjobs} "
         f"--iodepth={config.windows_iodepth} "
         f"--output-format={config.windows_output_format} "
@@ -3150,12 +3192,10 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
     """
     Write initial test dataset to all hosts.
 
-    Runs FIO in randwrite mode to pre-write test data on all VMs.
-    Waits until write_dataset.json is written. Stall recovery only applies
-    when FIO is still running with incomplete data files (after --runtime when
-    time-based; immediately after stall_limit when size-based / no runtime).
-    Full-size data + still-running FIO is treated as healthy for time_based;
-    size-based FIO should exit once --size is written.
+    Always size-based (no --runtime / --time_based): FIO writes the full --size
+    then exits. Configured runtime applies only to later performance tests.
+    Stall recovery applies when FIO is still running with incomplete data and
+    no byte growth for stall_limit seconds.
     """
     logger.info("Writing initial test dataset...")
 
@@ -3164,37 +3204,22 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
     stall_limit = int(config.timeout_dataset_stall)
     max_attempts = 1 + int(config.dataset_write_retries)
     check_interval = config.timeout_check_interval
-    linux_runtime = parse_optional_runtime(config.test_runtime) or 0
-    windows_runtime = parse_optional_runtime(config.windows_test_runtime) or 0
-    size_based_dataset = (
-        (not linux_hosts or linux_runtime == 0)
-        and (not windows_hosts or windows_runtime == 0)
-    )
-    # time_based: wait until past configured runtime before stall recovery.
-    # size-based: stall recovery can apply as soon as growth stops (gate=0).
-    expected_runtime = 0 if size_based_dataset else max(linux_runtime, windows_runtime, 60)
+    # Dataset write never uses --runtime; stall recovery can apply immediately
+    # once growth stops (gate=0).
+    expected_runtime = 0
 
-    if size_based_dataset:
-        logger.info(
-            "Dataset write mode: size-based (runtime omitted) — "
-            "FIO exits when --size is fully written (no --time_based)"
-        )
-        logger.info(
-            f"Dataset write policy: no hard timeout; "
-            f"stall_limit={stall_limit}s if data incomplete and no byte growth; "
-            f"full-size data + running FIO = wait for JSON; "
-            f"max_attempts={max_attempts} "
-            f"(1 start + {config.dataset_write_retries} restart)"
-        )
-    else:
-        logger.info(
-            f"Dataset write policy: no hard timeout; "
-            f"stall_limit={stall_limit}s (only if data incomplete after "
-            f"expected_runtime={expected_runtime}s); "
-            f"full-size data + running FIO = wait for JSON; "
-            f"max_attempts={max_attempts} "
-            f"(1 start + {config.dataset_write_retries} restart)"
-        )
+    logger.info(
+        "Dataset write mode: always size-based — "
+        "FIO exits when --size is fully written (no --runtime / --time_based); "
+        "configured runtime applies only to FIO performance tests"
+    )
+    logger.info(
+        f"Dataset write policy: no hard timeout; "
+        f"stall_limit={stall_limit}s if data incomplete and no byte growth; "
+        f"full-size data + running FIO = wait for JSON; "
+        f"max_attempts={max_attempts} "
+        f"(1 start + {config.dataset_write_retries} restart)"
+    )
 
     linux_cmd = _linux_dataset_fio_cmd(config) if linux_hosts else None
     windows_cmd = _windows_dataset_fio_cmd(config) if windows_hosts else None
@@ -3508,23 +3533,12 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
 
             if status == "RUNNING":
                 failed_streak.pop(host, None)
-                host_runtime = (
-                    parse_optional_runtime(config.windows_test_runtime) or 0
-                    if executor.is_windows_host(host)
-                    else parse_optional_runtime(config.test_runtime) or 0
-                )
-                stall_gate = 0 if host_runtime <= 0 else expected_runtime
-                # time_based keeps FIO alive for full --runtime even after files are full;
-                # size-based should exit once --size is written — wait for JSON either way.
+                # Dataset write is always size-based: FIO should exit once --size
+                # is written. Wait for JSON when data is full; stall-recover only
+                # when incomplete and no progress.
+                stall_gate = expected_runtime  # always 0 for dataset
                 if data_full:
-                    if host_runtime > 0:
-                        if attempt_age > host_runtime and int(attempt_age) % 60 < check_interval:
-                            logger.info(
-                                f"{host}: dataset files full-size "
-                                f"({job.get('last_bytes', 0)} bytes) and FIO still running "
-                                f"past runtime — waiting for write_dataset.json (not killing)"
-                            )
-                    elif int(attempt_age) % 60 < check_interval:
+                    if int(attempt_age) % 60 < check_interval:
                         logger.info(
                             f"{host}: dataset files full-size "
                             f"({job.get('last_bytes', 0)} bytes); size-based FIO still running — "
@@ -3534,13 +3548,9 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
                 if attempt_age > stall_gate and stall_age > stall_limit:
                     recover_hosts.append((
                         host,
-                        f"no progress for {int(stall_age)}s > {stall_limit}s"
-                        + (
-                            f" after runtime"
-                            if host_runtime > 0
-                            else " (size-based, incomplete)"
-                        )
-                        + f" (data incomplete: {job.get('last_bytes', 0)}/{expected_bytes or '?'} bytes)"
+                        f"no progress for {int(stall_age)}s > {stall_limit}s "
+                        f"(size-based, incomplete) "
+                        f"(data incomplete: {job.get('last_bytes', 0)}/{expected_bytes or '?'} bytes)"
                     ))
                 continue
 
@@ -3920,6 +3930,7 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
                     f"--bs={bs} "
                     f"{fio_runtime_flags(config.test_runtime)}"
                     f"--direct={config.direct_io} "
+                    f"{build_fio_fsync_option(config.fsync)}"
                     f"--numjobs={config.numjobs} "
                     f"--iodepth={config.iodepth} "
                     f"{build_linux_fio_thread_option(config.ioengine)}"
@@ -3971,6 +3982,7 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
                     f"--bs={bs} "
                     f"{fio_runtime_flags(config.windows_test_runtime)}"
                     f"--direct={config.windows_direct_io} "
+                    f"{build_fio_fsync_option(config.windows_fsync)}"
                     f"--numjobs={config.windows_numjobs} "
                     f"--iodepth={config.windows_iodepth} "
                     f"--output-format={config.windows_output_format} "
@@ -4486,6 +4498,7 @@ def generate_combined_results(results_dir: str, config: FioTestConfig) -> None:
                     "numjobs": config.windows_numjobs if is_windows else config.numjobs,
                     "iodepth": config.windows_iodepth if is_windows else config.iodepth,
                     "ioengine": "windowsaio" if is_windows else config.ioengine,
+                    "fsync": config.windows_fsync if is_windows else config.fsync,
                     "test_size": config.windows_test_size if is_windows else config.test_size,
                     "runtime": config.windows_test_runtime if is_windows else config.test_runtime,
                     "fio_results": fio_data,

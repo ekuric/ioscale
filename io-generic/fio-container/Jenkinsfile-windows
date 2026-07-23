@@ -41,6 +41,11 @@ pipeline {
             choices: ['1', '0'],
             description: 'Direct I/O (1=yes, 0=no)'
         )
+        string(
+            name: 'WIN_FSYNC',
+            defaultValue: '',
+            description: 'FIO fsync interval (empty=disabled; e.g. 1 or 32 → --fsync=N after every N writes)'
+        )
         string(name: 'WIN_RATE_IOPS',     defaultValue: '',                   description: 'IOPS rate limit (empty = unlimited)')
 
         string(name: 'INTERVAL',           defaultValue: '30',                  description: 'Seconds between failed ssh command attempts')
@@ -146,6 +151,7 @@ pipeline {
                               -e WIN_NUMJOBS=${params.WIN_NUMJOBS} \
                               -e WIN_IODEPTH=${params.WIN_IODEPTH} \
                               -e WIN_DIRECT_IO=${params.WIN_DIRECT_IO} \
+                              -e WIN_FSYNC="${params.WIN_FSYNC}" \
                               -e WIN_RATE_IOPS="${params.WIN_RATE_IOPS}" \
                               -e MIGRATE_WORKLOADS="${params.MIGRATE_WORKLOADS}" \
                               -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
@@ -203,7 +209,7 @@ pipeline {
             echo "Hosts: ${params.WIN_HOST_PATTERN}"
             echo "Block sizes: ${params.WIN_BLOCK_SIZES}"
             echo "I/O patterns: ${params.WIN_IO_PATTERNS}"
-            echo "Numjobs: ${params.WIN_NUMJOBS}, Iodepth: ${params.WIN_IODEPTH}"
+            echo "Numjobs: ${params.WIN_NUMJOBS}, Iodepth: ${params.WIN_IODEPTH}, Fsync: ${params.WIN_FSYNC ?: '(disabled)'}"
         }
     }
 }

@@ -41,6 +41,11 @@ pipeline {
             choices: ['1', '0'],
             description: 'Direct I/O (1=bypass page cache, 0=use cache)'
         )
+        string(
+            name: 'FSYNC',
+            defaultValue: '',
+            description: 'FIO fsync interval (empty=disabled; e.g. 1 or 32 → --fsync=N after every N writes)'
+        )
         choice(
             name: 'FIO_INSTALLED',
             choices: ['false', 'true'],
@@ -141,6 +146,7 @@ pipeline {
                               -e NUMJOBS=${params.NUMJOBS} \
                               -e IODEPTH=${params.IODEPTH} \
                               -e DIRECT_IO=${params.DIRECT_IO} \
+                              -e FSYNC="${params.FSYNC}" \
                               -e FIO_INSTALLED="${params.FIO_INSTALLED}" \
                               -e RATE_IOPS="${params.RATE_IOPS}" \
                               -e MIGRATE_WORKLOADS="${params.MIGRATE_WORKLOADS}" \
@@ -200,7 +206,7 @@ pipeline {
             echo "Hosts: ${params.HOST_PATTERN}"
             echo "Block sizes: ${params.BLOCK_SIZES}"
             echo "I/O patterns: ${params.IO_PATTERNS}"
-            echo "Numjobs: ${params.NUMJOBS}, Iodepth: ${params.IODEPTH}"
+            echo "Numjobs: ${params.NUMJOBS}, Iodepth: ${params.IODEPTH}, Fsync: ${params.FSYNC ?: '(disabled)'}"
         }
     }
 }
