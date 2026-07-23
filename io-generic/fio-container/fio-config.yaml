@@ -47,7 +47,8 @@ fio:
   # Test file size (e.g., "1G", "500M", "10G")
   test_size: "1G"
   
-  # Test runtime in seconds
+  # Test runtime in seconds. Omit (or set null/empty) for size-based mode:
+  # FIO writes/reads the full --size then exits (no --time_based).
   runtime: "120"
   
   # Block sizes to test (space-separated)
@@ -58,12 +59,20 @@ fio:
   
   # Number of parallel jobs
   numjobs: "1"
+
+  # Linux I/O engine (libaio recommended with numjobs>1 and --direct=1)
+  ioengine: "libaio"
   
   # I/O depth
   iodepth: "16"
   
   # Direct I/O (bypass page cache)
   direct_io: "1"
+
+  # Golden image support: set true when Linux VMs were built with imagecreator.sh
+  # (fio, xfsprogs, util-linux pre-installed). Skips dnf/yum install; verifies only.
+  # Default false = install packages via dnf if missing (legacy behavior).
+  fio_installed: false
 
   # rate_iops  - uncomment if there need to impose rate iops
   # rate_iops: "1000" 
@@ -124,7 +133,10 @@ migrate:
 #   runtime_buffer: 300   # Extra seconds added to FIO runtime for test timeout
 #   nohup_setup: 60       # Setting up nohup background FIO on remote host
 #   scp: 300              # File copy (scp/virtctl scp) timeout
-#   dataset_buffer: 60    # Extra seconds for dataset pre-write to finish
+#   dataset_buffer: 60    # Extra seconds folded into default dataset hard timeout
+#   dataset_stall: 600    # No dataset byte growth for this long => hung (kill + one restart)
+#   dataset_hard: 660     # Optional absolute max wait per dataset attempt (default: 2*runtime + dataset_buffer)
+#   dataset_write_retries: 1  # One-shot restart of dataset write after kill (per host)
 #   check_interval: 10    # Polling interval for background tasks
 #   migration: 600        # VM live migration timeout per host
 
@@ -162,7 +174,7 @@ windows:
     #root_dir: "d:/"    # Alternative: root directory (will use root_dir/fio if run_dir not set)
     # Test file size
     test_size: "10GB"
-    # Test runtime in seconds
+    # Test runtime in seconds. Omit (or null) for size-based: full --size then stop.
     runtime: 600
     # Block sizes to test (space-separated)
     block_sizes: "4k 8k 64k 128k 1024k 4096k"
@@ -214,6 +226,7 @@ windows:
 # - Use root@vmi for Linux hosts
 # - Use Administrator@vmi for Windows hosts
 # - Skip package installation for Windows hosts (assumes FIO is pre-installed)
+# - When fio_installed: true, skip dnf/yum on Linux hosts (golden image)
 # - Use appropriate commands (bash for Linux, PowerShell for Windows)
 # - Use windowsaio ioengine and fio.exe for Windows
-# - Use standard FIO for Linux
+# - Use configurable Linux ioengine (default libaio) with --thread for async engines

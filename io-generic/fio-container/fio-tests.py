@@ -45,10 +45,16 @@ RUNTIME_BUFFER = 300            # Extra seconds added to FIO runtime for test ti
 NOHUP_SETUP_TIMEOUT = 60       # Setting up nohup background FIO on remote host
 SCP_TIMEOUT = 300               # File copy (scp/virtctl scp) timeout
 DATASET_WRITE_BUFFER = 60      # Extra seconds for FIO dataset pre-write to finish
+DATASET_STALL_SECONDS = 600     # No dataset byte growth for this long => treat as hung
+DATASET_WRITE_RETRIES = 1       # One-shot restart of dataset write after kill (per host)
 CHECK_INTERVAL = 10             # Polling interval when waiting for background tasks
 MIGRATION_TIMEOUT = 600         # VM live migration timeout per host
 DEFAULT_MAX_WORKERS = 50        # Default thread pool max workers
-VM_RESTART_WAIT = 60            # Seconds to wait for VM restart after virtctl restart
+VM_RESTART_WAIT = 300           # Seconds to wait for VM restart after virtctl restart (5 min; many VMs need longer)
+UNREACHABLE_GRACE_WAIT = 180    # Wait/retry this long before virtctl restart (prep + FIO tests)
+WINDOWS_PREP_RESTART_AFTER_ATTEMPT = 5  # Windows prep: restart VM after this many failed attempts
+DEFAULT_LINUX_IOENGINE = "libaio"
+LINUX_THREAD_IOENGINES = frozenset({"libaio", "io_uring", "posixaio"})
 
 # Import required dependencies
 try:
@@ -84,6 +90,67 @@ def normalize_windows_path(path: str) -> str:
     return normalized
 
 
+def parse_bool(value, default: bool = False) -> bool:
+    """Parse YAML/config booleans from bool, int, or string values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("true", "1", "yes", "on"):
+            return True
+        if normalized in ("false", "0", "no", "off", "", "null"):
+            return False
+    return bool(value)
+
+
+def linux_fio_uses_threads(ioengine: str) -> bool:
+    """True when Linux FIO ioengine needs --thread for parallel numjobs."""
+    return ioengine.lower() in LINUX_THREAD_IOENGINES
+
+
+def build_linux_fio_thread_option(ioengine: str) -> str:
+    """Return '--thread ' for async Linux engines, else empty string."""
+    return "--thread " if linux_fio_uses_threads(ioengine) else ""
+
+
+def parse_optional_runtime(value) -> Optional[int]:
+    """
+    Parse FIO runtime in seconds.
+
+    Returns None when runtime is omitted/empty/null/non-positive — FIO then runs
+    size-based (writes/reads the configured --size and exits; no --time_based).
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text.lower() in ("null", "none", "false"):
+            return None
+        try:
+            value = int(text)
+        except ValueError:
+            return None
+    try:
+        secs = int(value)
+    except (TypeError, ValueError):
+        return None
+    return secs if secs > 0 else None
+
+
+def fio_runtime_flags(runtime) -> str:
+    """Return '--runtime=N --time_based=1 ' or '' for size-complete mode."""
+    secs = parse_optional_runtime(runtime)
+    if secs is None:
+        return ""
+    return f"--runtime={secs} --time_based=1 "
+
+
 class FioTestConfig:
     """Configuration class for FIO tests"""
     
@@ -111,8 +178,10 @@ class FioTestConfig:
         self.io_patterns = []
         self.numjobs = 1
         self.iodepth = 1
+        self.ioengine = DEFAULT_LINUX_IOENGINE
         self.direct_io = "1"
         self.rate_iops = None
+        self.fio_installed = False
         self.output_dir = None
         self.output_format = None
         self.description = ""
@@ -144,6 +213,9 @@ class FioTestConfig:
         self.timeout_nohup_setup = NOHUP_SETUP_TIMEOUT
         self.timeout_scp = SCP_TIMEOUT
         self.timeout_dataset_buffer = DATASET_WRITE_BUFFER
+        self.timeout_dataset_stall = DATASET_STALL_SECONDS
+        self.timeout_dataset_hard = None  # computed from runtime if unset
+        self.dataset_write_retries = DATASET_WRITE_RETRIES
         self.timeout_check_interval = CHECK_INTERVAL
         self.timeout_migration = MIGRATION_TIMEOUT
         self.monitor_vm = False
@@ -541,6 +613,249 @@ class CommandExecutor:
         """
         return host in self.config.windows_hosts
 
+    @staticmethod
+    def _is_host_unreachable(stderr: str = "", stdout: str = "", timed_out: bool = False) -> bool:
+        """Return True when failure looks like SSH/virtctl connectivity, not remote command logic.
+
+        Important: Windows PowerShell often writes CategoryInfo / FullyQualifiedErrorId to
+        stderr (containing the word "Error") while SSH is fine. Do not treat generic
+        "error"/"failed"/"virtctl" tokens as connectivity loss.
+        """
+        combined = f"{stderr or ''}\n{stdout or ''}".lower()
+        # Explicit pause is connectivity/availability loss even if remote stdout exists
+        if (
+            "vmi is paused" in combined
+            or "virtualmachineinstance is paused" in combined
+            or ("virtualmachineinstance" in combined and "paused" in combined)
+        ):
+            return True
+        if timed_out:
+            # Timeout alone is ambiguous (slow remote cmd vs hung SSH). Callers that
+            # may restart VMs must confirm with _probe_ssh_reachable().
+            return True
+        if stdout and stdout.strip():
+            # Remote command produced output: almost always a guest-side failure
+            return False
+        connectivity_markers = (
+            "connection timed out",
+            "dial tcp",
+            "connection refused",
+            "no route to host",
+            "unable to connect",
+            "i/o timeout",
+            "ssh: connect to host",
+            "network is unreachable",
+            "operation timed out",
+            "error dialing",
+            "failed to connect",
+            "handshake failed",
+            "connection reset",
+            "broken pipe",
+            "waiting for vmi",
+            "vmi is not running",
+            "cannot establish",
+            "could not resolve hostname",
+            "name or service not known",
+            "no such host",
+            "permission denied (publickey",
+            "missing or incomplete configuration",
+            "dial tcp",
+            "connect: connection refused",
+        )
+        return any(marker in combined for marker in connectivity_markers)
+
+    def _probe_ssh_reachable(self, host: str) -> bool:
+        """Quick SSH check used to avoid false unreachable / VM restart decisions."""
+        probe_cmd = (
+            "powershell -Command \"Write-Output ok\""
+            if self.is_windows_host(host)
+            else "echo ok"
+        )
+        ok, out = self.execute_command(
+            host,
+            probe_cmd,
+            "SSH reachability probe",
+            max_retries=1,
+            retry_interval=1,
+            timeout=min(20, self.config.timeout_connectivity * 2 or 20),
+            quiet=True,
+            restart_vm_on_unreachable=False,
+        )
+        return bool(ok and "ok" in (out or "").lower())
+
+    @staticmethod
+    def _is_vmi_paused_message(stderr: str = "", stdout: str = "") -> bool:
+        """True when virtctl/oc output indicates the VMI is paused."""
+        combined = f"{stderr or ''}\n{stdout or ''}".lower()
+        return "vmi is paused" in combined or (
+            "virtualmachineinstance" in combined and "paused" in combined
+        )
+
+    def is_vmi_paused(self, host: str) -> bool:
+        """Query the cluster for VMI Paused=True (KubeVirt pause condition)."""
+        if not self.config.namespace or self.config.namespace == "N/A":
+            return False
+        try:
+            result = subprocess.run(
+                [
+                    "oc", "get", "vmi", host, "-n", self.config.namespace,
+                    "-o",
+                    r'jsonpath={range .status.conditions[*]}{.type}={.status}{"\n"}{end}',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout_connectivity,
+            )
+            if result.returncode != 0:
+                # Fall back to probing via SSH error text
+                ok, out = self.execute_command(
+                    host, "echo ok", "Probe host after possible pause",
+                    max_retries=1, retry_interval=1, timeout=15, quiet=True,
+                )
+                if not ok and self._is_vmi_paused_message(out or ""):
+                    return True
+                return False
+            for line in (result.stdout or "").splitlines():
+                if line.strip().lower() in ("paused=true", "paused=true\r"):
+                    return True
+            return "Paused=True" in (result.stdout or "")
+        except Exception as e:
+            logger.debug(f"{host}: Failed to query VMI pause state: {e}")
+            return False
+
+    def wait_for_host_accessible(self, host: str, max_wait: Optional[int] = None) -> bool:
+        """Poll until a simple remote command succeeds (post-restart readiness)."""
+        deadline = time.time() + (max_wait if max_wait is not None else VM_RESTART_WAIT)
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            ok, out = self.execute_command(
+                host, "echo ready", "Wait for host accessible",
+                max_retries=1, retry_interval=1, timeout=15, quiet=True,
+            )
+            if ok and "ready" in (out or ""):
+                logger.info(f"{host}: Host accessible again (probe attempt {attempt})")
+                return True
+            time.sleep(10)
+        logger.error(f"{host}: Host not accessible within wait window after restart")
+        return False
+
+    @staticmethod
+    def _is_windows_drive_missing(stderr: str = "", stdout: str = "") -> bool:
+        """True when PowerShell reports the target drive letter is missing (e.g. D:)."""
+        combined = f"{stderr or ''}\n{stdout or ''}".lower()
+        return (
+            "cannot find drive" in combined
+            or "drivenotfound" in combined
+            or "drive with the name" in combined
+        )
+
+    def _reprovision_windows_data_disk(self, host: str) -> bool:
+        """Re-run provision-data-disk.ps1 so the Windows data drive (e.g. D:) exists."""
+        device = "1"
+        if getattr(self.config, "windows_storage_devices", None):
+            device = self.config.windows_storage_devices.get(host, "1")
+        cmd = f"powershell c:\\tools\\setup\\provision-data-disk.ps1 -DiskID {device}"
+        logger.info(f"{host}: Re-provisioning Windows data disk {device} after VM restart...")
+        success, output = self.execute_command(
+            host, cmd, f"Re-provisioning Windows storage on {host}",
+            max_retries=3, retry_interval=30, timeout=self.config.timeout_default,
+            quiet=False, restart_vm_on_unreachable=False,
+        )
+        if success:
+            logger.info(f"{host}: Windows data disk re-provisioned successfully")
+        else:
+            logger.error(f"{host}: Windows data disk re-provision failed: {output}")
+        return success
+
+    def restart_vm(self, host: str, remount: bool = True, reason: Optional[str] = None,
+                   wait_accessible: bool = False) -> bool:
+        """Restart a KubeVirt VM via virtctl and wait for it to come back.
+
+        Args:
+            host: VM hostname to restart.
+            remount: If True (default), remount the test device after restart.
+                     Set to False when the caller intends to format the device.
+            reason: Optional log reason (defaults to unreachable/prep message).
+            wait_accessible: If True, poll SSH until the guest answers after the
+                             fixed restart wait (used during FIO test recovery).
+        """
+        if self.config.use_virtctl is False or not self.is_vm_host(host):
+            return False
+        if not self.config.namespace or self.config.namespace == "N/A":
+            logger.warning(f"{host}: Cannot restart VM - namespace is not set")
+            return False
+        try:
+            why = reason or "Host unreachable during prep/validation"
+            logger.warning(f"{host}: {why} - restarting VM...")
+            restart_result = subprocess.run(
+                ["virtctl", "-n", self.config.namespace, "restart", host],
+                capture_output=True,
+                text=True,
+                timeout=self.config.timeout_connectivity,
+            )
+            if restart_result.returncode == 0:
+                logger.info(f"{host}: VM restart initiated, waiting {VM_RESTART_WAIT}s...")
+                time.sleep(VM_RESTART_WAIT)
+                if wait_accessible and not self.wait_for_host_accessible(host):
+                    return False
+                if remount and not self.is_windows_host(host) and host in self.config.storage_devices:
+                    self._remount_after_restart(host)
+                return True
+            logger.error(f"{host}: virtctl restart failed: {restart_result.stderr}")
+            return False
+        except Exception as e:
+            logger.error(f"{host}: Failed to restart VM: {e}")
+            return False
+
+    def _remount_after_restart(self, host: str) -> None:
+        """Remount the test device after a VM restart.
+
+        Mounts are lost on reboot when /etc/fstab has no entry for the
+        test device.  This recreates the mount-point directory and
+        remounts the device so the calling retry loop finds storage ready.
+        """
+        device = self.config.storage_devices[host]
+        mount_point = self.config.mount_point
+        device_path = f"/dev/{device}"
+
+        mount_cmd = (
+            f"mkdir -p {mount_point} && "
+            f"if mountpoint -q {mount_point}; then "
+            f"echo 'Already mounted'; "
+            f"else "
+            f"mount {device_path} {mount_point} && "
+            f"echo 'Remounted {device_path} -> {mount_point}'; "
+            f"fi"
+        )
+
+        logger.info(f"{host}: Remounting {device_path} -> {mount_point} after VM restart...")
+
+        success, output = self.execute_command(
+            host, mount_cmd, "Remounting after restart",
+            max_retries=5, retry_interval=10, timeout=30,
+            restart_vm_on_unreachable=False,
+        )
+
+        if success:
+            logger.info(f"{host}: Post-restart remount: {output.strip()}")
+        else:
+            logger.warning(
+                f"{host}: Post-restart remount failed: {output} "
+                f"- subsequent storage prep steps may still fix this"
+            )
+
+    def execute_prep_command(self, host: str, command: str, description: str = "command",
+                             **kwargs) -> Tuple[bool, str]:
+        """Execute a pre-test prep/validation command.
+
+        If the host is unreachable: wait UNREACHABLE_GRACE_WAIT, retry once, and only
+        then restart the VM if it is still unreachable.
+        """
+        return self.execute_command(
+            host, command, description, restart_vm_on_unreachable=True, **kwargs
+        )
+
     def get_ssh_command(self, host: str, command: str) -> List[str]:
         """
         Get SSH/virtctl command for executing on a host.
@@ -563,12 +878,18 @@ class CommandExecutor:
         if self.is_vm_host(host):
             if not self.config.namespace or self.config.namespace == "N/A":
                 raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
-            # Use Administrator for Windows hosts, root for Linux
+            # Use Administrator for Windows hosts, root for Linux.
+            # virtctl >=1.6: ExactArgs(1) — only one positional (user@vmi/name).
+            # Flags (-c/--command, -i, --local-ssh-opts) MUST come BEFORE the target.
+            # Putting -c after the target yields: "accepts 1 arg(s), received 2".
             user = "Administrator" if self.is_windows_host(host) else "root"
             return [
                 "virtctl", "-n", self.config.namespace, "ssh",
+                "-i", "/root/.ssh/id_rsa",
                 "--local-ssh-opts=-o StrictHostKeyChecking=no",
-                f"{user}@vmi/{host}", "-c", command
+                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
+                "-c", command,
+                f"{user}@vmi/{host}",
             ]
         else:
             # For non-VM hosts, use root for Linux, Administrator for Windows
@@ -631,7 +952,8 @@ class CommandExecutor:
                        max_retries: Optional[int] = None,
                        retry_interval: Optional[int] = None,
                        timeout: Optional[int] = None,
-                       quiet: bool = False) -> Tuple[bool, str]:
+                       quiet: bool = False,
+                       restart_vm_on_unreachable: bool = False) -> Tuple[bool, str]:
         """
         Execute command on remote host with retry logic.
 
@@ -647,6 +969,9 @@ class CommandExecutor:
             retry_interval: Seconds between retries (defaults to config).
             timeout: Explicit timeout in seconds (auto-calculated for FIO).
             quiet: If True, suppress non-critical error logging.
+            restart_vm_on_unreachable: If True (prep/validation), when the host looks
+                unreachable: wait UNREACHABLE_GRACE_WAIT and retry once; only if still
+                unreachable, restart the VM via virtctl and retry again.
 
         Returns:
             Tuple of (success: bool, output: str).
@@ -672,18 +997,30 @@ class CommandExecutor:
                     cmd_timeout = fio_runtime + self.config.timeout_runtime_buffer
                     logger.debug(f"FIO command detected with runtime {fio_runtime}s - setting timeout to {cmd_timeout}s")
                 else:
-                    # FIO command but no runtime found - use default with larger buffer
-                    # Check if it's a dataset write (might not have runtime but takes time)
-                    if "dataset" in description.lower() or "write" in description.lower():
-                        # For dataset writes, use max of Linux and Windows runtime + buffer
-                        linux_runtime = int(self.config.test_runtime) if self.config.test_runtime else 300
-                        windows_runtime = int(self.config.windows_test_runtime) if self.config.windows_test_runtime else 300
-                        max_runtime = max(linux_runtime, windows_runtime)
+                    # FIO without --runtime: size-based (or unset). Prefer configured runtimes if any.
+                    linux_runtime = parse_optional_runtime(self.config.test_runtime) or 0
+                    windows_runtime = parse_optional_runtime(self.config.windows_test_runtime) or 0
+                    max_runtime = max(linux_runtime, windows_runtime)
+                    if max_runtime > 0:
                         cmd_timeout = max_runtime + self.config.timeout_runtime_buffer
-                        logger.debug(f"FIO dataset write detected - using max runtime {max_runtime}s + {self.config.timeout_runtime_buffer}s = {cmd_timeout}s timeout")
+                        logger.debug(
+                            f"FIO without --runtime in command but config runtime={max_runtime}s — "
+                            f"timeout {cmd_timeout}s"
+                        )
+                    elif self.config.timeout_dataset_hard is not None:
+                        cmd_timeout = int(self.config.timeout_dataset_hard)
+                        logger.debug(
+                            f"FIO size-based (no runtime) — using dataset_hard timeout {cmd_timeout}s"
+                        )
                     else:
-                        # FIO command without runtime - use default
-                        cmd_timeout = self.config.timeout_runtime_buffer
+                        # Size-based: unknown duration; allow long wait (stall*3 floor 1h) + buffer
+                        cmd_timeout = (
+                            max(int(self.config.timeout_dataset_stall) * 3, 3600)
+                            + self.config.timeout_runtime_buffer
+                        )
+                        logger.debug(
+                            f"FIO size-based (no runtime) — using timeout {cmd_timeout}s"
+                        )
             else:
                 # Non-FIO command - use default timeout
                 cmd_timeout = self.config.timeout_default
@@ -697,8 +1034,102 @@ class CommandExecutor:
             return True, ""
         
         ssh_cmd = self.get_ssh_command(host, command)
+        vm_restarted = False
+        unreachable_grace_done = False
+
+        def _maybe_recover_unreachable(stderr: str = "", stdout: str = "",
+                                       timed_out: bool = False) -> bool:
+            """Prep unreachable recovery: grace wait + retry, then restart + retry.
+
+            Returns True if the caller should retry the command.
+            """
+            nonlocal vm_restarted, unreachable_grace_done
+            if not restart_vm_on_unreachable or vm_restarted:
+                return False
+            if not self._is_host_unreachable(stderr, stdout, timed_out):
+                return False
+
+            # Windows PowerShell failures often look like connectivity (stderr with
+            # "Error", or command timeout) while virtctl ssh still works. Confirm.
+            if self._probe_ssh_reachable(host):
+                why = "timed out" if timed_out else "looked like connectivity failure"
+                logger.warning(
+                    f"{host}: Command {why} during '{description}', but SSH is reachable - "
+                    f"treating as command failure (skipping {UNREACHABLE_GRACE_WAIT}s wait / VM restart)"
+                )
+                return False
+
+            if not unreachable_grace_done:
+                err_snip = (stderr or stdout or "").strip()
+                if err_snip:
+                    # Show real virtctl/ssh error (often kubeconfig / auth) — previously hidden
+                    logger.warning(
+                        f"{host}: Unreachable detail: {err_snip[:500]}"
+                    )
+                logger.warning(
+                    f"{host}: Host unreachable during prep/validation - "
+                    f"waiting {UNREACHABLE_GRACE_WAIT}s before retry "
+                    f"(VM restart deferred)..."
+                )
+                time.sleep(UNREACHABLE_GRACE_WAIT)
+                unreachable_grace_done = True
+                return True
+
+            logger.warning(
+                f"{host}: Still unreachable after {UNREACHABLE_GRACE_WAIT}s grace wait - "
+                f"restarting VM..."
+            )
+            if self.restart_vm(
+                host,
+                reason="Host still unreachable after grace wait during prep/validation",
+            ):
+                vm_restarted = True
+                return True
+            return False
+
+        def _maybe_restart_windows_prep(stderr: str = "", stdout: str = "") -> bool:
+            """After N failed Windows prep attempts: restart VM, wait, optionally re-provision.
+
+            Handles cases like DriveNotFoundException when D: is missing during
+            'Creating test directories'. Returns True if the caller should retry.
+            """
+            nonlocal vm_restarted
+            if (
+                not restart_vm_on_unreachable
+                or vm_restarted
+                or not self.is_windows_host(host)
+                or attempt != WINDOWS_PREP_RESTART_AFTER_ATTEMPT
+            ):
+                return False
+
+            logger.warning(
+                f"{host}: Windows prep '{description}' failed on attempt "
+                f"{WINDOWS_PREP_RESTART_AFTER_ATTEMPT}/{max_retries} - "
+                f"restarting VM, waiting {VM_RESTART_WAIT}s, then retrying..."
+            )
+            if not self.restart_vm(
+                host,
+                remount=False,
+                reason=(
+                    f"Windows prep failed after {WINDOWS_PREP_RESTART_AFTER_ATTEMPT} attempts "
+                    f"({description})"
+                ),
+                wait_accessible=True,
+            ):
+                return False
+            vm_restarted = True
+
+            # Drive letter is often gone until the data disk is provisioned again
+            if (
+                self._is_windows_drive_missing(stderr, stdout)
+                or "creating test directories" in description.lower()
+            ):
+                self._reprovision_windows_data_disk(host)
+            return True
         
-        for attempt in range(1, max_retries + 1):
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 result = subprocess.run(
                     ssh_cmd,
@@ -712,6 +1143,20 @@ class CommandExecutor:
                         logger.info(f"Command output from {host}: {result.stdout}")
                     return True, result.stdout
                 
+                if _maybe_recover_unreachable(result.stderr, result.stdout):
+                    if not quiet:
+                        action = "VM restart" if vm_restarted else f"{UNREACHABLE_GRACE_WAIT}s grace wait"
+                        logger.info(f"{host}: Retrying '{description}' after {action}...")
+                    continue
+
+                if _maybe_restart_windows_prep(result.stderr, result.stdout):
+                    if not quiet:
+                        logger.info(
+                            f"{host}: Retrying '{description}' after Windows VM restart "
+                            f"(+{VM_RESTART_WAIT}s wait)..."
+                        )
+                    continue
+
                 if attempt < max_retries:
                     if not quiet:
                         logger.warning(f"Command failed on {host} (attempt {attempt}/{max_retries}): {description}")
@@ -722,23 +1167,50 @@ class CommandExecutor:
                             logger.warning(f"Standard output: {result.stdout}")
                         logger.warning(f"Retrying in {retry_interval}s...")
                     time.sleep(retry_interval)
-                else:
-                    is_process_check = "process" in description.lower() or "task" in description.lower() or "checking if" in description.lower()
-                    if not quiet:
-                        log_level = logger.warning if is_process_check else logger.error
-                        log_prefix = "WARNING" if is_process_check else "ERROR"
-                        
-                        log_level(f"{log_prefix}: Failed to execute '{description}' on {host} after {max_retries} attempts")
-                        log_level(f"{log_prefix}: Exit code: {result.returncode}")
-                        if result.stderr:
-                            log_level(f"{log_prefix}: Error output: {result.stderr}")
-                        if result.stdout:
-                            log_level(f"{log_prefix}: Standard output: {result.stdout}")
-                        if is_process_check:
-                            log_level(f"{log_prefix}: This is a non-critical process check - assuming process is not running (fail-safe behavior)")
-                    return False, result.stderr or result.stdout or "Command failed with no output"
+                    continue
+
+                is_process_check = "process" in description.lower() or "task" in description.lower() or "checking if" in description.lower()
+                if not quiet:
+                    log_level = logger.warning if is_process_check else logger.error
+                    log_prefix = "WARNING" if is_process_check else "ERROR"
+                    
+                    log_level(f"{log_prefix}: Failed to execute '{description}' on {host} after {max_retries} attempts")
+                    log_level(f"{log_prefix}: Exit code: {result.returncode}")
+                    if result.stderr:
+                        log_level(f"{log_prefix}: Error output: {result.stderr}")
+                    if result.stdout:
+                        log_level(f"{log_prefix}: Standard output: {result.stdout}")
+                    if is_process_check:
+                        log_level(f"{log_prefix}: This is a non-critical process check - assuming process is not running (fail-safe behavior)")
+                combined = "\n".join(
+                    part for part in (result.stderr, result.stdout) if part and part.strip()
+                )
+                return False, combined or "Command failed with no output"
                     
             except subprocess.TimeoutExpired:
+                if _maybe_recover_unreachable(timed_out=True):
+                    if not quiet:
+                        action = "VM restart" if vm_restarted else f"{UNREACHABLE_GRACE_WAIT}s grace wait"
+                        logger.info(
+                            f"{host}: Retrying '{description}' after {action} "
+                            f"(command timed out)..."
+                        )
+                    continue
+                if _maybe_restart_windows_prep("Command timeout", ""):
+                    if not quiet:
+                        logger.info(
+                            f"{host}: Retrying '{description}' after Windows VM restart "
+                            f"(command timed out)..."
+                        )
+                    continue
+                if attempt < max_retries:
+                    if not quiet:
+                        logger.warning(
+                            f"Command timeout on {host} (attempt {attempt}/{max_retries}): "
+                            f"{description} (timeout: {cmd_timeout}s) - retrying in {retry_interval}s..."
+                        )
+                    time.sleep(retry_interval)
+                    continue
                 if not quiet:
                     if cmd_timeout <= 30:
                         logger.warning(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s)")
@@ -746,16 +1218,25 @@ class CommandExecutor:
                         logger.error(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s)")
                 return False, "Command timeout"
             except Exception as e:
+                if _maybe_recover_unreachable(str(e)):
+                    if not quiet:
+                        action = "VM restart" if vm_restarted else f"{UNREACHABLE_GRACE_WAIT}s grace wait"
+                        logger.info(f"{host}: Retrying '{description}' after {action}...")
+                    continue
+                if _maybe_restart_windows_prep(str(e), ""):
+                    if not quiet:
+                        logger.info(
+                            f"{host}: Retrying '{description}' after Windows VM restart..."
+                        )
+                    continue
                 if attempt < max_retries:
                     if not quiet:
                         logger.warning(f"Command error on {host} (attempt {attempt}/{max_retries}): {str(e)}")
                     time.sleep(retry_interval)
-                else:
-                    if not quiet:
-                        logger.error(f"Command exception on {host}: {str(e)}")
-                    return False, str(e)
-        
-        return False, "Max retries exceeded"
+                    continue
+                if not quiet:
+                    logger.error(f"Command exception on {host}: {str(e)}")
+                return False, str(e)
     
     def execute_background(self, host: str, command: str, description: str = "background command",
                           migration_state: Optional[Dict[str, bool]] = None) -> threading.Thread:
@@ -826,59 +1307,53 @@ class CommandExecutor:
                     # Encode command using base64
                     encoded_cmd = base64.b64encode(command.encode()).decode()
                     
-                    # Create script that decodes and runs command
-                    # Write the decoded command to a script file and execute it with nohup
+                    # Fire-and-forget: spawn and print PID immediately (no remote sleep/ps).
+                    # At scale, waiting in the same SSH session causes false timeouts and
+                    # retries that would start a second FIO.
                     script_cmd = (
                         f"echo '{encoded_cmd}' | base64 -d > {script_file} && "
                         f"chmod +x {script_file} && "
-                        f"nohup bash {script_file} > {log_file} 2>&1 & "
-                        f"sleep 3 && "
-                        f"ps aux | grep -E 'fio.*testfile|bash.*{script_file}' | grep -v grep | head -1 | awk '{{print $2}}' || echo '0'"
+                        f"setsid nohup bash {script_file} > {log_file} 2>&1 < /dev/null & "
+                        f"echo $!"
                     )
                     
-                    # Use shorter timeout (60s) for nohup setup - it should complete quickly
-                    # If it times out, the process might still be running, so we'll verify separately
-                    success, output = self.execute_command(host, script_cmd, description, timeout=self.config.timeout_nohup_setup)
+                    success, output = self.execute_command(
+                        host, script_cmd, description,
+                        timeout=self.config.timeout_nohup_setup,
+                        max_retries=1,
+                        retry_interval=1,
+                        quiet=True,
+                    )
+                    pid = None
                     if success:
-                        pid = re.search(r'\d+', output)
-                        if pid and pid.group() != "0":
-                            logger.info(f"Background FIO process started on {host} with PID: {pid.group()}")
-                            return
-                        else:
-                            # Script executed but PID not found - verify process is actually running
-                            logger.warning(f"PID not found in output for {host}, verifying FIO process is running...")
-                            time.sleep(3)  # Give it a moment to start
-                            if self.check_task_running(host, f"fio.*testfile|bash.*{script_file}"):
-                                logger.info(f"Background FIO process confirmed running on {host}")
-                                return
-                            else:
-                                # Check log file for errors
-                                check_log_cmd = f"tail -20 {log_file} 2>/dev/null || echo 'Log file not found or empty'"
-                                log_success, log_output = self.execute_command(host, check_log_cmd, "Checking log file", timeout=10)
-                                if log_success and log_output:
-                                    logger.warning(f"FIO process may not have started on {host}. Log output: {log_output.strip()[:200]}")
-                                else:
-                                    logger.warning(f"FIO process may not have started on {host} - will be checked later")
-                                return
-                    else:
-                        # Command failed or timed out, but nohup might have still started the process
-                        # Verify if process is actually running before reporting failure
-                        logger.warning(f"SSH verification timed out on {host}, checking if process started...")
-                        time.sleep(3)  # Give it a moment to start
+                        lines = (output or "").strip().splitlines()
+                        match = re.search(r'\d+', lines[-1]) if lines else None
+                        if match and match.group() != "0":
+                            pid = match.group()
+                    if not pid:
+                        time.sleep(2)
                         if self.check_task_running(host, f"fio.*testfile|bash.*{script_file}"):
-                            logger.info(f"Process confirmed running on {host} despite SSH timeout - nohup started successfully")
+                            logger.info(
+                                f"Background FIO process confirmed running on {host}"
+                                + (" despite launch SSH timeout" if not success else "")
+                            )
                             return
-                        # Check log file for errors (Linux only - Windows doesn't use log files)
-                        if not self.is_windows_host(host):
-                            check_log_cmd = f"tail -20 {log_file} 2>/dev/null || echo 'Log file not found or empty'"
-                            log_success, log_output = self.execute_command(host, check_log_cmd, "Checking log file for errors", timeout=10)
-                            if log_success and log_output:
-                                logger.error(f"Failed to start background FIO process on {host}. Log output: {log_output.strip()[:200]}")
-                            else:
-                                logger.error(f"Failed to start background FIO process on {host} - verification confirms process is not running")
+                        check_log_cmd = f"tail -20 {log_file} 2>/dev/null || echo 'Log file not found or empty'"
+                        log_success, log_output = self.execute_command(
+                            host, check_log_cmd, "Checking log file", timeout=10, quiet=True, max_retries=1
+                        )
+                        if log_success and log_output:
+                            logger.warning(
+                                f"FIO process may not have started on {host}. "
+                                f"Log output: {log_output.strip()[:200]}"
+                            )
                         else:
-                            logger.error(f"Failed to start background FIO process on {host} - verification confirms process is not running")
+                            logger.warning(
+                                f"FIO process may not have started on {host} - will be checked later"
+                            )
                         return
+                    logger.info(f"Background FIO process started on {host} with PID: {pid}")
+                    return
                 else:
                     self.execute_command(host, command, description)
         
@@ -886,58 +1361,192 @@ class CommandExecutor:
         thread.start()
         return thread
     
-    def check_task_running(self, host: str, task_pattern: str = "fio.*testfile") -> bool:
+    def check_task_status(self, host: str, task_pattern: str = "fio.*testfile") -> str:
         """
-        Check if a task is running on a host.
-        
-        This is a non-critical check used to monitor process status. Failures are expected
-        in some cases (e.g., process not running, transient connection issues) and are
-        handled gracefully by returning False (fail-safe behavior).
-        
-        Args:
-            host: Hostname to check
-            task_pattern: Process name or pattern to search for
-            
-        Returns:
-            True if process is running, False otherwise (fail-safe)
+        Probe whether a remote task is running and whether the host is reachable.
+
+        Returns one of:
+          - 'running': process matches pattern
+          - 'stopped': host reachable, process not found
+          - 'paused': VMI reported as paused (virtctl/oc)
+          - 'unreachable': SSH/virtctl connectivity failure
         """
         is_windows = self.is_windows_host(host)
-        
+
         if is_windows:
-            # For Windows, use PowerShell Get-Process
-            # Wrap in powershell -Command to ensure it runs in PowerShell, not cmd.exe
             if "fio" in task_pattern.lower():
-                # Simple check for fio.exe process
                 cmd = "powershell -Command \"Get-Process -Name fio -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count\""
             else:
-                # Generic pattern matching for Windows
-                # Escape the pattern properly for PowerShell
                 escaped_pattern = task_pattern.replace("'", "''").replace('"', '""')
                 cmd = f"powershell -Command \"Get-Process | Where-Object {{$_.ProcessName -match '{escaped_pattern}'}} | Measure-Object | Select-Object -ExpandProperty Count\""
         else:
-            # Linux: Use ps and grep
             cmd = f"ps aux | grep -E '{task_pattern}' | grep -v grep | wc -l"
-        
-        # Use a short timeout (30s) for quick process checks
-        # Use max_retries=1 since this is a quick status check, not a critical operation
-        # Suppress error logging for this check since failures are expected (process might not be running)
-        success, output = self.execute_command(host, cmd, f"Checking if process '{task_pattern}' is running", max_retries=1, retry_interval=1, timeout=self.config.timeout_process_check)
-        
-        if success:
+
+        success, output = self.execute_command(
+            host, cmd, f"Checking if process '{task_pattern}' is running",
+            max_retries=1, retry_interval=1, timeout=self.config.timeout_process_check,
+            quiet=True,
+        )
+
+        def _status_from_success(ok: bool, out: str) -> Optional[str]:
+            if not ok:
+                return None
             try:
-                count = int(output.strip())
-                is_running = count > 0
-                logger.debug(f"Process check on {host} (pattern: '{task_pattern}'): {count} process(es) found - {'running' if is_running else 'not running'}")
-                return is_running
-            except ValueError:
-                logger.debug(f"Process check on {host} (pattern: '{task_pattern}'): Could not parse output '{output.strip()}' as integer - assuming not running")
-                return False
-        
-        # If check fails or times out, assume task is not running (fail-safe)
-        # This is expected behavior - the process might not be running, or there might be
-        # a transient connection issue. Log at debug level since this is not a critical error.
-        logger.debug(f"Process check on {host} (pattern: '{task_pattern}') failed or timed out - assuming process is not running (fail-safe)")
-        return False
+                count = int((out or "").strip().splitlines()[-1].strip())
+                if count > 0:
+                    logger.debug(
+                        f"Process check on {host} (pattern: '{task_pattern}'): "
+                        f"{count} process(es) running"
+                    )
+                    return "running"
+                logger.debug(
+                    f"Process check on {host} (pattern: '{task_pattern}'): not running"
+                )
+                return "stopped"
+            except (ValueError, IndexError):
+                logger.debug(
+                    f"Process check on {host} (pattern: '{task_pattern}'): "
+                    f"Could not parse output '{(out or '').strip()}' - treating as stopped"
+                )
+                return "stopped"
+
+        parsed = _status_from_success(success, output or "")
+        if parsed is not None:
+            return parsed
+
+        # Failed process check: confirm paused/unreachable with short retries so
+        # transient virtctl/SSH blips (common on Windows) do not escalate immediately.
+        access_confirm_retries = 3
+        access_confirm_delay = 10
+        last_output = output or ""
+        for confirm in range(1, access_confirm_retries + 1):
+            paused_msg = self._is_vmi_paused_message(last_output)
+            looks_paused = paused_msg or self.is_vmi_paused(host)
+            looks_unreachable = self._is_host_unreachable(
+                last_output, timed_out=("timeout" in last_output.lower())
+            )
+
+            if not looks_paused and not looks_unreachable:
+                break
+
+            ssh_ok = self._probe_ssh_reachable(host)
+            # Unreachable-looking failure but SSH works → guest command glitch, not access loss
+            if looks_unreachable and not looks_paused and ssh_ok:
+                logger.debug(
+                    f"{host}: Process check failed but SSH reachable - treating as stopped"
+                )
+                return "stopped"
+
+            kind = "paused" if looks_paused else "unreachable"
+            if confirm >= access_confirm_retries:
+                if looks_paused:
+                    # SSH may still answer while cluster reports Paused; only escalate
+                    # when the process check cannot succeed after retries.
+                    logger.warning(
+                        f"{host}: VMI appears paused during process check "
+                        f"(after {access_confirm_retries} confirms)"
+                    )
+                    return "paused"
+                logger.debug(
+                    f"{host}: Host unreachable during process check "
+                    f"(after {access_confirm_retries} confirms)"
+                )
+                return "unreachable"
+
+            if looks_paused and ssh_ok:
+                logger.warning(
+                    f"{host}: Pause indicated during process check but SSH is reachable "
+                    f"(confirm {confirm}/{access_confirm_retries}) - "
+                    f"retrying process check in {access_confirm_delay}s..."
+                )
+            else:
+                logger.warning(
+                    f"{host}: Host appears {kind} during process check "
+                    f"(confirm {confirm}/{access_confirm_retries}) - "
+                    f"retrying in {access_confirm_delay}s before escalating..."
+                )
+            time.sleep(access_confirm_delay)
+
+            success, output = self.execute_command(
+                host, cmd, f"Checking if process '{task_pattern}' is running",
+                max_retries=1, retry_interval=1, timeout=self.config.timeout_process_check,
+                quiet=True,
+            )
+            parsed = _status_from_success(success, output or "")
+            if parsed is not None:
+                logger.info(
+                    f"{host}: Process check recovered after access retry "
+                    f"({confirm}/{access_confirm_retries}): {parsed}"
+                )
+                return parsed
+            last_output = output or ""
+
+        logger.debug(
+            f"Process check on {host} (pattern: '{task_pattern}') failed - "
+            f"assuming process is not running (fail-safe)"
+        )
+        return "stopped"
+
+    def check_task_running(self, host: str, task_pattern: str = "fio.*testfile") -> bool:
+        """
+        Check if a task is running on a host.
+
+        Failures / unreachable hosts return False (fail-safe). Prefer
+        check_task_status() when paused-VM recovery is needed.
+        """
+        return self.check_task_status(host, task_pattern) == "running"
+
+    def has_fio_result_file(self, host: str, test_name: str) -> bool:
+        """Return True if the expected FIO JSON result exists on the host."""
+        if self.is_windows_host(host):
+            output_dir_win = normalize_windows_path(self.config.windows_output_dir)
+            check_cmd = (
+                f"powershell -Command \"if (Test-Path '{output_dir_win}/{test_name}.json') "
+                f"{{ Write-Host 'exists' }} else {{ Write-Host 'missing' }}\""
+            )
+        else:
+            check_cmd = (
+                f"test -f {self.config.output_dir}/{test_name}.json && echo 'exists' || echo 'missing'"
+            )
+        success, output = self.execute_command(
+            host, check_cmd, "Checking FIO result file",
+            max_retries=1, retry_interval=1, timeout=30, quiet=True,
+        )
+        return bool(success and "exists" in (output or ""))
+
+    def clear_fio_result_file(self, host: str, test_name: str) -> None:
+        """Remove a possibly incomplete FIO JSON result before relaunch."""
+        if self.is_windows_host(host):
+            output_dir_win = normalize_windows_path(self.config.windows_output_dir)
+            rm_cmd = (
+                f"powershell -Command \"Remove-Item -Force -ErrorAction SilentlyContinue "
+                f"'{output_dir_win}/{test_name}.json'\""
+            )
+        else:
+            rm_cmd = f"rm -f {self.config.output_dir}/{test_name}.json"
+        self.execute_command(
+            host, rm_cmd, "Clearing incomplete FIO result",
+            max_retries=1, retry_interval=1, timeout=30, quiet=True,
+        )
+
+    def recover_paused_vm_and_relaunch_fio(
+        self, host: str, fio_cmd: str, test_name: str, description: str
+    ) -> bool:
+        """
+        Restart a paused/unreachable VM, remount storage, and relaunch the FIO job.
+
+        Returns True if the VM came back and the FIO command was re-submitted.
+        """
+        reason = f"VMI paused/unreachable during FIO test '{test_name}' (after access grace/retries)"
+        if not self.restart_vm(
+            host, remount=True, reason=reason, wait_accessible=True
+        ):
+            logger.error(f"{host}: Failed to recover paused/unreachable VM for '{test_name}'")
+            return False
+        self.clear_fio_result_file(host, test_name)
+        logger.info(f"{host}: Relaunching FIO test after VM recovery: {test_name}")
+        self.execute_background(host, fio_cmd, f"{description} (relaunched after VM recovery)")
+        return True
 
 
 class ConfigLoader:
@@ -1021,18 +1630,14 @@ class ConfigLoader:
         fio = yaml_data.get('fio', {})
         if linux_hosts_present:
             self.config.test_size = fio.get('test_size')
-            # Ensure test_runtime is an integer
-            runtime = fio.get('runtime')
-            if isinstance(runtime, str):
-                self.config.test_runtime = int(runtime)
-            else:
-                self.config.test_runtime = int(runtime) if runtime else None
+            self.config.test_runtime = parse_optional_runtime(fio.get('runtime'))
             raw_bs = fio.get('block_sizes', '')
             self.config.block_sizes = raw_bs if isinstance(raw_bs, list) else raw_bs.split()
             raw_ip = fio.get('io_patterns', '')
             self.config.io_patterns = raw_ip if isinstance(raw_ip, list) else raw_ip.split()
             self.config.numjobs = int(fio.get('numjobs', 1))
             self.config.iodepth = int(fio.get('iodepth', 1))
+            self.config.ioengine = str(fio.get('ioengine', DEFAULT_LINUX_IOENGINE)).strip() or DEFAULT_LINUX_IOENGINE
             self.config.direct_io = str(fio.get('direct_io', 1))
             self.config.rate_iops = fio.get('rate_iops')
             if self.config.rate_iops == "null" or not self.config.rate_iops:
@@ -1041,6 +1646,7 @@ class ConfigLoader:
                 # Ensure rate_iops is an integer if it's set
                 if isinstance(self.config.rate_iops, str):
                     self.config.rate_iops = int(self.config.rate_iops)
+            self.config.fio_installed = parse_bool(fio.get('fio_installed'), False)
         
         # Load output configuration (required for Linux hosts, optional if only Windows)
         output = yaml_data.get('output', {})
@@ -1181,11 +1787,7 @@ class ConfigLoader:
                         self.config.windows_fio_dir += '/'
                     
                     self.config.windows_test_size = fio_win.get('test_size')
-                    runtime_win = fio_win.get('runtime')
-                    if isinstance(runtime_win, str):
-                        self.config.windows_test_runtime = int(runtime_win)
-                    else:
-                        self.config.windows_test_runtime = int(runtime_win) if runtime_win else None
+                    self.config.windows_test_runtime = parse_optional_runtime(fio_win.get('runtime'))
                     raw_wbs = fio_win.get('block_sizes', '')
                     self.config.windows_block_sizes = raw_wbs if isinstance(raw_wbs, list) else raw_wbs.split()
                     raw_wip = fio_win.get('io_patterns', '')
@@ -1219,11 +1821,17 @@ class ConfigLoader:
             self.config.timeout_nohup_setup = int(timeouts.get('nohup_setup', NOHUP_SETUP_TIMEOUT))
             self.config.timeout_scp = int(timeouts.get('scp', SCP_TIMEOUT))
             self.config.timeout_dataset_buffer = int(timeouts.get('dataset_buffer', DATASET_WRITE_BUFFER))
+            self.config.timeout_dataset_stall = int(timeouts.get('dataset_stall', DATASET_STALL_SECONDS))
+            if timeouts.get('dataset_hard') is not None:
+                self.config.timeout_dataset_hard = int(timeouts.get('dataset_hard'))
+            self.config.dataset_write_retries = int(timeouts.get('dataset_write_retries', DATASET_WRITE_RETRIES))
             self.config.timeout_check_interval = int(timeouts.get('check_interval', CHECK_INTERVAL))
             self.config.timeout_migration = int(timeouts.get('migration', MIGRATION_TIMEOUT))
             logger.info(f"Timeouts - default: {self.config.timeout_default}s, quick: {self.config.timeout_quick}s, "
                         f"scp: {self.config.timeout_scp}s, connectivity: {self.config.timeout_connectivity}s, "
-                        f"migration: {self.config.timeout_migration}s")
+                        f"migration: {self.config.timeout_migration}s, "
+                        f"dataset_stall: {self.config.timeout_dataset_stall}s, "
+                        f"dataset_write_retries: {self.config.dataset_write_retries}")
 
         # Merge Windows hosts into vm_hosts list (so all hosts are in one list)
         if self.config.windows_hosts:
@@ -1555,9 +2163,23 @@ def main():
         logger.info(f"FIO directory (Windows): {config.windows_fio_dir}")
     logger.info(f"Persistent mount: {'ENABLED (will create /etc/fstab entries)' if config.persistent_mount else 'DISABLED (temporary mounts only)'}")
     logger.info(f"Test size: {config.test_size}")
-    logger.info(f"Runtime: {config.test_runtime}s")
+    if config.test_runtime:
+        logger.info(f"Runtime (Linux): {config.test_runtime}s")
+    elif linux_hosts:
+        logger.info("Runtime (Linux): omitted (size-based — complete --size then stop)")
+    if windows_hosts:
+        if config.windows_test_runtime:
+            logger.info(f"Runtime (Windows): {config.windows_test_runtime}s")
+        else:
+            logger.info("Runtime (Windows): omitted (size-based — complete --size then stop)")
     logger.info(f"Block sizes: {' '.join(config.block_sizes)}")
     logger.info(f"I/O patterns: {' '.join(config.io_patterns)}")
+    if linux_hosts:
+        logger.info(
+            "FIO packages: "
+            f"{'pre-installed (skip package check/install)' if config.fio_installed else 'install via dnf if missing'}"
+        )
+        logger.info(f"IO engine (Linux): {config.ioengine}")
     
     if config.migrate_workloads:
         if config.migrate_interval > 0:
@@ -1576,7 +2198,10 @@ def main():
             logger.info("  2. Copy log file to results directory (if found)")
         else:
             logger.info("Would execute the following steps:")
-            logger.info("  1. Install FIO and dependencies on VMs")
+            if config.fio_installed:
+                logger.info("  1. Skip FIO package check on Linux VMs (fio_installed=true)")
+            else:
+                logger.info("  1. Install FIO and dependencies on VMs")
             logger.info("  2. Prepare storage (format and mount devices)")
             logger.info("  3. Write initial test dataset")
             logger.info("  4. Run FIO performance tests")
@@ -1634,6 +2259,11 @@ def main():
     
     # Handle prepare-machine mode
     if config.prepare_machine:
+        if config.fio_installed and not config.get_windows_hosts():
+            logger.info("PREPARE MACHINE MODE: Skipping Linux package install (fio_installed=true)")
+            logger.info("Golden image already includes FIO and dependencies")
+            return 0
+
         logger.info("PREPARE MACHINE MODE: Installing FIO dependencies only")
         logger.info(f"Using retry configuration: interval={config.retry_interval}s, max_retries={config.max_retries}")
         if not config.skip_connectivity_test:
@@ -1751,7 +2381,8 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
     """
     Ensure FIO and required packages are installed on all hosts.
 
-    For Linux hosts: installs fio, xfsprogs, and util-linux via dnf.
+    For Linux hosts: installs fio, xfsprogs, and util-linux via dnf unless
+    config.fio_installed is True (golden image — Linux check/install skipped).
     For Windows hosts: copies FIO executable from c:\tools\fio to the
     configured FIO directory on each host.
 
@@ -1762,12 +2393,9 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
     Raises:
         SystemExit: If installation fails on any host.
     """
-    logger.info("Checking if FIO and required packages are installed on all hosts...")
-    
-    # Separate Linux and Windows hosts
     linux_hosts = config.get_linux_hosts()
     windows_hosts = config.get_windows_hosts()
-    
+
     # Install FIO on Windows hosts (copy from c:\tools\fio to root_dir)
     if windows_hosts:
         logger.info(f"Installing FIO on Windows hosts: {windows_hosts}")
@@ -1817,7 +2445,7 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
                     f"Write-Host 'PROVISIONED' "
                     f"}}\""
                 )
-                future = pool.submit(executor.execute_command, host, cmd, f"Checking/provisioning drive {drive_letter}: on {host}", timeout=config.timeout_default)
+                future = pool.submit(executor.execute_prep_command, host, cmd, f"Checking/provisioning drive {drive_letter}: on {host}", timeout=config.timeout_default)
                 provision_futures.append((future, host))
             
             # Wait for all check/provision to complete
@@ -1843,7 +2471,7 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
             futures = []
             for host in windows_hosts:
                 cmd = f"powershell -Command \"if (Test-Path 'c:\\tools\\fio') {{ copy-item -Path c:\\tools\\fio -Destination {root_dir_ps_with_slash} -recurse -force; Write-Host 'FIO_COPIED' }} else {{ Write-Host 'SOURCE_NOT_FOUND' }}\""
-                future = pool.submit(executor.execute_command, host, cmd, f"Installing FIO on {host}")
+                future = pool.submit(executor.execute_prep_command, host, cmd, f"Installing FIO on {host}")
                 futures.append(future)
             
             # Wait for all installations to complete
@@ -1864,16 +2492,18 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
         logger.info(f"FIO installation completed on all Windows hosts")
     
     if not linux_hosts:
-        logger.info("No Linux hosts to install packages on")
         return
-    
-    # Check if FIO is already installed on each Linux host
+
+    if config.fio_installed:
+        logger.info("Skipping FIO package check/install on Linux hosts (fio_installed=true)")
+        return
+
+    logger.info("Checking if FIO and required packages are installed on all Linux hosts...")
+
+    # Install FIO on each Linux host when not using a golden image
     with ThreadPoolExecutor(max_workers=min(len(linux_hosts), config.max_workers)) as pool:
         futures = []
         for host in linux_hosts:
-            # Format command as a single line with proper bash -c wrapping
-            # This ensures multi-line commands are executed correctly via SSH
-            # Use single quotes for outer command to avoid quote conflicts
             cmd = (
                 "bash -c '"
                 "if command -v fio &> /dev/null; then "
@@ -1887,7 +2517,12 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
                 "fi"
                 "'"
             )
-            future = pool.submit(executor.execute_command, host, cmd, "Checking and installing FIO dependencies")
+            future = pool.submit(
+                executor.execute_prep_command,
+                host,
+                cmd,
+                "Checking and installing FIO dependencies",
+            )
             futures.append(future)
         
         # Wait for all installations to complete
@@ -1932,6 +2567,10 @@ def prepare_machine(config: FioTestConfig, executor: CommandExecutor) -> None:
         config: FIO test configuration object.
         executor: Command executor for remote operations.
     """
+    if config.fio_installed and not config.get_windows_hosts():
+        logger.info("Skipping machine preparation (fio_installed=true, golden image)")
+        return
+
     logger.info("Preparing machines - installing FIO dependencies only...")
     ensure_packages_installed(config, executor)
     logger.info("Machine preparation completed - FIO dependencies are ready on all hosts")
@@ -1970,7 +2609,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
         for host in linux_hosts:
             device = config.storage_devices[host]
             cmd = f"test -b /dev/{device} && echo 'Found block device /dev/{device}' && lsblk /dev/{device} || (echo 'ERROR: Block device /dev/{device} not found' && exit 1)"
-            future = pool.submit(executor.execute_command, host, cmd, "Validating test device")
+            future = pool.submit(executor.execute_prep_command, host, cmd, "Validating test device")
             futures.append(future)
         for host in windows_hosts:
             # Windows: Use PowerShell to validate disk (provision script will handle this)
@@ -1978,7 +2617,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
             # Wrap in powershell -Command to ensure it runs in PowerShell, not cmd.exe
             # Use single quotes to avoid shell interpretation of pipes
             cmd = f"powershell -Command \"Get-Disk -Number {device} | Select-Object -Property Number,Size,PartitionStyle\""
-            future = pool.submit(executor.execute_command, host, cmd, "Validating Windows disk")
+            future = pool.submit(executor.execute_prep_command, host, cmd, "Validating Windows disk")
             futures.append(future)
         for future in as_completed(futures):
             success, output = future.result()
@@ -1993,7 +2632,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
             futures = []
             for host in linux_hosts:
                 cmd = f"mountpoint -q {config.mount_point} && (echo 'Unmounting {config.mount_point}' && umount {config.mount_point} || true) || echo 'Mount point {config.mount_point} is not mounted'"
-                future = pool.submit(executor.execute_command, host, cmd, "Unmounting existing mount")
+                future = pool.submit(executor.execute_prep_command, host, cmd, "Unmounting existing mount")
                 futures.append(future)
             for future in as_completed(futures):
                 future.result()  # Don't fail on unmount errors
@@ -2002,20 +2641,31 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # This partitions and formats the disk, creating the drive (e.g., d:)
     if windows_hosts:
         logger.info("Step 3/7 (Windows): Preparing storage on Windows hosts using provision-data-disk.ps1...")
-        logger.info("NOTE: This will partition and format the disk, creating the drive (e.g., d:)")
+        logger.info(
+            f"NOTE: This will partition and format the disk on "
+            f"{', '.join(windows_hosts)}, creating the drive (e.g., d:)"
+        )
         with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
-            futures = []
+            futures = {}
             for host in windows_hosts:
                 device = config.windows_storage_devices.get(host, "1")
+                logger.info(f"{host}: Partitioning and formatting Disk {device}...")
                 # Match bash script format: powershell c:\tools\setup\provision-data-disk.ps1 -DiskID {device}
                 cmd = f"powershell c:\\tools\\setup\\provision-data-disk.ps1 -DiskID {device}"
-                future = pool.submit(executor.execute_command, host, cmd, "Preparing Windows storage")
-                futures.append(future)
+                future = pool.submit(
+                    executor.execute_prep_command,
+                    host,
+                    cmd,
+                    f"Preparing Windows storage on {host}",
+                )
+                futures[future] = host
             for future in as_completed(futures):
+                host = futures[future]
                 success, output = future.result()
                 if not success:
-                    logger.error(f"Windows storage preparation failed: {output}")
+                    logger.error(f"{host}: Windows storage preparation failed: {output}")
                     sys.exit(1)
+                logger.info(f"{host}: Disk partition/format completed")
     
     # Step 4: Create directories (Linux and Windows separately)
     # For Windows: This must be done AFTER disk provisioning (Step 3) so the drive exists
@@ -2024,7 +2674,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
         futures = []
         for host in linux_hosts:
             cmd = f"mkdir -p {config.output_dir} {config.mount_point}"
-            future = pool.submit(executor.execute_command, host, cmd, "Creating test directories")
+            future = pool.submit(executor.execute_prep_command, host, cmd, "Creating test directories")
             futures.append(future)
         for host in windows_hosts:
             # Windows: Use PowerShell to create directories
@@ -2033,7 +2683,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
             output_dir_win = normalize_windows_path(config.windows_output_dir)
             # Use -Command to ensure it runs in PowerShell, not cmd.exe
             cmd = f"powershell -Command \"New-Item -ItemType Directory -Force -Path '{mount_point_win}', '{output_dir_win}'\""
-            future = pool.submit(executor.execute_command, host, cmd, "Creating test directories")
+            future = pool.submit(executor.execute_prep_command, host, cmd, "Creating test directories")
             futures.append(future)
         for future in as_completed(futures):
             success, output = future.result()
@@ -2043,18 +2693,154 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # Step 5: Format devices (Linux only - Windows handled by provision script)
     if linux_hosts:
         logger.info("Step 5/7: Formatting devices on Linux hosts (WARNING: destructive operation)...")
-        with ThreadPoolExecutor(max_workers=min(len(linux_hosts), config.max_workers)) as pool:
-            futures = []
-            for host in linux_hosts:
+
+        def _is_mounted_filesystem_error(output: str) -> bool:
+            text = (output or "").lower()
+            return (
+                "mounted filesystem" in text
+                or "apparently in use" in text
+                or "is mounted" in text
+            )
+
+        def _mkfs_once(host: str, description: str, *, max_retries: int = 1) -> Tuple[bool, str]:
+            device = config.storage_devices[host]
+            device_path = f"/dev/{device}"
+            fmt_cmd = (
+                f"echo 'WARNING: Formatting {device_path} with {config.filesystem}' && "
+                f"mkfs.{config.filesystem} -f {device_path}"
+            )
+            # quiet=True: mounted-filesystem failures are expected sometimes and
+            # handled by reboot+retry below — avoid ERROR spam before recovery.
+            return executor.execute_command(
+                host, fmt_cmd, description,
+                max_retries=max_retries, retry_interval=10, timeout=60,
+                quiet=True,
+                restart_vm_on_unreachable=True,
+            )
+
+        def _format_pass(hosts: List[str], description: str, *, max_retries: int = 1
+                         ) -> Dict[str, Tuple[bool, str]]:
+            """Run mkfs on all given hosts in parallel (unbounded)."""
+            results: Dict[str, Tuple[bool, str]] = {}
+            lock = threading.Lock()
+
+            def _run(host: str) -> None:
                 device = config.storage_devices[host]
-                cmd = f"echo 'WARNING: Formatting /dev/{device} with {config.filesystem}' && mkfs.{config.filesystem} -f /dev/{device}"
-                future = pool.submit(executor.execute_command, host, cmd, "Formatting test device")
-                futures.append(future)
-            for future in as_completed(futures):
-                success, output = future.result()
-                if not success:
-                    logger.error(f"Formatting failed: {output}")
-                    sys.exit(1)
+                logger.info(f"{host}: {description} of /dev/{device} with {config.filesystem}")
+                success, output = _mkfs_once(host, description, max_retries=max_retries)
+                with lock:
+                    results[host] = (success, output)
+
+            threads = []
+            for host in hosts:
+                t = threading.Thread(target=_run, args=(host,), daemon=True)
+                t.start()
+                threads.append(t)
+            for t in threads:
+                t.join()
+            return results
+
+        # Pass 1: format ALL hosts at once
+        logger.info(
+            f"Format pass 1: {len(linux_hosts)} Linux hosts in parallel "
+            f"(unbounded — not capped by max_workers={config.max_workers})"
+        )
+        pass1 = _format_pass(linux_hosts, "Formatting test device", max_retries=1)
+
+        ok_hosts = []
+        reboot_hosts = []
+        hard_fail_hosts = []
+        for host in linux_hosts:
+            success, output = pass1.get(host, (False, "no result"))
+            if success:
+                ok_hosts.append(host)
+                logger.info(f"{host}: Format completed on /dev/{config.storage_devices[host]}")
+            elif _is_mounted_filesystem_error(output):
+                reboot_hosts.append(host)
+                logger.warning(
+                    f"{host}: /dev/{config.storage_devices[host]} contains a mounted filesystem — "
+                    f"will restart VM and retry format"
+                )
+            else:
+                hard_fail_hosts.append(host)
+                logger.error(f"{host}: Formatting failed on /dev/{config.storage_devices[host]}: {output}")
+
+        if hard_fail_hosts:
+            logger.error(
+                f"Format failed (non-mount issues) on {len(hard_fail_hosts)} host(s): "
+                f"{', '.join(hard_fail_hosts)}"
+            )
+            sys.exit(1)
+
+        # Pass 2: reboot stuck hosts, wait, then format only those hosts again
+        if reboot_hosts:
+            logger.warning(
+                f"Format pass 2: restarting {len(reboot_hosts)} VM(s) to clear stuck mounts, "
+                f"then retrying format (script waits here — will not proceed to mount yet): "
+                f"{', '.join(reboot_hosts)}"
+            )
+
+            def _reboot_host(host: str) -> Tuple[str, bool]:
+                # remount=False — we are about to format, not use the old FS
+                return host, executor.restart_vm(
+                    host,
+                    remount=False,
+                    reason="Stuck mount during format — clearing via reboot",
+                )
+
+            reboot_results: Dict[str, bool] = {}
+            reboot_lock = threading.Lock()
+
+            def _reboot_and_store(host: str) -> None:
+                h, ok = _reboot_host(host)
+                with reboot_lock:
+                    reboot_results[h] = ok
+
+            reboot_threads = []
+            for host in reboot_hosts:
+                t = threading.Thread(target=_reboot_and_store, args=(host,), daemon=True)
+                t.start()
+                reboot_threads.append(t)
+            for t in reboot_threads:
+                t.join()
+
+            reboot_failed = [h for h in reboot_hosts if not reboot_results.get(h)]
+            if reboot_failed:
+                logger.error(
+                    f"VM restart failed on {len(reboot_failed)} host(s): {', '.join(reboot_failed)}"
+                )
+                sys.exit(1)
+
+            logger.info(
+                f"All {len(reboot_hosts)} VM(s) restarted — retrying format on those hosts only..."
+            )
+            pass2 = _format_pass(
+                reboot_hosts, "Formatting test device (after VM restart)", max_retries=5
+            )
+
+            still_failed = []
+            for host in reboot_hosts:
+                success, output = pass2.get(host, (False, "no result"))
+                if success:
+                    ok_hosts.append(host)
+                    logger.info(
+                        f"{host}: Format completed after VM restart on /dev/{config.storage_devices[host]}"
+                    )
+                else:
+                    still_failed.append(host)
+                    logger.error(
+                        f"{host}: Formatting still failed after VM restart on "
+                        f"/dev/{config.storage_devices[host]}: {output}"
+                    )
+
+            if still_failed:
+                logger.error(
+                    f"Format failed after reboot on {len(still_failed)} host(s): "
+                    f"{', '.join(still_failed)}"
+                )
+                sys.exit(1)
+
+        logger.info(f"Format completed on all {len(ok_hosts)} Linux host(s)")
     
     # Step 6: Mount devices (Linux only - Windows handled by provision script in Step 3)
     if linux_hosts:
@@ -2064,7 +2850,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
             for host in linux_hosts:
                 device = config.storage_devices[host]
                 cmd = f"mount /dev/{device} {config.mount_point}"
-                future = pool.submit(executor.execute_command, host, cmd, "Mounting test device")
+                future = pool.submit(executor.execute_prep_command, host, cmd, "Mounting test device")
                 futures.append(future)
             for future in as_completed(futures):
                 success, output = future.result()
@@ -2094,7 +2880,7 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
                     f"echo 'fstab entry already exists for {device_path} -> {mount_point}'; "
                     f"fi"
                 )
-                future = pool.submit(executor.execute_command, host, cmd, f"Creating fstab entry for {host}")
+                future = pool.submit(executor.execute_prep_command, host, cmd, f"Creating fstab entry for {host}")
                 futures.append(future)
             for future in as_completed(futures):
                 success, output = future.result()
@@ -2110,215 +2896,727 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     logger.info("Storage preparation completed on all hosts!")
 
 
+def _dataset_hard_timeout_seconds(config: FioTestConfig) -> int:
+    """Legacy helper (unused): previously max wait before kill/retry."""
+    if config.timeout_dataset_hard is not None:
+        return int(config.timeout_dataset_hard)
+    linux_runtime = parse_optional_runtime(config.test_runtime) or 0
+    windows_runtime = parse_optional_runtime(config.windows_test_runtime) or 0
+    runtime = max(linux_runtime, windows_runtime)
+    if runtime <= 0:
+        return max(int(config.timeout_dataset_stall) * 3, 3600) + int(config.timeout_dataset_buffer)
+    return runtime * 2 + int(config.timeout_dataset_buffer)
+
+
+def _parse_fio_size_to_bytes(size_str: Optional[str]) -> Optional[int]:
+    """Parse FIO size strings like 8G, 512M, 1024k into bytes (binary units)."""
+    if not size_str:
+        return None
+    text = str(size_str).strip().lower().replace(" ", "")
+    match = re.match(r'^(\d+(?:\.\d+)?)([kmgtpe]i?b?)?$', text)
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = (match.group(2) or "").rstrip("b")
+    multipliers = {
+        "": 1,
+        "k": 1024,
+        "ki": 1024,
+        "m": 1024 ** 2,
+        "mi": 1024 ** 2,
+        "g": 1024 ** 3,
+        "gi": 1024 ** 3,
+        "t": 1024 ** 4,
+        "ti": 1024 ** 4,
+        "p": 1024 ** 5,
+        "pi": 1024 ** 5,
+        "e": 1024 ** 6,
+        "ei": 1024 ** 6,
+    }
+    if unit not in multipliers:
+        return None
+    return int(value * multipliers[unit])
+
+
+def _expected_dataset_data_bytes(config: FioTestConfig, host: str) -> Optional[int]:
+    """Expected total dataset file bytes for a host (size * numjobs)."""
+    if host in config.windows_hosts:
+        per_file = _parse_fio_size_to_bytes(config.windows_test_size)
+        numjobs = int(config.windows_numjobs or 1)
+    else:
+        per_file = _parse_fio_size_to_bytes(config.test_size)
+        numjobs = int(config.numjobs or 1)
+    if per_file is None:
+        return None
+    return per_file * max(numjobs, 1)
+
+
+def _dataset_files_full_size(nbytes: int, expected_bytes: Optional[int]) -> bool:
+    """True when observed dataset bytes are at (or nearly) full configured size."""
+    if expected_bytes is None or expected_bytes <= 0 or nbytes <= 0:
+        return False
+    # Allow tiny slack for filesystem accounting; require ~99% of expected data size.
+    return nbytes >= int(expected_bytes * 0.99)
+
+
+def _linux_dataset_fio_cmd(config: FioTestConfig) -> str:
+    # Omit --runtime/--time_based when runtime unset: FIO exits after writing --size (100%).
+    return (
+        f"cd {config.output_dir} && fio "
+        f"--ioengine={config.ioengine} "
+        f"--name=testfile "
+        f"--directory={config.mount_point} "
+        f"--size={config.test_size} "
+        f"--rw=randwrite "
+        f"--bs=4k "
+        f"{fio_runtime_flags(config.test_runtime)}"
+        f"--direct={config.direct_io} "
+        f"--numjobs={config.numjobs} "
+        f"--iodepth={config.iodepth} "
+        f"{build_linux_fio_thread_option(config.ioengine)}"
+        f"--output-format={config.output_format} "
+        f"--overwrite=1 "
+        f"--output=write_dataset.json"
+    )
+
+
+def _windows_dataset_fio_cmd(config: FioTestConfig) -> str:
+    fio_dir = normalize_windows_path(config.windows_fio_dir)
+    mount_point_win = normalize_windows_path(config.windows_mount_point)
+    output_dir_win = normalize_windows_path(config.windows_output_dir)
+    if not fio_dir.endswith('/'):
+        fio_dir += '/'
+    mount_point_fio = mount_point_win.replace('/', '\\')
+    if len(mount_point_fio) >= 2 and mount_point_fio[1] == ':':
+        mount_point_fio = mount_point_fio[0] + '\\' + mount_point_fio[1:]
+    return (
+        f"powershell cd {fio_dir} ; {fio_dir}fio.exe "
+        f"--ioengine=windowsaio "
+        f"--name=fiodatafile "
+        f"--directory={mount_point_fio} "
+        f"--size={config.windows_test_size} "
+        f"--rw=randwrite "
+        f"--bs=4k "
+        f"{fio_runtime_flags(config.windows_test_runtime)}"
+        f"--direct={config.windows_direct_io} "
+        f"--numjobs={config.windows_numjobs} "
+        f"--iodepth={config.windows_iodepth} "
+        f"--output-format={config.windows_output_format} "
+        f"--thread "
+        f"--overwrite=1 "
+        f"--output={output_dir_win}/write_dataset.json"
+    )
+
+
+def _launch_linux_dataset_nohup(executor: CommandExecutor, host: str, fio_cmd: str) -> Dict:
+    """
+    Start Linux dataset FIO via setsid+nohup and return job metadata (pid/script/log).
+
+    setsid detaches from the virtctl/SSH session process group so a local command
+    timeout/SIGTERM on the SSH helper does not kill the remote FIO job.
+
+    The launch SSH is fire-and-forget (print PID immediately, no remote sleep/ps).
+    Under high parallel launch load, virtctl often exceeds the setup timeout even
+    after FIO has started — so we never retry the launch (avoids duplicate FIO)
+    and always confirm via a separate short pgrep.
+    """
+    safe_host = re.sub(r'[^a-zA-Z0-9._-]', '_', host)
+    script_file = f"/tmp/fio_run_{int(time.time())}_{os.getpid()}_{safe_host}.sh"
+    log_file = f"/tmp/fio_background_{int(time.time())}_{os.getpid()}_{safe_host}.log"
+    encoded_cmd = base64.b64encode(fio_cmd.encode()).decode()
+    # Remove any prior aborted/stale JSON so status checks cannot false-DONE.
+    output_json = f"{executor.config.output_dir.rstrip('/')}/write_dataset.json"
+    # Return as soon as the background job is spawned — do not sleep/ps here;
+    # that keeps the SSH session open and causes false 60s timeouts at scale.
+    script_cmd = (
+        f"echo '{encoded_cmd}' | base64 -d > {script_file} && "
+        f"chmod +x {script_file} && "
+        f"rm -f '{output_json}' && "
+        f"setsid nohup bash {script_file} > {log_file} 2>&1 < /dev/null & "
+        f"echo $!"
+    )
+    success, output = executor.execute_command(
+        host, script_cmd, "Writing test dataset (nohup)",
+        timeout=executor.config.timeout_nohup_setup,
+        max_retries=1,  # never re-launch on SSH timeout (would start a 2nd FIO)
+        retry_interval=1,
+        quiet=True,
+    )
+
+    pid = None
+    if success:
+        lines = (output or "").strip().splitlines()
+        match = re.search(r'\d+', lines[-1]) if lines else None
+        if match and match.group() != "0":
+            pid = match.group()
+
+    # Always verify independently — launch SSH may time out after FIO started
+    if not pid:
+        time.sleep(2)
+    find_pid_cmd = (
+        f"pgrep -f -- '--output=write_dataset.json' 2>/dev/null | head -1 || "
+        f"pgrep -f -- '{script_file}' 2>/dev/null | head -1 || "
+        f"pgrep -f -- 'fio.*--name=testfile' 2>/dev/null | head -1 || echo 0"
+    )
+    ok, out = executor.execute_command(
+        host, find_pid_cmd, "Find dataset FIO PID", quiet=True, timeout=20, max_retries=2, retry_interval=2
+    )
+    if ok:
+        lines = (out or "").strip().splitlines()
+        match = re.search(r'\d+', lines[-1]) if lines else None
+        if match and match.group() != "0":
+            pid = match.group()
+
+    if pid:
+        if success:
+            logger.info(f"Dataset FIO started on {host} with PID {pid}")
+        else:
+            logger.info(
+                f"Dataset FIO confirmed running on {host} with PID {pid} "
+                f"(launch SSH timed out/failed — treating as success, not retrying)"
+            )
+    else:
+        logger.warning(
+            f"Dataset FIO start on {host}: PID unknown after launch "
+            f"(success={success}, output={str(output)[:120]!r}); will poll by process pattern"
+        )
+    return {
+        "pid": pid,
+        "script_file": script_file,
+        "log_file": log_file,
+        "fio_cmd": fio_cmd,
+    }
+
+
+def _kill_dataset_fio_on_host(executor: CommandExecutor, host: str, job: Optional[Dict] = None) -> None:
+    """Terminate stuck dataset-write FIO (and wrapper) on a host."""
+    if executor.is_windows_host(host):
+        kill_cmd = (
+            "powershell -Command \""
+            "Get-Process -Name fio -ErrorAction SilentlyContinue | Stop-Process -Force; "
+            "Write-Host killed\""
+        )
+        executor.execute_command(host, kill_cmd, "Kill dataset FIO", quiet=True, timeout=30)
+        return
+
+    pid = (job or {}).get("pid")
+    script_file = (job or {}).get("script_file")
+    parts = []
+    if pid:
+        parts.append(f"kill -TERM {pid} 2>/dev/null; sleep 2; kill -KILL {pid} 2>/dev/null; true")
+    parts.append("pkill -TERM -f -- '--output=write_dataset.json' 2>/dev/null || true")
+    parts.append("sleep 2")
+    parts.append("pkill -KILL -f -- '--output=write_dataset.json' 2>/dev/null || true")
+    if script_file:
+        parts.append(f"pkill -TERM -f -- '{script_file}' 2>/dev/null || true")
+        parts.append(f"pkill -KILL -f -- '{script_file}' 2>/dev/null || true")
+    parts.append("sleep 1")
+    kill_cmd = "; ".join(parts)
+    executor.execute_command(host, kill_cmd, "Kill dataset FIO", quiet=True, timeout=60)
+    logger.info(f"Sent kill for dataset FIO on {host}" + (f" (pid={pid})" if pid else ""))
+
+
+def _dataset_progress_bytes(executor: CommandExecutor, host: str, config: FioTestConfig) -> int:
+    """Return approximate written dataset bytes (testfile* + json size)."""
+    if executor.is_windows_host(host):
+        mount_point_win = normalize_windows_path(config.windows_mount_point)
+        output_dir_win = normalize_windows_path(config.windows_output_dir)
+        cmd = (
+            f"powershell -Command \""
+            f"$sum = 0; "
+            f"Get-ChildItem -Path '{mount_point_win}' -Filter 'fiodatafile*' -ErrorAction SilentlyContinue | "
+            f"ForEach-Object {{ $sum += $_.Length }}; "
+            f"if (Test-Path '{output_dir_win}/write_dataset.json') {{ "
+            f"  $sum += (Get-Item '{output_dir_win}/write_dataset.json').Length "
+            f"}}; "
+            f"Write-Host $sum\""
+        )
+    else:
+        cmd = (
+            f"(du -sb {config.mount_point}/testfile* 2>/dev/null | awk '{{s+=$1}} END{{print s+0}}'; "
+            f"stat -c %s {config.output_dir}/write_dataset.json 2>/dev/null || echo 0) | "
+            f"awk '{{s+=$1}} END{{print s+0}}'"
+        )
+    ok, out = executor.execute_command(host, cmd, "Dataset progress bytes", quiet=True, timeout=30)
+    if not ok or not out:
+        return 0
+    try:
+        return int(re.search(r'\d+', out.strip().splitlines()[-1]).group())
+    except (AttributeError, ValueError):
+        return 0
+
+
 def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
     """
     Write initial test dataset to all hosts.
 
     Runs FIO in randwrite mode to pre-write test data on all VMs.
-    This ensures consistent test conditions by populating the
-    test files before actual performance tests.
-
-    The function starts FIO processes in parallel on all hosts,
-    then waits for completion with progress logging.
-
-    Args:
-        config: FIO test configuration object.
-        executor: Command executor for remote operations.
+    Waits until write_dataset.json is written. Stall recovery only applies
+    when FIO is still running with incomplete data files (after --runtime when
+    time-based; immediately after stall_limit when size-based / no runtime).
+    Full-size data + still-running FIO is treated as healthy for time_based;
+    size-based FIO should exit once --size is written.
     """
     logger.info("Writing initial test dataset...")
-    
-    # Separate Linux and Windows hosts
+
     linux_hosts = config.get_linux_hosts()
     windows_hosts = config.get_windows_hosts()
-    
-    # Start FIO processes on all hosts in parallel
-    threads = []
-    
-    # Linux hosts - start FIO processes in parallel
-    for host in linux_hosts:
-        fio_cmd = (
-            f"cd {config.output_dir} && fio "
-            f"--name=testfile "
-            f"--directory={config.mount_point} "
-            f"--size={config.test_size} "
-            f"--rw=randwrite "
-            f"--bs=4k "
-            f"--runtime={config.test_runtime} "
-            f"--direct={config.direct_io} "
-            f"--numjobs={config.numjobs} "
-            f"--time_based=1 "
-            f"--iodepth={config.iodepth} "
-            f"--output-format={config.output_format} "
-            f"--overwrite=1 "
-            f"--output=write_dataset.json"
+    stall_limit = int(config.timeout_dataset_stall)
+    max_attempts = 1 + int(config.dataset_write_retries)
+    check_interval = config.timeout_check_interval
+    linux_runtime = parse_optional_runtime(config.test_runtime) or 0
+    windows_runtime = parse_optional_runtime(config.windows_test_runtime) or 0
+    size_based_dataset = (
+        (not linux_hosts or linux_runtime == 0)
+        and (not windows_hosts or windows_runtime == 0)
+    )
+    # time_based: wait until past configured runtime before stall recovery.
+    # size-based: stall recovery can apply as soon as growth stops (gate=0).
+    expected_runtime = 0 if size_based_dataset else max(linux_runtime, windows_runtime, 60)
+
+    if size_based_dataset:
+        logger.info(
+            "Dataset write mode: size-based (runtime omitted) — "
+            "FIO exits when --size is fully written (no --time_based)"
         )
-        thread = executor.execute_background(host, fio_cmd, "Writing test dataset")
-        threads.append(thread)
-    
-    # Windows hosts - prepare and start FIO processes in parallel
+        logger.info(
+            f"Dataset write policy: no hard timeout; "
+            f"stall_limit={stall_limit}s if data incomplete and no byte growth; "
+            f"full-size data + running FIO = wait for JSON; "
+            f"max_attempts={max_attempts} "
+            f"(1 start + {config.dataset_write_retries} restart)"
+        )
+    else:
+        logger.info(
+            f"Dataset write policy: no hard timeout; "
+            f"stall_limit={stall_limit}s (only if data incomplete after "
+            f"expected_runtime={expected_runtime}s); "
+            f"full-size data + running FIO = wait for JSON; "
+            f"max_attempts={max_attempts} "
+            f"(1 start + {config.dataset_write_retries} restart)"
+        )
+
+    linux_cmd = _linux_dataset_fio_cmd(config) if linux_hosts else None
+    windows_cmd = _windows_dataset_fio_cmd(config) if windows_hosts else None
+
+    jobs: Dict[str, Dict] = {}
+    jobs_lock = threading.Lock()
+
+    def _init_progress_fields(meta: Dict) -> Dict:
+        now = time.time()
+        meta.update({
+            "attempt": meta.get("attempt", 1),
+            "attempt_started": now,
+            "last_bytes": 0,
+            "last_progress_at": now,
+            "retried": meta.get("retried", False),
+        })
+        return meta
+
+    def _start_host(host: str, attempt: int) -> None:
+        if executor.is_windows_host(host):
+            logger.info(f"Starting Windows dataset write on {host} (attempt {attempt}/{max_attempts})")
+            thread = executor.execute_background(host, windows_cmd, "Writing test dataset")
+            meta = _init_progress_fields({
+                "attempt": attempt,
+                "thread": thread,
+                "fio_cmd": windows_cmd,
+                "pid": None,
+                "script_file": None,
+                "log_file": None,
+                "retried": attempt > 1,
+            })
+        else:
+            logger.info(f"Starting Linux dataset write on {host} (attempt {attempt}/{max_attempts})")
+            meta = _launch_linux_dataset_nohup(executor, host, linux_cmd)
+            meta["attempt"] = attempt
+            meta["retried"] = attempt > 1
+            meta = _init_progress_fields(meta)
+        with jobs_lock:
+            jobs[host] = meta
+
     if windows_hosts:
-        # Prepare Windows-specific variables
-        fio_dir = normalize_windows_path(config.windows_fio_dir)
         mount_point_win = normalize_windows_path(config.windows_mount_point)
-        output_dir_win = normalize_windows_path(config.windows_output_dir)
-        test_size_win = config.windows_test_size
-        runtime_win = config.windows_test_runtime
-        direct_io_win = config.windows_direct_io
-        numjobs_win = config.windows_numjobs
-        iodepth_win = config.windows_iodepth
-        output_format_win = config.windows_output_format
-        
-        # Ensure fio_dir has trailing slash for proper path construction
-        if not fio_dir.endswith('/'):
-            fio_dir += '/'
-        
-        # Prepare mount point path format for FIO (d\:\fio\data)
-        mount_point_fio = mount_point_win.replace('/', '\\')
-        if len(mount_point_fio) >= 2 and mount_point_fio[1] == ':':
-            mount_point_fio = mount_point_fio[0] + '\\' + mount_point_fio[1:]
-        
-        # Step 1: Verify directories exist in parallel for all Windows hosts
-        logger.info(f"Ensuring mount point directories exist on {len(windows_hosts)} Windows hosts in parallel...")
+        logger.info(f"Ensuring mount point directories exist on {len(windows_hosts)} Windows hosts...")
         with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
             dir_futures = []
             for host in windows_hosts:
-                ensure_dir_cmd = f"powershell -Command \"New-Item -ItemType Directory -Force -Path '{mount_point_win}' | Out-Null; if (Test-Path '{mount_point_win}') {{ Write-Host 'EXISTS' }} else {{ Write-Host 'NOT_FOUND' }}\""
-                future = pool.submit(executor.execute_command, host, ensure_dir_cmd, "Ensuring mount point directory exists", timeout=10)
-                dir_futures.append((future, host))
-            
-            # Wait for all directory checks to complete
+                ensure_dir_cmd = (
+                    f"powershell -Command \"New-Item -ItemType Directory -Force -Path '{mount_point_win}' | Out-Null; "
+                    f"if (Test-Path '{mount_point_win}') {{ Write-Host 'EXISTS' }} else {{ Write-Host 'NOT_FOUND' }}\""
+                )
+                dir_futures.append(
+                    (pool.submit(
+                        executor.execute_command, host, ensure_dir_cmd,
+                        "Ensuring mount point directory exists", timeout=10
+                    ), host)
+                )
             for future, host in dir_futures:
                 dir_success, dir_output = future.result()
-                if dir_success and 'EXISTS' in dir_output:
-                    logger.debug(f"Mount point directory verified on {host}: {mount_point_win}")
-                else:
+                if not (dir_success and 'EXISTS' in (dir_output or '')):
                     logger.warning(f"Mount point directory may not exist on {host}: {mount_point_win}")
-                    if dir_output:
-                        logger.warning(f"Directory check output: {dir_output.strip()}")
-        
-        # Step 2: Start FIO processes in parallel for all Windows hosts
-        logger.info(f"Starting FIO dataset writing on {len(windows_hosts)} Windows hosts in parallel (numjobs={numjobs_win})...")
-        for host in windows_hosts:
-            # Write dataset - always overwrite existing file and actually write data
-            # The --numjobs parameter ensures parallel jobs within FIO
-            fio_cmd = (
-                f"powershell cd {fio_dir} ; {fio_dir}fio.exe "
-                f"--ioengine=windowsaio "
-                f"--name=fiodatafile "
-                f"--directory={mount_point_fio} "
-                f"--size={test_size_win} "
-                f"--rw=randwrite "
-                f"--bs=4k "
-                f"--runtime={runtime_win} "
-                f"--direct={direct_io_win} "
-                f"--numjobs={numjobs_win} "
-                f"--time_based=1 "
-                f"--iodepth={iodepth_win} "
-                f"--output-format={output_format_win} "
-                f"--thread "
-                f"--overwrite=1 "
-                f"--output={output_dir_win}/write_dataset.json"
-            )
-            logger.info(f"FIO command for {host}: {fio_cmd}")
-            thread = executor.execute_background(host, fio_cmd, "Writing test dataset")
-            threads.append(thread)
-    
-    # Wait for all threads to start (they just start the FIO process)
-    for thread in threads:
-        thread.join(timeout=config.timeout_check_interval)  # Wait for thread to start the process
-    
-    # Now wait for FIO processes to actually complete
-    # FIO will write data for the specified runtime, so we need to wait for the full runtime
-    logger.info("Waiting for FIO dataset writing to complete on all hosts...")
-    # Use actual test runtime from config (with buffer) - use max of Linux and Windows
-    # Add buffer time for completion
-    linux_runtime = int(config.test_runtime) if config.test_runtime else 300
-    windows_runtime = int(config.windows_test_runtime) if config.windows_test_runtime else 300
-    expected_runtime = max(linux_runtime, windows_runtime)
-    start_time = time.time()
-    check_interval = config.timeout_check_interval
-    
-    completed_hosts = set()
-    total_hosts = len(config.vm_hosts)
-    
-    while True:
-        all_done = True
-        newly_completed = []
-        
-        with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
-            check_futures = []
-            for host in config.vm_hosts:
-                if host in completed_hosts:
-                    continue
-                if executor.is_windows_host(host):
-                    output_dir_win = normalize_windows_path(config.windows_output_dir)
-                    output_file = f"{output_dir_win}/write_dataset.json"
-                    check_cmd = (
-                        f"powershell -Command \""
-                        f"if (Test-Path '{output_file}') {{ $f = Get-Item '{output_file}'; if ($f.Length -gt 0) {{ Write-Host 'DONE' }} else {{ Write-Host 'RUNNING' }} }} "
-                        f"else {{ $p = Get-Process fio -ErrorAction SilentlyContinue; if ($p) {{ Write-Host 'RUNNING' }} else {{ Write-Host 'FAILED' }} }}\""
-                    )
-                else:
-                    output_file = f"{config.output_dir}/write_dataset.json"
-                    check_cmd = (
-                        f"test -f {output_file} && test -s {output_file} && echo 'DONE' || "
-                        f"(pgrep -f 'fio.*testfile' >/dev/null 2>&1 && echo 'RUNNING' || echo 'FAILED')"
-                    )
-                future = pool.submit(executor.execute_command, host, check_cmd, "Checking dataset status", quiet=True, timeout=15)
-                check_futures.append((future, host))
 
-            for future, host in check_futures:
-                success, output = future.result()
-                if success and output and 'DONE' in output:
-                    if host not in completed_hosts:
-                        completed_hosts.add(host)
-                        newly_completed.append(host)
-                elif success and output and 'RUNNING' in output:
-                    all_done = False
+    # Launch dataset write on ALL hosts at once (one thread per host, no max_workers batching).
+    logger.info(
+        f"Starting dataset write on all {len(config.vm_hosts)} hosts in parallel "
+        f"(unbounded — not capped by max_workers={config.max_workers})"
+    )
+    start_threads = []
+    for host in config.vm_hosts:
+        t = threading.Thread(target=_start_host, args=(host, 1), daemon=True)
+        t.start()
+        start_threads.append(t)
+    for t in start_threads:
+        t.join()
+    logger.info(f"Dataset write launch completed for {len(jobs)}/{len(config.vm_hosts)} hosts")
+
+    completed_hosts = set()
+    failed_hosts = set()
+    failed_streak: Dict[str, int] = {}
+    failed_streak_needed = 3
+    total_hosts = len(config.vm_hosts)
+    start_time = time.time()
+
+    def _linux_dataset_running_check(job: Optional[Dict]) -> str:
+        pid = (job or {}).get("pid")
+        script_file = (job or {}).get("script_file")
+        checks = [
+            "pgrep -f -- '--output=write_dataset.json' >/dev/null 2>&1",
+            "pgrep -f -- 'fio.*--name=testfile' >/dev/null 2>&1",
+        ]
+        if pid:
+            checks.insert(0, f"kill -0 {pid} 2>/dev/null")
+        if script_file:
+            checks.append(f"pgrep -f -- '{script_file}' >/dev/null 2>&1")
+        return " || ".join(checks)
+
+    def _dataset_status_cmd(host: str) -> str:
+        """
+        DONE only when dataset files are full-size and write_dataset.json is a
+        successful completion — not an aborted SIGTERM dump with zero I/O.
+        """
+        job = jobs.get(host)
+        expected = _expected_dataset_data_bytes(config, host) or 0
+        # Require real data on disk; never treat aborted/empty JSON alone as DONE.
+        min_bytes = int(expected * 0.99) if expected > 0 else 1
+
+        if executor.is_windows_host(host):
+            output_dir_win = normalize_windows_path(config.windows_output_dir)
+            mount_point_win = normalize_windows_path(config.windows_mount_point)
+            output_file = f"{output_dir_win}/write_dataset.json"
+            return (
+                f"powershell -Command \""
+                f"$out = '{output_file}'; $dir = '{mount_point_win}'; $minBytes = {min_bytes}; "
+                f"$dataBytes = 0; "
+                f"Get-ChildItem -Path $dir -Filter 'fiodatafile*' -ErrorAction SilentlyContinue | "
+                f"  ForEach-Object {{ $dataBytes += $_.Length }}; "
+                f"$fioRunning = [bool](Get-Process fio -ErrorAction SilentlyContinue); "
+                f"$jsonOk = $false; "
+                f"if (Test-Path $out) {{ "
+                f"  $txt = Get-Content -Raw $out -ErrorAction SilentlyContinue; "
+                f"  if ($txt -and $txt.Length -gt 0 -and ($txt -notmatch 'terminating on signal')) {{ "
+                f"    $jsonOk = $true "
+                f"  }} "
+                f"}}; "
+                f"if ($dataBytes -ge $minBytes -and $jsonOk) {{ Write-Host 'DONE' }} "
+                f"elseif ($fioRunning) {{ Write-Host 'RUNNING' }} "
+                f"elseif ($dataBytes -ge $minBytes -and -not $jsonOk) {{ Write-Host 'RUNNING' }} "
+                f"else {{ Write-Host 'FAILED' }}\""
+            )
+
+        output_file = f"{config.output_dir.rstrip('/')}/write_dataset.json"
+        data_glob = f"{config.mount_point.rstrip('/')}/testfile*"
+        running = _linux_dataset_running_check(job)
+        # Shell status:
+        # DONE = full data files + non-empty JSON without 'terminating on signal'
+        # RUNNING = fio alive, or data full while waiting for a good JSON
+        # FAILED = fio gone with incomplete data and/or aborted JSON
+        return (
+            f"output_file='{output_file}'; "
+            f"min_bytes={min_bytes}; "
+            f"data_bytes=$(du -sb {data_glob} 2>/dev/null | awk '{{s+=$1}} END{{print s+0}}'); "
+            f"json_aborted=0; json_present=0; "
+            f"if test -s \"$output_file\"; then "
+            f"  json_present=1; "
+            f"  if grep -q 'terminating on signal' \"$output_file\" 2>/dev/null; then json_aborted=1; fi; "
+            f"fi; "
+            f"if [ \"$data_bytes\" -ge \"$min_bytes\" ] && [ \"$json_present\" -eq 1 ] && [ \"$json_aborted\" -eq 0 ]; then "
+            f"  echo 'DONE'; "
+            f"elif {running}; then "
+            f"  echo 'RUNNING'; "
+            f"elif [ \"$data_bytes\" -ge \"$min_bytes\" ] && [ \"$json_aborted\" -eq 0 ]; then "
+            f"  echo 'RUNNING'; "
+            f"else "
+            f"  echo 'FAILED'; "
+            f"fi"
+        )
+
+    def _log_dataset_failure_details(host: str) -> None:
+        if executor.is_windows_host(host):
+            output_dir_win = normalize_windows_path(config.windows_output_dir)
+            output_file = f"{output_dir_win}/write_dataset.json"
+            check_cmd = (
+                f"powershell -Command \""
+                f"if (Test-Path '{output_file}') {{ $f = Get-Item '{output_file}'; "
+                f"Write-Host ('json_size=' + $f.Length + ' (0 until FIO finishes)') }} "
+                f"else {{ Write-Host 'json=NOT_FOUND' }}; "
+                f"if (Get-Process fio -ErrorAction SilentlyContinue) {{ Write-Host 'fio=RUNNING' }} "
+                f"else {{ Write-Host 'fio=NOT_RUNNING' }}\""
+            )
+            ok, out = executor.execute_command(host, check_cmd, "Dataset failure diagnostics", quiet=True, timeout=15)
+            if ok and out:
+                logger.error(f"{host}: {out.strip()}")
+            return
+
+        output_file = f"{config.output_dir}/write_dataset.json"
+        data_glob = f"{config.mount_point}/testfile*"
+        log_file = (jobs.get(host) or {}).get("log_file")
+        log_tail = (
+            f"tail -n 40 {log_file}" if log_file else
+            "ls -t /tmp/fio_background_*.log 2>/dev/null | head -1 | xargs -r tail -n 40"
+        )
+        diag_cmd = (
+            f"echo -n 'json='; "
+            f"if test -f '{output_file}'; then "
+            f"  size=$(stat -c '%s' '{output_file}' 2>/dev/null || echo 0); "
+            f"  echo \"${{size}} bytes (0 until FIO finishes)\"; "
+            f"else echo 'NOT_FOUND'; fi; "
+            f"echo -n 'data_files='; ls -1 {data_glob} 2>/dev/null | wc -l; "
+            f"echo -n 'fio_procs='; pgrep -ax fio 2>/dev/null || echo 'none'; "
+            f"echo '--- fio background log (tail) ---'; "
+            f"{log_tail}"
+        )
+        ok, out = executor.execute_command(host, diag_cmd, "Dataset failure diagnostics", quiet=True, timeout=30)
+        if ok and out:
+            for line in out.strip().splitlines()[:50]:
+                logger.error(f"{host}: {line}")
+
+    def _clear_dataset_json(host: str) -> None:
+        """Remove write_dataset.json (including aborted SIGTERM dumps)."""
+        if executor.is_windows_host(host):
+            output_dir_win = normalize_windows_path(config.windows_output_dir)
+            cmd = (
+                f"powershell -Command \""
+                f"$p='{output_dir_win}/write_dataset.json'; "
+                f"if (Test-Path $p) {{ Remove-Item $p -Force }}\""
+            )
+        else:
+            cmd = f"rm -f '{config.output_dir.rstrip('/')}/write_dataset.json'"
+        executor.execute_command(host, cmd, "Clear write_dataset.json", quiet=True, timeout=15)
+
+    def _recover_or_fail(host: str, reason: str) -> None:
+        """Kill stuck job; one-shot restart if attempts remain, else mark FAILED."""
+        job = jobs.get(host, {})
+        attempt = int(job.get("attempt", 1))
+        logger.warning(f"{host}: dataset write recovery triggered ({reason}), attempt {attempt}/{max_attempts}")
+
+        # Race guard: FIO may have finished between status poll and recovery.
+        recheck_cmd = _dataset_status_cmd(host)
+        ok, out = executor.execute_command(
+            host, recheck_cmd, "Recheck dataset status before recovery", quiet=True, timeout=15
+        )
+        status = (out or "").strip().splitlines()[-1].strip() if ok and out else ""
+        if status == "DONE":
+            logger.info(f"{host}: dataset write verified complete — skipping kill/restart")
+            completed_hosts.add(host)
+            failed_streak.pop(host, None)
+            return
+
+        _log_dataset_failure_details(host)
+        _kill_dataset_fio_on_host(executor, host, job)
+        _clear_dataset_json(host)
+
+        if attempt < max_attempts:
+            next_attempt = attempt + 1
+            logger.info(f"{host}: one-shot restart of dataset write (attempt {next_attempt}/{max_attempts})")
+            _start_host(host, next_attempt)
+            failed_streak.pop(host, None)
+        else:
+            logger.error(f"{host}: dataset write failed after {attempt} attempt(s) ({reason})")
+            failed_hosts.add(host)
+            failed_streak.pop(host, None)
+
+    while True:
+        newly_completed = []
+        newly_failed = []
+        pending_hosts = [h for h in config.vm_hosts if h not in completed_hosts and h not in failed_hosts]
+
+        if not pending_hosts:
+            break
+
+        now = time.time()
+
+        with ThreadPoolExecutor(max_workers=min(len(pending_hosts), config.max_workers)) as pool:
+            check_futures = {
+                pool.submit(
+                    executor.execute_command,
+                    host,
+                    _dataset_status_cmd(host),
+                    "Checking dataset status",
+                    quiet=True,
+                    timeout=15,
+                ): host
+                for host in pending_hosts
+            }
+
+            status_by_host = {}
+            for future in as_completed(check_futures):
+                host = check_futures[future]
+                try:
+                    success, output = future.result()
+                except Exception as e:
+                    logger.warning(f"Dataset status check error on {host}: {e}")
+                    status_by_host[host] = ("", False)
+                    continue
+                status = (output or "").strip().splitlines()[-1].strip() if success and output else ""
+                status_by_host[host] = (status, success)
+
+        running_hosts = [h for h, (st, ok) in status_by_host.items() if st == "RUNNING"]
+        if running_hosts:
+            with ThreadPoolExecutor(max_workers=min(len(running_hosts), config.max_workers)) as pool:
+                prog_futures = {
+                    pool.submit(_dataset_progress_bytes, executor, host, config): host
+                    for host in running_hosts
+                }
+                for future in as_completed(prog_futures):
+                    host = prog_futures[future]
+                    try:
+                        nbytes = future.result()
+                    except Exception:
+                        nbytes = 0
+                    job = jobs.get(host)
+                    if not job:
+                        continue
+                    if nbytes > job.get("last_bytes", 0):
+                        job["last_bytes"] = nbytes
+                        job["last_progress_at"] = now
+
+        recover_hosts = []
+        for host in pending_hosts:
+            status, success = status_by_host.get(host, ("", False))
+            job = jobs.get(host, {})
+            attempt_age = now - job.get("attempt_started", start_time)
+            stall_age = now - job.get("last_progress_at", start_time)
+            expected_bytes = _expected_dataset_data_bytes(config, host)
+            data_full = _dataset_files_full_size(int(job.get("last_bytes", 0)), expected_bytes)
+
+            if status == "DONE":
+                completed_hosts.add(host)
+                newly_completed.append(host)
+                failed_streak.pop(host, None)
+                continue
+
+            if status == "RUNNING":
+                failed_streak.pop(host, None)
+                host_runtime = (
+                    parse_optional_runtime(config.windows_test_runtime) or 0
+                    if executor.is_windows_host(host)
+                    else parse_optional_runtime(config.test_runtime) or 0
+                )
+                stall_gate = 0 if host_runtime <= 0 else expected_runtime
+                # time_based keeps FIO alive for full --runtime even after files are full;
+                # size-based should exit once --size is written — wait for JSON either way.
+                if data_full:
+                    if host_runtime > 0:
+                        if attempt_age > host_runtime and int(attempt_age) % 60 < check_interval:
+                            logger.info(
+                                f"{host}: dataset files full-size "
+                                f"({job.get('last_bytes', 0)} bytes) and FIO still running "
+                                f"past runtime — waiting for write_dataset.json (not killing)"
+                            )
+                    elif int(attempt_age) % 60 < check_interval:
+                        logger.info(
+                            f"{host}: dataset files full-size "
+                            f"({job.get('last_bytes', 0)} bytes); size-based FIO still running — "
+                            f"waiting for write_dataset.json (not killing)"
+                        )
+                    continue
+                if attempt_age > stall_gate and stall_age > stall_limit:
+                    recover_hosts.append((
+                        host,
+                        f"no progress for {int(stall_age)}s > {stall_limit}s"
+                        + (
+                            f" after runtime"
+                            if host_runtime > 0
+                            else " (size-based, incomplete)"
+                        )
+                        + f" (data incomplete: {job.get('last_bytes', 0)}/{expected_bytes or '?'} bytes)"
+                    ))
+                continue
+
+            if status == "FAILED":
+                # Process gone: if data is already full, give JSON a few polls to appear
+                # before declaring failure (FIO may have just exited).
+                if data_full:
+                    streak = failed_streak.get(host, 0) + 1
+                    failed_streak[host] = streak
+                    if streak < failed_streak_needed:
+                        logger.info(
+                            f"{host}: FIO exited with full-size dataset "
+                            f"({streak}/{failed_streak_needed}) — waiting for write_dataset.json"
+                        )
+                        continue
+                streak = failed_streak.get(host, 0) + 1
+                failed_streak[host] = streak
+                if streak >= failed_streak_needed:
+                    recover_hosts.append((host, "process gone without write_dataset.json"))
                 else:
-                    logger.warning(f"FIO dataset write may have failed on {host}")
-                    all_done = False
-        
+                    logger.warning(
+                        f"{host}: no dataset FIO process detected "
+                        f"({streak}/{failed_streak_needed} before recovery) — will recheck"
+                    )
+                continue
+
+            logger.warning(
+                f"Could not determine dataset status on {host} "
+                f"(success={success}, status={status!r}); will retry"
+            )
+
+        for host, reason in recover_hosts:
+            if host in completed_hosts or host in failed_hosts:
+                continue
+            before_failed = host in failed_hosts
+            _recover_or_fail(host, reason)
+            if host in failed_hosts and not before_failed:
+                newly_failed.append(host)
+
         if newly_completed:
             logger.info(f"Dataset write completed on: {', '.join(sorted(newly_completed))}")
-        
-        completed_count = len(completed_hosts)
-        
-        if all_done:
-            # All hosts have completed (file exists or process finished)
-            elapsed = time.time() - start_time
-            logger.info(f"All FIO dataset writing processes completed ({completed_count}/{total_hosts} files created, {int(elapsed)}s elapsed)")
-            
-            # Verify that output files exist and have content
-            if completed_count < total_hosts:
-                logger.warning(f"Only {completed_count}/{total_hosts} hosts created dataset files - checking for errors...")
-                for host in config.vm_hosts:
-                    if executor.is_windows_host(host):
-                        output_dir_win = normalize_windows_path(config.windows_output_dir)
-                        output_file = f"{output_dir_win}/write_dataset.json"
-                        check_cmd = f"powershell -Command \"if (Test-Path '{output_file}') {{ $file = Get-Item '{output_file}'; Write-Host 'EXISTS: ' $file.Length ' bytes' }} else {{ Write-Host 'NOT_FOUND' }}\""
-                        log_success, log_output = executor.execute_command(host, check_cmd, "Verifying dataset file", timeout=10)
-                        if log_success:
-                            if 'NOT_FOUND' in log_output:
-                                logger.error(f"{host}: Dataset file not found - FIO may have failed")
-                            elif 'EXISTS' in log_output:
-                                logger.info(f"{host}: Dataset file exists - {log_output.strip()}")
-                    else:
-                        output_file = f"{config.output_dir}/write_dataset.json"
-                        check_cmd = f"test -f {output_file} && ls -lh {output_file} || echo 'NOT_FOUND'"
-                        log_success, log_output = executor.execute_command(host, check_cmd, "Verifying dataset file", timeout=10)
-                        if log_success:
-                            if 'NOT_FOUND' in log_output:
-                                logger.error(f"{host}: Dataset file not found - FIO may have failed")
-                            else:
-                                logger.info(f"{host}: Dataset file exists - {log_output.strip()}")
+        if newly_failed:
+            logger.error(
+                f"Dataset write FAILED on: {', '.join(sorted(newly_failed))} "
+                f"(exhausted retries or unrecoverable)"
+            )
+
+        elapsed = int(time.time() - start_time)
+        remaining_hosts = [h for h in config.vm_hosts if h not in completed_hosts and h not in failed_hosts]
+        logger.info(
+            f"Waiting for FIO dataset writing... "
+            f"({len(remaining_hosts)} hosts remaining"
+            f"{(': ' + ', '.join(sorted(remaining_hosts))) if remaining_hosts else ''}, "
+            f"{len(completed_hosts)}/{total_hosts} completed, "
+            f"{len(failed_hosts)} failed, {elapsed}s elapsed)"
+        )
+
+        if not remaining_hosts:
             break
-        
-        elapsed = time.time() - start_time
-        remaining = total_hosts - completed_count
-        logger.info(f"Waiting for FIO dataset writing... ({remaining} hosts remaining, {completed_count}/{total_hosts} completed, {int(elapsed)}s elapsed)")
+
         time.sleep(check_interval)
-    
+
+    elapsed = int(time.time() - start_time)
+    logger.info(
+        f"Dataset writing finished: {len(completed_hosts)}/{total_hosts} succeeded, "
+        f"{len(failed_hosts)} failed, {elapsed}s elapsed"
+    )
+
+    if failed_hosts:
+        logger.error(
+            f"FIO dataset write failed on {len(failed_hosts)} host(s): "
+            f"{', '.join(sorted(failed_hosts))}"
+        )
+        logger.error("Cannot continue tests without a valid dataset on all hosts")
+        sys.exit(1)
+
     logger.info("Test dataset writing completed")
 
 
@@ -2542,215 +3840,428 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
     windows_io_patterns = config.windows_io_patterns if config.windows_io_patterns else linux_io_patterns
     
     logger.info(f"Linux hosts: {linux_hosts}")
-    logger.info(f"Linux block sizes: {linux_block_sizes}")
-    logger.info(f"Linux I/O patterns: {linux_io_patterns}")
+    if linux_hosts:
+        logger.info(f"Linux block sizes: {linux_block_sizes}")
+        logger.info(f"Linux I/O patterns: {linux_io_patterns}")
     logger.info(f"Windows hosts: {windows_hosts}")
-    logger.info(f"Windows block sizes: {windows_block_sizes}")
-    logger.info(f"Windows I/O patterns: {windows_io_patterns}")
+    if windows_hosts:
+        logger.info(f"Windows block sizes: {windows_block_sizes}")
+        logger.info(f"Windows I/O patterns: {windows_io_patterns}")
     
-    # Get all unique combinations of block sizes and patterns
-    all_block_sizes = sorted(set(linux_block_sizes + windows_block_sizes))
-    all_io_patterns = sorted(set(linux_io_patterns + windows_io_patterns))
+    # Preserve config order (do not sort) so progress numbering matches declared lists
+    def _unique_preserve(seq):
+        seen = set()
+        ordered = []
+        for item in seq:
+            if item not in seen:
+                seen.add(item)
+                ordered.append(item)
+        return ordered
+
+    all_block_sizes = _unique_preserve(linux_block_sizes + windows_block_sizes)
+    all_io_patterns = _unique_preserve(linux_io_patterns + windows_io_patterns)
     
     logger.info(f"All block sizes to test: {all_block_sizes}")
     logger.info(f"All I/O patterns to test: {all_io_patterns}")
-    
-    test_counter = 1
-    
-    for bs in all_block_sizes:
-        logger.info(f"Starting block size iteration: {bs}")
+
+    # Precompute combinations that will actually run on at least one host OS
+    planned_tests = [
+        (bs, pattern)
+        for bs in all_block_sizes
+        for pattern in all_io_patterns
+        if ((bs in linux_block_sizes and pattern in linux_io_patterns and linux_hosts) or
+            (bs in windows_block_sizes and pattern in windows_io_patterns and windows_hosts))
+    ]
+    total_tests = len(planned_tests)
+    logger.info(f"Total FIO test combinations to run: {total_tests}")
+
+    test_counter = 0
+
+    for bs, pattern in planned_tests:
+        test_counter += 1
+        tests_remaining = total_tests - test_counter
+        logger.info(
+            f"Running test {test_counter}/{total_tests} "
+            f"({tests_remaining} remaining): {pattern} with block size {bs}"
+        )
+        logger.debug(f"  Linux check: bs='{bs}' in {linux_block_sizes}? {bs in linux_block_sizes}, pattern='{pattern}' in {linux_io_patterns}? {pattern in linux_io_patterns}")
+        logger.debug(f"  Windows check: bs='{bs}' in {windows_block_sizes}? {bs in windows_block_sizes}, pattern='{pattern}' in {windows_io_patterns}? {pattern in windows_io_patterns}")
         
-        for pattern in all_io_patterns:
-            logger.info(f"Running test {test_counter}: {pattern} with block size {bs}")
-            logger.debug(f"  Linux check: bs='{bs}' in {linux_block_sizes}? {bs in linux_block_sizes}, pattern='{pattern}' in {linux_io_patterns}? {pattern in linux_io_patterns}")
-            logger.debug(f"  Windows check: bs='{bs}' in {windows_block_sizes}? {bs in windows_block_sizes}, pattern='{pattern}' in {windows_io_patterns}? {pattern in windows_io_patterns}")
-            
-            if migration_monitor:
-                migration_monitor.current_operation = f"{pattern} bs={bs}"
-            
-            # Start FIO tests on all hosts
-            threads = []
-            test_name = f"fio-test-{pattern}-bs-{bs}"
-            
-            # Linux hosts
-            linux_should_run = bs in linux_block_sizes and pattern in linux_io_patterns
-            logger.debug(f"  Linux should run: {linux_should_run}")
-            if linux_should_run:
-                logger.info(f"Running Linux test: {pattern} with block size {bs} on hosts: {linux_hosts}")
-                for host in linux_hosts:
-                    fio_cmd = (
-                        f"cd {config.output_dir} && fio "
-                        f"--name=testfile "
-                        f"--directory={config.mount_point} "
-                        f"--size={config.test_size} "
-                        f"--rw={pattern} "
-                        f"--bs={bs} "
-                        f"--runtime={config.test_runtime} "
-                        f"--direct={config.direct_io} "
-                        f"--numjobs={config.numjobs} "
-                        f"--time_based=1 "
-                        f"--iodepth={config.iodepth} "
-                        f"--output-format={config.output_format} "
-                        f"--group_reporting"
-                    )
-                    
-                    if config.rate_iops:
-                        fio_cmd += f" --rate_iops={config.rate_iops}"
-                    
-                    fio_cmd += f" --output={test_name}.json"
-                    
-                    logger.info(f"Starting FIO test on {host}: {test_name}")
-                    thread = executor.execute_background(host, fio_cmd, f"FIO test: {pattern}, block size: {bs}")
-                    threads.append(thread)
+        if migration_monitor:
+            migration_monitor.current_operation = f"test {test_counter}/{total_tests}: {pattern} bs={bs}"
+        
+        # Start FIO tests on all hosts
+        threads = []
+        test_name = f"fio-test-{pattern}-bs-{bs}"
+        # Per-host FIO command (used to relaunch after paused-VM recovery)
+        host_fio_cmds: Dict[str, str] = {}
+        host_fio_desc: Dict[str, str] = {}
+        recovered_hosts: set = set()
+        # First time we saw paused/unreachable for a host this test (grace before restart)
+        access_issue_since: Dict[str, float] = {}
+        deadline_extension = 0
+        
+        # Linux hosts
+        linux_should_run = bs in linux_block_sizes and pattern in linux_io_patterns
+        logger.debug(f"  Linux should run: {linux_should_run}")
+        if linux_should_run:
+            logger.info(
+                f"Running Linux test {test_counter}/{total_tests}: "
+                f"{pattern} with block size {bs} on hosts: {linux_hosts}"
+            )
+            for host in linux_hosts:
+                fio_cmd = (
+                    f"cd {config.output_dir} && fio "
+                    f"--ioengine={config.ioengine} "
+                    f"--name=testfile "
+                    f"--directory={config.mount_point} "
+                    f"--size={config.test_size} "
+                    f"--rw={pattern} "
+                    f"--bs={bs} "
+                    f"{fio_runtime_flags(config.test_runtime)}"
+                    f"--direct={config.direct_io} "
+                    f"--numjobs={config.numjobs} "
+                    f"--iodepth={config.iodepth} "
+                    f"{build_linux_fio_thread_option(config.ioengine)}"
+                    f"--output-format={config.output_format} "
+                    f"--group_reporting"
+                )
+                
+                if config.rate_iops:
+                    fio_cmd += f" --rate_iops={config.rate_iops}"
+                
+                fio_cmd += f" --output={test_name}.json"
+                fio_desc = f"FIO test: {pattern}, block size: {bs}"
+                host_fio_cmds[host] = fio_cmd
+                host_fio_desc[host] = fio_desc
+                
+                logger.info(f"Starting FIO test on {host}: {test_name}")
+                thread = executor.execute_background(host, fio_cmd, fio_desc)
+                threads.append(thread)
+        else:
+            logger.debug(f"Skipping Linux test: {pattern} with block size {bs} (bs in {linux_block_sizes}? {bs in linux_block_sizes}, pattern in {linux_io_patterns}? {pattern in linux_io_patterns})")
+        
+        # Windows hosts
+        if bs in windows_block_sizes and pattern in windows_io_patterns:
+            for host in windows_hosts:
+                fio_dir = normalize_windows_path(config.windows_fio_dir)
+                mount_point_win = normalize_windows_path(config.windows_mount_point)
+                output_dir_win = normalize_windows_path(config.windows_output_dir)
+                
+                # Ensure fio_dir has trailing slash for proper path construction
+                if not fio_dir.endswith('/'):
+                    fio_dir += '/'
+                
+                # Match bash script format: "powershell cd {fio_dir} ; {fio_dir}/fio.exe ..."
+                # FIO on Windows requires backslashes in the path format: d\:\fio\data
+                # Convert forward slashes to backslashes
+                # The format needed is: d\:\fio\data (backslash before colon, backslashes for path)
+                mount_point_fio = mount_point_win.replace('/', '\\')
+                # Ensure drive separator is \: (backslash-colon) not just :
+                # If path starts with drive letter like "d:", convert to "d\:"
+                if len(mount_point_fio) >= 2 and mount_point_fio[1] == ':':
+                    mount_point_fio = mount_point_fio[0] + '\\' + mount_point_fio[1:]
+                fio_cmd = (
+                    f"powershell cd {fio_dir} ; {fio_dir}fio.exe "
+                    f"--ioengine=windowsaio "
+                    f"--name=fiodatafile "
+                    f"--directory={mount_point_fio} "
+                    f"--size={config.windows_test_size} "
+                    f"--rw={pattern} "
+                    f"--bs={bs} "
+                    f"{fio_runtime_flags(config.windows_test_runtime)}"
+                    f"--direct={config.windows_direct_io} "
+                    f"--numjobs={config.windows_numjobs} "
+                    f"--iodepth={config.windows_iodepth} "
+                    f"--output-format={config.windows_output_format} "
+                    f"--thread "
+                    f"--group_reporting"
+                )
+                
+                # Add rate_iops only if it's set (matches bash script logic)
+                if config.windows_rate_iops:
+                    fio_cmd += f" --rate_iops={config.windows_rate_iops}"
+                
+                fio_cmd += f" --output={output_dir_win}/{test_name}.json"
+                fio_desc = f"FIO test: {pattern}, block size: {bs}"
+                host_fio_cmds[host] = fio_cmd
+                host_fio_desc[host] = fio_desc
+                
+                logger.info(f"Starting FIO test on {host}: {test_name}")
+                thread = executor.execute_background(host, fio_cmd, fio_desc)
+                threads.append(thread)
+        
+        # Check if migration is needed
+        if pattern in config.migrate_workloads:
+            linux_runtime = parse_optional_runtime(config.test_runtime) or 0
+            windows_runtime = parse_optional_runtime(config.windows_test_runtime) or 0
+            test_runtime_int = max(linux_runtime, windows_runtime)
+            if test_runtime_int <= 0:
+                logger.warning(
+                    f"Migration configured for pattern '{pattern}' but runtime is omitted "
+                    f"(size-based) — skipping timed midpoint migration"
+                )
             else:
-                logger.debug(f"Skipping Linux test: {pattern} with block size {bs} (bs in {linux_block_sizes}? {bs in linux_block_sizes}, pattern in {linux_io_patterns}? {pattern in linux_io_patterns})")
-            
-            # Windows hosts
-            if bs in windows_block_sizes and pattern in windows_io_patterns:
-                for host in windows_hosts:
-                    fio_dir = normalize_windows_path(config.windows_fio_dir)
-                    mount_point_win = normalize_windows_path(config.windows_mount_point)
-                    output_dir_win = normalize_windows_path(config.windows_output_dir)
-                    
-                    # Ensure fio_dir has trailing slash for proper path construction
-                    if not fio_dir.endswith('/'):
-                        fio_dir += '/'
-                    
-                    # Match bash script format: "powershell cd {fio_dir} ; {fio_dir}/fio.exe ..."
-                    # FIO on Windows requires backslashes in the path format: d\:\fio\data
-                    # Convert forward slashes to backslashes
-                    # The format needed is: d\:\fio\data (backslash before colon, backslashes for path)
-                    mount_point_fio = mount_point_win.replace('/', '\\')
-                    # Ensure drive separator is \: (backslash-colon) not just :
-                    # If path starts with drive letter like "d:", convert to "d\:"
-                    if len(mount_point_fio) >= 2 and mount_point_fio[1] == ':':
-                        mount_point_fio = mount_point_fio[0] + '\\' + mount_point_fio[1:]
-                    fio_cmd = (
-                        f"powershell cd {fio_dir} ; {fio_dir}fio.exe "
-                        f"--ioengine=windowsaio "
-                        f"--name=fiodatafile "
-                        f"--directory={mount_point_fio} "
-                        f"--size={config.windows_test_size} "
-                        f"--rw={pattern} "
-                        f"--bs={bs} "
-                        f"--runtime={config.windows_test_runtime} "
-                        f"--direct={config.windows_direct_io} "
-                        f"--numjobs={config.windows_numjobs} "
-                        f"--time_based=1 "
-                        f"--iodepth={config.windows_iodepth} "
-                        f"--output-format={config.windows_output_format} "
-                        f"--thread "
-                        f"--group_reporting"
-                    )
-                    
-                    # Add rate_iops only if it's set (matches bash script logic)
-                    if config.windows_rate_iops:
-                        fio_cmd += f" --rate_iops={config.windows_rate_iops}"
-                    
-                    fio_cmd += f" --output={output_dir_win}/{test_name}.json"
-                    
-                    logger.info(f"Starting FIO test on {host}: {test_name}")
-                    thread = executor.execute_background(host, fio_cmd, f"FIO test: {pattern}, block size: {bs}")
-                    threads.append(thread)
-            
-            # Check if migration is needed
-            if pattern in config.migrate_workloads:
-                # Use max runtime from Linux and Windows for migration timing
-                linux_runtime = int(config.test_runtime) if config.test_runtime else 0
-                windows_runtime = int(config.windows_test_runtime) if config.windows_test_runtime else 0
-                test_runtime_int = max(linux_runtime, windows_runtime)
                 half_runtime = test_runtime_int // 2
-                logger.info(f"Migration configured for pattern '{pattern}' - will migrate VMs at {half_runtime}s (midpoint of {test_runtime_int}s runtime)")
+                logger.info(
+                    f"Migration configured for pattern '{pattern}' - will migrate VMs at "
+                    f"{half_runtime}s (midpoint of {test_runtime_int}s runtime)"
+                )
                 logger.info(f"Waiting {half_runtime}s before triggering VM migrations...")
                 time.sleep(half_runtime)
-                
+
                 logger.info("Triggering VM migrations at midpoint of test runtime...")
                 migrate_vms_during_test(config, pattern, executor)
+        
+        # Wait for all threads to start (they just start the FIO process)
+        for thread in threads:
+            thread.join(timeout=config.timeout_check_interval)  # Wait for thread to start the process
+        
+        # Now wait for FIO processes to actually complete
+        logger.info(
+            f"Waiting for all FIO tests to complete for test {test_counter}/{total_tests}: "
+            f"{pattern} with block size {bs} "
+            f"({tests_remaining} remaining)..."
+        )
+        linux_runtime = parse_optional_runtime(config.test_runtime) or 0
+        windows_runtime = parse_optional_runtime(config.windows_test_runtime) or 0
+        test_runtime_int = max(linux_runtime, windows_runtime)
+        size_based_test = test_runtime_int <= 0
+        if size_based_test:
+            logger.info(
+                "FIO wait mode: size-based (runtime omitted) — waiting until processes exit"
+            )
+        start_time = time.time()
+        check_interval = config.timeout_check_interval
+        active_hosts = list(host_fio_cmds.keys())
+        completed_hosts = set()
+        total_hosts = len(active_hosts)
+        
+        while True:
+            all_done = True
+            running_count = 0
+            running_hosts = []
+            check_failures = 0
+            recovery_candidates = []  # (host, status)
+            newly_completed = []
             
-            # Wait for all threads to start (they just start the FIO process)
-            for thread in threads:
-                thread.join(timeout=config.timeout_check_interval)  # Wait for thread to start the process
-            
-            # Now wait for FIO processes to actually complete
-            logger.info(f"Waiting for all FIO tests to complete for {pattern} with block size {bs}...")
-            # Use max runtime from Linux and Windows
-            linux_runtime = int(config.test_runtime) if config.test_runtime else 0
-            windows_runtime = int(config.windows_test_runtime) if config.windows_test_runtime else 0
-            test_runtime_int = max(linux_runtime, windows_runtime)
-            start_time = time.time()
-            check_interval = config.timeout_check_interval
-            
-            while True:
-                all_done = True
-                running_count = 0
-                check_failures = 0
-                
-                # Check all hosts in parallel using ThreadPoolExecutor
-                with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
-                    check_futures = {}
-                    for host in config.vm_hosts:
-                        if executor.is_windows_host(host):
-                            future = pool.submit(executor.check_task_running, host, "fio")
-                        else:
-                            future = pool.submit(executor.check_task_running, host, f"fio.*{test_name}")
-                        check_futures[future] = host
-                    
-                    for future in as_completed(check_futures):
-                        host = check_futures[future]
-                        try:
-                            is_running = future.result()
-                            if is_running:
-                                all_done = False
-                                running_count += 1
-                        except Exception as e:
-                            check_failures += 1
-                            logger.debug(f"Failed to check task status on {host}: {e}")
-                
-                if all_done:
-                    logger.info("All FIO test processes completed")
-                    break
-                
-                elapsed = time.time() - start_time
-                if elapsed > test_runtime_int + config.timeout_runtime_buffer:
-                    logger.warning(f"FIO test exceeded expected time ({test_runtime_int}s)")
-                    logger.warning(f"{running_count} hosts still have FIO processes running")
-                    # Check if result files exist - if they do, the test likely completed
-                    result_files_exist = 0
-                    with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
-                        file_futures = {}
-                        for host in config.vm_hosts:
-                            if executor.is_windows_host(host):
-                                output_dir_win = normalize_windows_path(config.windows_output_dir)
-                                check_cmd = f"powershell -Command \"Test-Path '{output_dir_win}/{test_name}.json'\""
-                            else:
-                                check_cmd = f"test -f {config.output_dir}/{test_name}.json && echo 'exists' || echo 'missing'"
-                            future = pool.submit(executor.execute_command, host, check_cmd, "Checking result file", max_retries=1, retry_interval=1, timeout=30)
-                            file_futures[future] = host
-                        for future in as_completed(file_futures):
-                            host = file_futures[future]
-                            success, output = future.result()
-                            if success:
-                                if executor.is_windows_host(host):
-                                    if "True" in output or "true" in output:
-                                        result_files_exist += 1
-                                else:
-                                    if "exists" in output:
-                                        result_files_exist += 1
-                    
-                    if result_files_exist == len(config.vm_hosts):
-                        logger.info(f"All result files exist - test completed successfully despite timeout warnings")
-                        break
+            # Check hosts that were started for this combo (parallel)
+            with ThreadPoolExecutor(max_workers=min(max(len(active_hosts), 1), config.max_workers)) as pool:
+                check_futures = {}
+                for host in active_hosts:
+                    if executor.is_windows_host(host):
+                        future = pool.submit(executor.check_task_status, host, "fio")
                     else:
-                        logger.warning(f"Only {result_files_exist}/{len(config.vm_hosts)} result files exist")
-                        break
+                        future = pool.submit(executor.check_task_status, host, f"fio.*{test_name}")
+                    check_futures[future] = host
                 
-                logger.info(f"Waiting for FIO tests... ({running_count} hosts still running, {int(elapsed)}s elapsed)")
-                time.sleep(check_interval)
+                for future in as_completed(check_futures):
+                    host = check_futures[future]
+                    try:
+                        status = future.result()
+                        if status == "running":
+                            access_issue_since.pop(host, None)
+                            all_done = False
+                            running_count += 1
+                            running_hosts.append(host)
+                        elif status in ("paused", "unreachable"):
+                            # Only recover if this host still needs a result for the current test
+                            if host in recovered_hosts:
+                                all_done = False  # wait / give up after prior recovery attempt
+                            elif executor.has_fio_result_file(host, test_name):
+                                access_issue_since.pop(host, None)
+                                logger.info(
+                                    f"{host}: Host {status} but result for {test_name} exists - treating as done"
+                                )
+                                if host not in completed_hosts:
+                                    completed_hosts.add(host)
+                                    newly_completed.append(host)
+                            else:
+                                all_done = False
+                                now = time.time()
+                                first_seen = access_issue_since.setdefault(host, now)
+                                issue_age = now - first_seen
+                                remaining_grace = max(0, UNREACHABLE_GRACE_WAIT - issue_age)
+                                if remaining_grace > 0:
+                                    logger.warning(
+                                        f"{host}: Host {status} during FIO test '{test_name}' - "
+                                        f"retrying (grace {int(issue_age)}s/{UNREACHABLE_GRACE_WAIT}s, "
+                                        f"{int(remaining_grace)}s left before VM restart)"
+                                    )
+                                else:
+                                    recovery_candidates.append((host, status))
+                        elif status == "stopped":
+                            # Finished, or never started / died without connectivity error.
+                            # If result is missing, check once for paused VMI before accepting done.
+                            if (host not in recovered_hosts
+                                    and host in host_fio_cmds
+                                    and not executor.has_fio_result_file(host, test_name)):
+                                if executor.is_vmi_paused(host):
+                                    all_done = False
+                                    now = time.time()
+                                    first_seen = access_issue_since.setdefault(host, now)
+                                    issue_age = now - first_seen
+                                    remaining_grace = max(0, UNREACHABLE_GRACE_WAIT - issue_age)
+                                    if remaining_grace > 0:
+                                        logger.warning(
+                                            f"{host}: FIO not running, no result, VMI paused - "
+                                            f"retrying (grace {int(issue_age)}s/{UNREACHABLE_GRACE_WAIT}s, "
+                                            f"{int(remaining_grace)}s left before VM restart)"
+                                        )
+                                    else:
+                                        recovery_candidates.append((host, "paused"))
+                                else:
+                                    access_issue_since.pop(host, None)
+                                    logger.warning(
+                                        f"{host}: FIO not running and no result for {test_name} "
+                                        f"(not paused) - treating as finished"
+                                    )
+                                    if host not in completed_hosts:
+                                        completed_hosts.add(host)
+                                        newly_completed.append(host)
+                            else:
+                                access_issue_since.pop(host, None)
+                                if host not in completed_hosts:
+                                    completed_hosts.add(host)
+                                    newly_completed.append(host)
+                    except Exception as e:
+                        check_failures += 1
+                        logger.debug(f"Failed to check task status on {host}: {e}")
             
-            test_counter += 1
-            logger.info(f"Completed test {test_counter - 1}: {pattern} with block size {bs}")
+            # After grace period: restart paused/unreachable VMs and relaunch FIO (once per host/test)
+            if recovery_candidates:
+                unique_hosts = []
+                seen = set()
+                for host, status in recovery_candidates:
+                    if host in seen or host in recovered_hosts:
+                        continue
+                    seen.add(host)
+                    unique_hosts.append((host, status))
+                
+                if unique_hosts:
+                    logger.warning(
+                        f"Recovering {len(unique_hosts)} paused/unreachable VM(s) for "
+                        f"{test_name} after {UNREACHABLE_GRACE_WAIT}s grace: "
+                        f"{[h for h, _ in unique_hosts]}"
+                    )
+                    
+                    def _recover(host: str) -> Tuple[str, bool]:
+                        return host, executor.recover_paused_vm_and_relaunch_fio(
+                            host,
+                            host_fio_cmds[host],
+                            test_name,
+                            host_fio_desc.get(host, f"FIO test: {pattern}, block size: {bs}"),
+                        )
+                    
+                    for host, _status in unique_hosts:
+                        recovered_hosts.add(host)
+                        access_issue_since.pop(host, None)
+                    
+                    recovered_ok = 0
+                    with ThreadPoolExecutor(max_workers=min(len(unique_hosts), config.max_workers)) as pool:
+                        recover_futures = [pool.submit(_recover, host) for host, _ in unique_hosts]
+                        for future in as_completed(recover_futures):
+                            host, ok = future.result()
+                            if ok:
+                                recovered_ok += 1
+                                logger.info(f"{host}: FIO relaunched after VM recovery")
+                            else:
+                                logger.error(f"{host}: VM recovery / FIO relaunch failed")
+                    
+                    if recovered_ok:
+                        if size_based_test:
+                            # Size-based: no known runtime; extend by buffer only
+                            extra = config.timeout_runtime_buffer
+                        else:
+                            extra = test_runtime_int + config.timeout_runtime_buffer
+                        deadline_extension += extra
+                        logger.info(
+                            f"Extended wait window by {extra}s after "
+                            f"{recovered_ok} VM recovery(ies)"
+                        )
+                    all_done = False
+                    running_count = max(running_count, recovered_ok)
+            
+            if newly_completed:
+                logger.info(
+                    f"FIO test completed on: {', '.join(sorted(newly_completed))}"
+                )
+            
+            if all_done:
+                logger.info(
+                    f"All FIO test processes completed for test {test_counter}/{total_tests}: "
+                    f"{pattern} with block size {bs}"
+                )
+                break
+            
+            elapsed = time.time() - start_time
+            remaining_hosts = [
+                h for h in active_hosts
+                if h not in completed_hosts
+            ]
+            # Time-based: enforce runtime + buffer. Size-based: only soft-cap if dataset_hard set.
+            over_deadline = False
+            if size_based_test:
+                if config.timeout_dataset_hard is not None:
+                    over_deadline = elapsed > (
+                        int(config.timeout_dataset_hard) + deadline_extension
+                    )
+            else:
+                over_deadline = elapsed > (
+                    test_runtime_int + config.timeout_runtime_buffer + deadline_extension
+                )
+            if over_deadline:
+                if size_based_test:
+                    logger.warning(
+                        f"FIO size-based test exceeded dataset_hard "
+                        f"({config.timeout_dataset_hard}s)"
+                    )
+                else:
+                    logger.warning(f"FIO test exceeded expected time ({test_runtime_int}s)")
+                logger.warning(
+                    f"{len(remaining_hosts)} hosts remaining"
+                    f"{(': ' + ', '.join(sorted(remaining_hosts))) if remaining_hosts else ''}"
+                )
+                # Check if result files exist - if they do, the test likely completed
+                result_files_exist = 0
+                hosts_to_check = active_hosts or list(config.vm_hosts)
+                with ThreadPoolExecutor(max_workers=min(len(hosts_to_check), config.max_workers)) as pool:
+                    file_futures = {}
+                    for host in hosts_to_check:
+                        future = pool.submit(executor.has_fio_result_file, host, test_name)
+                        file_futures[future] = host
+                    for future in as_completed(file_futures):
+                        host = file_futures[future]
+                        try:
+                            if future.result():
+                                result_files_exist += 1
+                        except Exception as e:
+                            logger.debug(f"Result file check failed on {host}: {e}")
+                
+                if result_files_exist == len(hosts_to_check):
+                    logger.info(f"All result files exist - test completed successfully despite timeout warnings")
+                    break
+                else:
+                    logger.warning(f"Only {result_files_exist}/{len(hosts_to_check)} result files exist")
+                    break
+            
+            logger.info(
+                f"Waiting for FIO test {test_counter}/{total_tests} "
+                f"({pattern} bs={bs})... "
+                f"({len(remaining_hosts)} hosts remaining"
+                f"{(': ' + ', '.join(sorted(remaining_hosts))) if remaining_hosts else ''}, "
+                f"{len(completed_hosts)}/{total_hosts} completed, "
+                f"{int(elapsed)}s elapsed, "
+                f"{tests_remaining} tests remaining after this)"
+            )
+            time.sleep(check_interval)
+        
+        logger.info(
+            f"Completed test {test_counter}/{total_tests}: {pattern} with block size {bs} "
+            f"({tests_remaining} remaining)"
+        )
     
-    logger.info("Completed all FIO performance tests")
+    logger.info(f"Completed all FIO performance tests ({total_tests} combinations)")
 
 
 def collect_results(config: FioTestConfig, executor: CommandExecutor, results_dir: str) -> None:
@@ -2814,28 +4325,17 @@ def collect_results(config: FioTestConfig, executor: CommandExecutor, results_di
         if success:
             return True, output
         
-        if "connection timed out" in (output or "").lower() or "dial tcp" in (output or "").lower():
-            logger.warning(f"{host}: Unreachable during archive creation - restarting VM...")
-            try:
-                restart_result = subprocess.run(
-                    ["virtctl", "-n", config.namespace, "restart", host],
-                    capture_output=True, text=True, timeout=config.timeout_connectivity
+        if executor._is_host_unreachable(output or ""):
+            if executor._probe_ssh_reachable(host):
+                logger.warning(
+                    f"{host}: Archive command failed but SSH reachable - not restarting VM"
                 )
-                if restart_result.returncode == 0:
-                    logger.info(f"{host}: VM restart initiated, waiting {VM_RESTART_WAIT}s for it to come back...")
-                    time.sleep(VM_RESTART_WAIT)
-                else:
-                    logger.error(f"{host}: virtctl restart failed: {restart_result.stderr}")
-                    return False, output
-            except Exception as e:
-                logger.error(f"{host}: Failed to restart VM: {e}")
                 return False, output
-            
-            success, output = executor.execute_command(host, cmd, f"Creating results archive for {host} (after restart)", max_retries=config.max_retries, retry_interval=config.retry_interval)
-            if success:
-                logger.info(f"{host}: Archive created successfully after VM restart")
-                return True, output
-            else:
+            if executor.restart_vm(host):
+                success, output = executor.execute_command(host, cmd, f"Creating results archive for {host} (after restart)", max_retries=config.max_retries, retry_interval=config.retry_interval)
+                if success:
+                    logger.info(f"{host}: Archive created successfully after VM restart")
+                    return True, output
                 logger.error(f"{host}: Still unreachable after restart - giving up")
                 return False, output
         
@@ -2985,6 +4485,7 @@ def generate_combined_results(results_dir: str, config: FioTestConfig) -> None:
                     "timestamp": run_timestamp,
                     "numjobs": config.windows_numjobs if is_windows else config.numjobs,
                     "iodepth": config.windows_iodepth if is_windows else config.iodepth,
+                    "ioengine": "windowsaio" if is_windows else config.ioengine,
                     "test_size": config.windows_test_size if is_windows else config.test_size,
                     "runtime": config.windows_test_runtime if is_windows else config.test_runtime,
                     "fio_results": fio_data,

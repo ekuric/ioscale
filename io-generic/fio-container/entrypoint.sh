@@ -3,6 +3,26 @@ set -euo pipefail
 
 CONFIG="${CONFIG:-/work/fio-config.yaml}"
 
+# --- Kubeconfig check (required for --virtctl-only) ---
+KUBECONFIG="${KUBECONFIG:-/root/.kube/config}"
+export KUBECONFIG
+if [[ ! -s "${KUBECONFIG}" ]]; then
+    echo "ERROR: kubeconfig missing or empty at ${KUBECONFIG}" >&2
+    echo "Mount the bastion kubeconfig, e.g.:" >&2
+    echo "  -v /root/.kube:/root/.kube:ro,Z -e KUBECONFIG=/root/.kube/config" >&2
+    ls -la /root/.kube 2>/dev/null || echo "( /root/.kube not present )" >&2
+    exit 1
+fi
+echo "Using kubeconfig: ${KUBECONFIG}"
+if ! oc whoami 2>/dev/null; then
+    echo "ERROR: oc cannot authenticate with ${KUBECONFIG}" >&2
+    echo "On the bastion verify: ls -la /root/.kube/config && oc whoami" >&2
+    echo "If SELinux is enforcing, remount with :Z (e.g. -v /root/.kube:/root/.kube:ro,Z)" >&2
+    oc whoami 2>&1 || true
+    exit 1
+fi
+echo "Cluster identity: $(oc whoami 2>/dev/null)  server=$(oc whoami --show-server 2>/dev/null || true)"
+
 # --- OC login (optional) ---
 if [[ -n "${KUBEADMIN_PASSWORD:-}" ]]; then
     API_URL="${API_URL:-https://api.ocp.example.com:6443}"
@@ -28,6 +48,9 @@ else
     RETRY_INTERVAL="${RETRY_INTERVAL:-30}"
     MAX_RETRIES="${MAX_RETRIES:-10}"
     MONITOR_INTERVAL="${MONITOR_INTERVAL:-60}"
+    MONITOR_VM="${MONITOR_VM:-false}"
+    MONITOR_VM_INTERVAL="${MONITOR_VM_INTERVAL:-10}"
+    MAX_WORKERS="${MAX_WORKERS:-}"
 
     # Detect what's requested
     HAS_LINUX=false
@@ -54,12 +77,15 @@ else
     LINUX_BLOCK=""
     if [[ "${HAS_LINUX}" == "true" ]]; then
         TEST_SIZE="${TEST_SIZE:-1G}"
-        RUNTIME="${RUNTIME:-300}"
+        # Unset → 300 (legacy default). Empty/null/0 → omit runtime (size-based, full --size).
+        RUNTIME="${RUNTIME-300}"
         BLOCK_SIZES="${BLOCK_SIZES:-4k 8k 128k}"
         IO_PATTERNS="${IO_PATTERNS:-read write randread randwrite}"
         NUMJOBS="${NUMJOBS:-4}"
         IODEPTH="${IODEPTH:-16}"
+        IOENGINE="${IOENGINE:-libaio}"
         DIRECT_IO="${DIRECT_IO:-1}"
+        FIO_INSTALLED="${FIO_INSTALLED:-false}"
         MOUNT_POINT="${MOUNT_POINT:-/root/tests/data}"
         FILESYSTEM="${FILESYSTEM:-xfs}"
         PERSISTENT="${PERSISTENT:-}"
@@ -91,9 +117,21 @@ else
 "
         done
 
+        case "${FIO_INSTALLED,,}" in
+            true|1|yes) FIO_INSTALLED_VALUE=true ;;
+            *) FIO_INSTALLED_VALUE=false ;;
+        esac
+
         RATE_IOPS_LINE=""
         if [[ -n "${RATE_IOPS:-}" ]]; then
             RATE_IOPS_LINE=$'\n'"  rate_iops: \"${RATE_IOPS}\""
+        fi
+
+        RUNTIME_LINE=""
+        if [[ -n "${RUNTIME}" && "${RUNTIME}" != "null" && "${RUNTIME}" != "0" ]]; then
+            RUNTIME_LINE=$'\n'"  runtime: \"${RUNTIME}\""
+        else
+            echo "Linux RUNTIME empty/null/0 — size-based mode (write full --size, no --time_based)"
         fi
 
         LINUX_BLOCK="vm:
@@ -107,13 +145,14 @@ ${DEVICE_BLOCK}  mount_point: \"${MOUNT_POINT}\"
   persistent: \"${PERSISTENT}\"
 
 fio:
-  test_size: \"${TEST_SIZE}\"
-  runtime: \"${RUNTIME}\"
+  test_size: \"${TEST_SIZE}\"${RUNTIME_LINE}
   block_sizes: \"${BLOCK_SIZES}\"
   io_patterns: \"${IO_PATTERNS}\"
   numjobs: \"${NUMJOBS}\"
   iodepth: \"${IODEPTH}\"
-  direct_io: \"${DIRECT_IO}\"${RATE_IOPS_LINE}
+  ioengine: \"${IOENGINE}\"
+  direct_io: \"${DIRECT_IO}\"
+  fio_installed: ${FIO_INSTALLED_VALUE}${RATE_IOPS_LINE}
 
 output:
   directory: \"${OUTPUT_DIR}\"
@@ -125,7 +164,8 @@ output:
     if [[ "${HAS_WINDOWS}" == "true" ]]; then
         WIN_RUN_DIR="${WIN_RUN_DIR:-d:/fio}"
         WIN_TEST_SIZE="${WIN_TEST_SIZE:-10GB}"
-        WIN_RUNTIME="${WIN_RUNTIME:-600}"
+        # Unset → 600 (legacy default). Empty/null/0 → omit runtime (size-based).
+        WIN_RUNTIME="${WIN_RUNTIME-600}"
         WIN_BLOCK_SIZES="${WIN_BLOCK_SIZES:-4k 8k 128k}"
         WIN_IO_PATTERNS="${WIN_IO_PATTERNS:-randread randwrite read write}"
         WIN_NUMJOBS="${WIN_NUMJOBS:-8}"
@@ -163,6 +203,13 @@ output:
             WIN_RATE_IOPS_LINE=$'\n'"    rate_iops: ${WIN_RATE_IOPS}"
         fi
 
+        WIN_RUNTIME_LINE=""
+        if [[ -n "${WIN_RUNTIME}" && "${WIN_RUNTIME}" != "null" && "${WIN_RUNTIME}" != "0" ]]; then
+            WIN_RUNTIME_LINE=$'\n'"    runtime: ${WIN_RUNTIME}"
+        else
+            echo "Windows WIN_RUNTIME empty/null/0 — size-based mode (write full --size, no --time_based)"
+        fi
+
         WINDOWS_BLOCK="
 windows:
 ${WIN_HOST_BLOCK}
@@ -173,8 +220,7 @@ ${WIN_DEVICE_BLOCK}    mount_point: '${WIN_MOUNT_POINT}'
 
   fio_win:
     run_dir: '${WIN_RUN_DIR}'
-    test_size: '${WIN_TEST_SIZE}'
-    runtime: ${WIN_RUNTIME}
+    test_size: '${WIN_TEST_SIZE}'${WIN_RUNTIME_LINE}
     block_sizes: '${WIN_BLOCK_SIZES}'
     io_patterns: '${WIN_IO_PATTERNS}'
     numjobs: ${WIN_NUMJOBS}
@@ -223,8 +269,17 @@ echo "---"
 # --- Run fio-tests.py from /work/results so output lands there ---
 cd /work/results
 
+EXTRA_ARGS=""
+if [[ "${MONITOR_VM}" == "true" ]]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --monitor-vm --monitor-vm-interval ${MONITOR_VM_INTERVAL}"
+fi
+if [[ -n "${MAX_WORKERS:-}" ]]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --max-workers ${MAX_WORKERS}"
+fi
+
 exec python3 /work/fio-tests.py \
     -c "${CONFIG}" \
     --virtctl-only \
     --yes-i-mean-it \
+    ${EXTRA_ARGS} \
     "$@"

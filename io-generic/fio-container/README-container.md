@@ -26,7 +26,7 @@ Mount your `fio-config.yaml`. Everything comes from the file. Best for complex
 or heavily customised setups.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./fio-config.yaml:/work/fio-config.yaml \
   -v /root/fio-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -38,7 +38,7 @@ podman run --rm \
 Or point to a baked-in example config ( however necessary to edit it for test machine names ):
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e CONFIG=/work/examples/example-simple.yaml \
   -v /root/fio-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -52,7 +52,7 @@ podman run --rm \
 No config file needed. Set Linux host and FIO variables.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="vm-{1..10}" \
   -e DEVICES="vm-{1..10}=vdc" \
   -e NAMESPACE="default" \
@@ -75,7 +75,7 @@ Set `WIN_HOSTS` or `WIN_HOST_PATTERN` plus `WIN_DEVICES`. Can be used alone
 **Windows-only:**
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e WIN_HOST_PATTERN="win-vm-{1..5}" \
   -e WIN_DEVICES="win-vm-{1..5}=1" \
   -e NAMESPACE="default" \
@@ -91,7 +91,7 @@ podman run --rm \
 **Mixed Linux + Windows:**
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="linux-vm-{1..5}" \
   -e DEVICES="linux-vm-{1..5}=vdc" \
   -e WIN_HOST_PATTERN="win-vm-{1..5}" \
@@ -134,6 +134,7 @@ Env vars are used when no config file is mounted (Modes 2 and 3).
 | `NUMJOBS` | `4` | Number of parallel FIO jobs |
 | `IODEPTH` | `16` | I/O depth |
 | `DIRECT_IO` | `1` | Direct I/O (1=bypass page cache) |
+| `FIO_INSTALLED` | `false` | Golden Linux image with FIO baked in (`true` = skip package check/install; `false` = install if missing) |
 | `RATE_IOPS` | -- | Optional IOPS rate limit |
 | `OUTPUT_DIR` | `/root/fio-results` | Result directory on remote hosts |
 | `OUTPUT_FORMAT` | `json+` | FIO output format |
@@ -168,6 +169,38 @@ Set `WIN_HOSTS` or `WIN_HOST_PATTERN` to activate the Windows section.
 | `WIN_OUTPUT_DIR` | `d:/fio/results` | Result directory on Windows hosts |
 | `WIN_OUTPUT_FORMAT` | `json+` | FIO output format |
 
+### Linux golden image (`fio_installed`)
+
+Use `fio_installed: true` in the `fio:` section of your YAML config (or
+`FIO_INSTALLED=true` when generating config from env vars) when Linux VMs were
+built from a golden qcow2 with FIO packages pre-installed — for example using
+`../imagecreator.sh` in this repo.
+
+| Value | Behavior on Linux hosts |
+|---|---|
+| `false` (default) | Run `dnf install -y fio xfsprogs util-linux` if `fio` is not already present |
+| `true` | Skip FIO package check/install on Linux (golden image) |
+
+YAML example:
+
+```yaml
+fio:
+  test_size: "5G"
+  runtime: 300
+  block_sizes: "4k 8k 128k"
+  io_patterns: "randread randwrite"
+  fio_installed: true
+```
+
+Env var example (with golden-image VMs):
+
+```bash
+-e FIO_INSTALLED=true \
+```
+
+Jenkins: set the `FIO_INSTALLED` build parameter to `true` when deploying VMs
+from the fio golden image (`Jenkinsfile`, `Jenkinsfile-linux`).
+
 ## Baked-in Example Configs
 
 The container includes example configs at `/work/examples/`:
@@ -183,7 +216,7 @@ The container includes example configs at `/work/examples/`:
 Copy one out to use as a starting point:
 
 ```bash
-podman run --rm quay.io/ekuric/fio-benchmark:latest cat /work/examples/example-simple.yaml > my-config.yaml
+podman run --rm --init --pids-limit=-1 quay.io/ekuric/fio-benchmark:latest cat /work/examples/example-simple.yaml > my-config.yaml
 ```
 
 ## fio-tests.py CLI Parameters
@@ -196,7 +229,7 @@ extra arguments after the image name are forwarded to `fio-tests.py`.
 Enable verbose output.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./fio-config.yaml:/work/fio-config.yaml \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
@@ -210,7 +243,7 @@ podman run --rm \
 Validate configuration and show what would be done without executing.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="vm-{1..5}" \
   -e DEVICES="vm-{1..5}=vdc" \
   -v /root/.kube/config:/root/.kube/config \
@@ -224,7 +257,7 @@ podman run --rm \
 Force plain SSH for all hosts (overrides the default `--virtctl-only`).
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./fio-config.yaml:/work/fio-config.yaml \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   quay.io/ekuric/fio-benchmark:latest \
@@ -233,10 +266,11 @@ podman run --rm \
 
 ### `--prepare-machine`
 
-Only install FIO dependencies on machines, skip all testing.
+Only install FIO dependencies on machines, skip all testing. When
+`fio_installed: true` on Linux-only runs, this step is skipped entirely.
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="vm-{1..10}" \
   -e DEVICES="vm-{1..10}=vdc" \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -251,7 +285,7 @@ podman run --rm \
 Only copy results from hosts (skip installation, preparation, and testing).
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./fio-config.yaml:/work/fio-config.yaml \
   -v /root/fio-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -286,7 +320,7 @@ Show detailed configuration parsing debug information.
 ### Config file only
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./fio-config.yaml:/work/fio-config.yaml \
   -v /root/fio-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -298,7 +332,7 @@ podman run --rm \
 ### Linux-only (env vars, all parameters)
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="vm-{1..10}" \
   -e DEVICES="vm-{1..10}=vdc" \
   -e NAMESPACE="default" \
@@ -322,10 +356,33 @@ podman run --rm \
   quay.io/ekuric/fio-benchmark:latest
 ```
 
+### Linux golden image (FIO pre-installed)
+
+Use this when VMs were created from a golden qcow2 built with
+`containers-bench/imagecreator.sh`:
+
+```bash
+podman run --rm --init --pids-limit=-1 \
+  -e HOST_PATTERN="fio-vm-{1..100}" \
+  -e DEVICES="fio-vm-{1..100}=vdb" \
+  -e FIO_INSTALLED=true \
+  -e TEST_SIZE="16G" \
+  -e RUNTIME=300 \
+  -e BLOCK_SIZES="4k 8k 128k" \
+  -e IO_PATTERNS="randread randwrite" \
+  -v /root/fio-results:/work/results \
+  -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/fio-benchmark:latest
+```
+
+Or mount a config file with `fio_installed: true` under the `fio:` section.
+
 ### Dry run with verbose output
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -v ./fio-config.yaml:/work/fio-config.yaml \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
@@ -336,7 +393,7 @@ podman run --rm \
 ### Multiple device patterns
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOSTS="vm-1 vm-2 bare1" \
   -e DEVICES="vm-1=vdc,vm-2=vdc,bare1=sdb" \
   -v /root/fio-results:/work/results \
@@ -349,7 +406,7 @@ podman run --rm \
 ### With VM migration during tests
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="vm-{1..20}" \
   -e DEVICES="vm-{1..20}=vdc" \
   -e RUNTIME=600 \
@@ -365,7 +422,7 @@ podman run --rm \
 ### Windows-only (env vars, all parameters)
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e WIN_HOST_PATTERN="win-vm-{1..5}" \
   -e WIN_DEVICES="win-vm-{1..5}=1" \
   -e NAMESPACE="default" \
@@ -391,7 +448,7 @@ podman run --rm \
 ### Mixed Linux + Windows (env vars, all parameters)
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e NAMESPACE="default" \
   -e DESCRIPTION="mixed linux-windows perf test" \
   -e HOST_PATTERN="linux-vm-{1..5}" \
@@ -430,7 +487,7 @@ podman run --rm \
 ### With oc login
 
 ```bash
-podman run --rm \
+podman run --rm --init --pids-limit=-1 \
   -e KUBEADMIN_PASSWORD="my-password" \
   -e API_URL="https://api.mycluster.example.com:6443" \
   -v ./fio-config.yaml:/work/fio-config.yaml \
@@ -605,7 +662,9 @@ When using env vars (no config file), set:
 - Any yum/dnf-based distribution (Fedora or CentOS recommended)
 - A separate data disk for testing, added to the VM at creation time
 - Passwordless SSH access enabled -- the public SSH key must be baked into the VM image at creation time
-- The script installs FIO and other dependencies automatically via dnf
+- FIO dependencies (`fio`, `xfsprogs`, `util-linux`):
+  - **Default (`fio_installed: false`)**: installed automatically via dnf if missing
+  - **Golden image (`fio_installed: true`)**: must be pre-installed in the VM image (see `../imagecreator.sh`)
 
 ### Windows VMs
 
@@ -628,5 +687,6 @@ When using env vars (no config file), set:
 - `/root/.kube/config` mount gives the container access to the OCP cluster.
 - Mount your SSH private key to `/root/.ssh/id_rsa` so `virtctl ssh` can authenticate.
 - `--yes-i-mean-it` is passed automatically to skip the device formatting confirmation prompt.
+- Set `fio_installed: true` (or `FIO_INSTALLED=true`) when using golden Linux images with FIO pre-baked; leave `false` for stock cloud images.
 - The entrypoint always prints the config before running, so you can see exactly what values are used.
 - Example configs are available inside the container at `/work/examples/`.

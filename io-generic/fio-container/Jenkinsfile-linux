@@ -6,50 +6,119 @@ pipeline {
     }
 
     parameters {
-        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP')
-        string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host')
-        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for bastion SSH key')
-        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/fio-benchmark:latest', description: 'Container image to run')
+        // ---------------------------------------------------------------------------
+        // Target selection
+        // CLUSTER=lab1/lab2 → uses profile map in "Resolve Target" (ignores fields below)
+        // CLUSTER=custom   → uses the editable string fields below (type any value)
+        // ---------------------------------------------------------------------------
+        choice(
+            name: 'CLUSTER',
+            choices: [
+                'custom',
+                'lab1',
+                'lab2'
+            ],
+            description: 'custom = type bastion/key/API below. lab1/lab2 = use built-in profile (edit profiles map in Jenkinsfile).'
+        )
+        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP (CLUSTER=custom)')
+        string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host (CLUSTER=custom)')
+        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for bastion SSH key (CLUSTER=custom)')
+        string(name: 'API_URL',           defaultValue: 'https://api.ocp.example.com:6443', description: 'OpenShift/Kubernetes API URL (CLUSTER=custom)')
+        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/fio-benchmark:latest', description: 'Container image to run (CLUSTER=custom; lab profiles may override)')
+        string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace for the VMs')
 
         string(name: 'HOST_PATTERN',      defaultValue: 'fio-vm-{1..10}',     description: 'Linux VM host pattern')
         string(name: 'DEVICES',           defaultValue: 'fio-vm-{1..10}=vdc', description: 'Device mapping (pattern=device, comma-separated)')
-        string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
 
         string(name: 'TEST_SIZE',         defaultValue: '16G',                 description: 'FIO test file size')
-        string(name: 'RUNTIME',           defaultValue: '300',                 description: 'Test runtime in seconds')
+        string(name: 'RUNTIME',           defaultValue: '300',                 description: 'Test runtime in seconds (leave empty = size-based: write full TEST_SIZE then stop)')
         string(name: 'BLOCK_SIZES',       defaultValue: '4k 8k 128k 1024k',  description: 'Block sizes (space-separated)')
         string(name: 'IO_PATTERNS',       defaultValue: 'read write randread randwrite randrw', description: 'I/O patterns (space-separated)')
         string(name: 'NUMJOBS',           defaultValue: '1',                  description: 'Number of parallel FIO jobs')
         string(name: 'IODEPTH',           defaultValue: '16',                 description: 'I/O depth')
-        string(name: 'DIRECT_IO',         defaultValue: '1',                  description: 'Direct I/O (1=bypass page cache, 0=use cache)')
+        choice(
+            name: 'DIRECT_IO',
+            choices: ['1', '0'],
+            description: 'Direct I/O (1=bypass page cache, 0=use cache)'
+        )
+        choice(
+            name: 'FIO_INSTALLED',
+            choices: ['false', 'true'],
+            description: 'VMs use golden image with FIO pre-installed (true=skip dnf/yum, false=install if missing)'
+        )
         string(name: 'RATE_IOPS',         defaultValue: '',                   description: 'IOPS rate limit (empty = unlimited)')
 
         string(name: 'INTERVAL',           defaultValue: '30',                  description: 'Seconds between failed ssh command attempts')
         string(name: 'MAX_RETRIES',       defaultValue: '10',                  description: 'Maximum number of failed ssh command attempts')
         string(name: 'MONITOR_INTERVAL',  defaultValue: '60',                  description: 'Seconds between task monitor checks')
         string(name: 'KUBEADMIN_PASSWORD', defaultValue: '',                   description: 'Kubernetes admin password')
-        string(name: 'API_URL',           defaultValue: 'https://api.ocp.example.com:6443', description: 'Kubernetes API URL')
 
         string(name: 'MIGRATE_WORKLOADS', defaultValue: '',                    description: 'I/O patterns triggering VM migration (empty = no migration)')
         string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
-        string(name: 'MONITOR_VM',        defaultValue: 'false',              description: 'Monitor VM node placement during tests and log migrations (true/false)')
+        choice(
+            name: 'MONITOR_VM',
+            choices: ['false', 'true'],
+            description: 'Monitor VM node placement during tests and log migrations'
+        )
         string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',               description: 'VM migration monitor polling interval in seconds')
         string(name: 'DESCRIPTION',       defaultValue: 'jenkins-fio-linux',  description: 'Test run description')
     }
 
     environment {
-        RESULTS_DIR  = '/root/fio-results'
-        BASTION_CONN = "${params.BASTION_USER}@${params.BASTION_HOST}"
+        RESULTS_DIR = '/root/fio-results'
     }
 
     stages {
+        stage('Resolve Target') {
+            steps {
+                script {
+                    // Edit this map when you add/remove labs. CLUSTER=custom uses the string parameters as-is.
+                    def profiles = [
+                        lab1: [
+                            bastionHost     : 'bastion.lab1.example.com',
+                            bastionUser     : 'root',
+                            sshCredentialId : 'lab1-bastion-key',
+                            apiUrl          : 'https://api.lab1.example.com:6443',
+                            containerImage  : 'quay.io/ekuric/fio-benchmark:latest',
+                        ],
+                        lab2: [
+                            bastionHost     : 'bastion.lab2.example.com',
+                            bastionUser     : 'root',
+                            sshCredentialId : 'lab2-bastion-key',
+                            apiUrl          : 'https://api.lab2.example.com:6443',
+                            containerImage  : 'quay.io/ekuric/fio-benchmark:latest',
+                        ],
+                    ]
+
+                    if (params.CLUSTER != 'custom' && profiles.containsKey(params.CLUSTER)) {
+                        def p = profiles[params.CLUSTER]
+                        env.RESOLVED_BASTION_HOST      = p.bastionHost
+                        env.RESOLVED_BASTION_USER      = p.bastionUser
+                        env.RESOLVED_SSH_CREDENTIAL_ID = p.sshCredentialId
+                        env.RESOLVED_API_URL           = p.apiUrl
+                        env.RESOLVED_CONTAINER_IMAGE   = p.containerImage
+                        echo "CLUSTER=${params.CLUSTER} → bastion=${p.bastionHost}, key=${p.sshCredentialId}, api=${p.apiUrl}"
+                    } else {
+                        env.RESOLVED_BASTION_HOST      = params.BASTION_HOST
+                        env.RESOLVED_BASTION_USER      = params.BASTION_USER
+                        env.RESOLVED_SSH_CREDENTIAL_ID = params.SSH_CREDENTIAL_ID
+                        env.RESOLVED_API_URL           = params.API_URL
+                        env.RESOLVED_CONTAINER_IMAGE   = params.CONTAINER_IMAGE
+                        echo "CLUSTER=custom → using parameters: bastion=${params.BASTION_HOST}, key=${params.SSH_CREDENTIAL_ID}, api=${params.API_URL}"
+                    }
+
+                    env.BASTION_CONN = "${env.RESOLVED_BASTION_USER}@${env.RESOLVED_BASTION_HOST}"
+                }
+            }
+        }
+
         stage('Prepare') {
             steps {
-                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                sshagent(credentials: [env.RESOLVED_SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
                             mkdir -p ${RESULTS_DIR}
-                            podman pull ${params.CONTAINER_IMAGE} || true
+                            podman pull ${RESOLVED_CONTAINER_IMAGE} || true
                         '
                     """
                 }
@@ -58,20 +127,21 @@ pipeline {
 
         stage('Run FIO Linux Test') {
             steps {
-                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                sshagent(credentials: [env.RESOLVED_SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
-                            podman run --rm --pids-limit=-1 \
+                            podman run --rm --init --pids-limit=-1 \
                               -e HOST_PATTERN="${params.HOST_PATTERN}" \
                               -e DEVICES="${params.DEVICES}" \
                               -e NAMESPACE="${params.NAMESPACE}" \
                               -e TEST_SIZE="${params.TEST_SIZE}" \
-                              -e RUNTIME=${params.RUNTIME} \
+                              -e RUNTIME="${params.RUNTIME}" \
                               -e BLOCK_SIZES="${params.BLOCK_SIZES}" \
                               -e IO_PATTERNS="${params.IO_PATTERNS}" \
                               -e NUMJOBS=${params.NUMJOBS} \
                               -e IODEPTH=${params.IODEPTH} \
                               -e DIRECT_IO=${params.DIRECT_IO} \
+                              -e FIO_INSTALLED="${params.FIO_INSTALLED}" \
                               -e RATE_IOPS="${params.RATE_IOPS}" \
                               -e MIGRATE_WORKLOADS="${params.MIGRATE_WORKLOADS}" \
                               -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
@@ -81,13 +151,14 @@ pipeline {
                               -e MONITOR_VM="${params.MONITOR_VM}" \
                               -e MONITOR_VM_INTERVAL=${params.MONITOR_VM_INTERVAL} \
                               -e KUBEADMIN_PASSWORD="${params.KUBEADMIN_PASSWORD}" \
-                              -e API_URL="${params.API_URL}" \
+                              -e API_URL="${RESOLVED_API_URL}" \
                               -e DESCRIPTION="${params.DESCRIPTION}" \
-                              -v ${RESULTS_DIR}:/work/results \
-                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
-                              -v /root/.kube/config:/root/.kube/config \
+                              -e KUBECONFIG=/root/.kube/config \
+                              -v ${RESULTS_DIR}:/work/results:Z \
+                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro,Z \
+                              -v /root/.kube:/root/.kube:ro,Z \
                               --privileged \
-                              ${params.CONTAINER_IMAGE}
+                              ${RESOLVED_CONTAINER_IMAGE}
                         '
                     """
                 }
@@ -96,7 +167,7 @@ pipeline {
 
         stage('Collect Results') {
             steps {
-                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                sshagent(credentials: [env.RESOLVED_SSH_CREDENTIAL_ID]) {
                     sh """
                         mkdir -p fio-results
                         scp -o StrictHostKeyChecking=no -r \
@@ -121,6 +192,10 @@ pipeline {
             echo "FIO Linux test failed. Check the console output for details."
         }
         always {
+            echo "Cluster: ${params.CLUSTER}"
+            echo "Bastion: ${env.BASTION_CONN ?: '(not resolved)'}"
+            echo "SSH credential: ${env.RESOLVED_SSH_CREDENTIAL_ID ?: params.SSH_CREDENTIAL_ID}"
+            echo "API URL: ${env.RESOLVED_API_URL ?: params.API_URL}"
             echo "Test description: ${params.DESCRIPTION}"
             echo "Hosts: ${params.HOST_PATTERN}"
             echo "Block sizes: ${params.BLOCK_SIZES}"
