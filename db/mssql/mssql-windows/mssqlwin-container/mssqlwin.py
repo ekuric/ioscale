@@ -89,6 +89,7 @@ class MSSQLWinConfig:
         self.windows_rebuild_always = False
         self.generate_only = False
         self.windows_mssql_pass = None
+        self.max_server_memory_mb = None
         self.windows_disk_id = "1"
         self.windows_rebuild_timeout = None
         self.windows_mssql_service_name = None
@@ -398,6 +399,7 @@ class CommandExecutor:
                 )
                 output_lines = []
                 start_time = time.time()
+                timed_out = False
                 while True:
                     line = process.stdout.readline() if process.stdout else ""
                     if line:
@@ -409,35 +411,47 @@ class CommandExecutor:
                         break
                     if cmd_timeout and (time.time() - start_time) > cmd_timeout:
                         process.kill()
-                        if attempt < max_retries:
-                            if not quiet:
-                                logger.warning(f"Command timeout on {host} (attempt {attempt}/{max_retries}): {description} (timeout: {cmd_timeout}s)")
-                                logger.warning(f"Retrying in {retry_interval}s...")
-                            time.sleep(retry_interval)
-                            break
-                        else:
-                            if not quiet:
-                                logger.error(f"Command timeout on {host}: {description} (timeout: {cmd_timeout}s) after {max_retries} attempts")
-                            return False, "Command timeout"
-                else:
-                    returncode = process.wait()
-                    output = "".join(output_lines)
-                    if returncode == 0:
-                        return True, output
+                        timed_out = True
+                        break
+
+                if timed_out:
                     if attempt < max_retries:
                         if not quiet:
-                            logger.warning(f"Command failed on {host} (attempt {attempt}/{max_retries}): {description}")
-                            logger.warning(f"Exit code: {returncode}")
+                            logger.warning(
+                                f"Command timeout on {host} (attempt {attempt}/{max_retries}): "
+                                f"{description} (timeout: {cmd_timeout}s)"
+                            )
                             logger.warning(f"Retrying in {retry_interval}s...")
                         time.sleep(retry_interval)
                         continue
                     if not quiet:
-                        logger.error(f"Failed to execute '{description}' on {host} after {max_retries} attempts")
-                    error_output = output.strip() or f"Exit code: {returncode}"
+                        logger.error(
+                            f"Command timeout on {host}: {description} "
+                            f"(timeout: {cmd_timeout}s) after {max_retries} attempts"
+                        )
+                    return False, "Command timeout"
+
+                returncode = process.wait()
+                output = "".join(output_lines)
+                if returncode == 0:
+                    return True, output
+                if attempt < max_retries:
                     if not quiet:
-                        logger.error(f"Error output: {error_output}")
-                    return False, error_output
-                continue
+                        logger.warning(
+                            f"Command failed on {host} (attempt {attempt}/{max_retries}): {description}"
+                        )
+                        logger.warning(f"Exit code: {returncode}")
+                        logger.warning(f"Retrying in {retry_interval}s...")
+                    time.sleep(retry_interval)
+                    continue
+                if not quiet:
+                    logger.error(
+                        f"Failed to execute '{description}' on {host} after {max_retries} attempts"
+                    )
+                error_output = output.strip() or f"Exit code: {returncode}"
+                if not quiet:
+                    logger.error(f"Error output: {error_output}")
+                return False, error_output
             except Exception as e:
                 if attempt < max_retries:
                     if not quiet:
@@ -876,6 +890,9 @@ class ConfigLoader:
             db_mssql_pass = None
         if db_mssql_pass:
             self.config.windows_mssql_pass = db_mssql_pass
+        max_server_memory_mb = database.get("max_server_memory_mb")
+        if max_server_memory_mb not in (None, "", "null"):
+            self.config.max_server_memory_mb = int(max_server_memory_mb)
 
         test = yaml_data.get("test", {})
         user_count = test.get("user_count")
@@ -1134,6 +1151,10 @@ def display_config(config: MSSQLWinConfig) -> None:
         logger.info(f"Windows hammerdb_test_script (local override): {config.windows_hammerdb_test_script_local}")
     if config.windows_mssql_pass:
         logger.info("Windows mssql_pass: [SET]")
+    if config.max_server_memory_mb is not None:
+        logger.info(f"Max server memory: {config.max_server_memory_mb} MB")
+    else:
+        logger.info("Max server memory: not configured (SQL Server default/unlimited)")
     logger.info(f"Windows rebuild_only: {'ENABLED' if config.windows_rebuild_only else 'DISABLED'}")
     logger.info(f"Windows rebuild_always: {'ENABLED' if config.windows_rebuild_always else 'DISABLED'}")
     logger.info(f"Windows test_only: {'ENABLED' if config.windows_test_only else 'DISABLED'}")
@@ -1145,6 +1166,83 @@ def display_config(config: MSSQLWinConfig) -> None:
     logger.info(f"Log level: {config.log_level}")
     logger.info(f"Timeouts - default: {config.timeout_default}s, scp: {config.timeout_scp}s, test: {config.timeout_test}s, prepare: {config.timeout_prepare}s")
     logger.info(f"Timeouts - vm_lookup: {config.timeout_vm_lookup}s, label_query: {config.timeout_label_query}s, oc_command: {config.timeout_oc_command}s")
+
+
+def configure_mssql_memory_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None:
+    """Set max server memory on all Windows hosts via sp_configure (no restart required)."""
+    if config.max_server_memory_mb is None:
+        logger.info("max_server_memory_mb not configured — skipping SQL Server memory cap")
+        return
+
+    cap_mb = int(config.max_server_memory_mb)
+    if cap_mb < 2048:
+        logger.error(f"max_server_memory_mb must be at least 2048 (got {cap_mb})")
+        sys.exit(1)
+
+    logger.info(f"Setting max server memory to {cap_mb} MB on all Windows hosts...")
+    sql = (
+        "EXEC sp_configure 'show advanced options', 1; "
+        "RECONFIGURE; "
+        f"EXEC sp_configure 'max server memory', {cap_mb}; "
+        "RECONFIGURE; "
+        "SELECT name, value_in_use FROM sys.configurations "
+        "WHERE name = 'max server memory (MB)';"
+    )
+    # Double-quoted PowerShell string: SQL uses single quotes for identifiers.
+    sql_ps = sql.replace('"', '`"')
+    ps_lines = [
+        "$ErrorActionPreference = 'Stop'",
+        "$waitSeconds = 120",
+        "$retryInterval = 5",
+        "$elapsed = 0",
+        "Write-Host 'Waiting for SQL Server before setting max server memory...'",
+        "while ($elapsed -lt $waitSeconds) {",
+        "  sqlcmd -S localhost -E -Q \"SELECT 1\" -b -l 5 -t 5 *> $null",
+        "  if ($LASTEXITCODE -eq 0) { Write-Host 'SQL Server is ready.'; break }",
+        "  Start-Sleep -Seconds $retryInterval",
+        "  $elapsed += $retryInterval",
+        "}",
+        "if ($elapsed -ge $waitSeconds) { Write-Error 'SQL Server did not become ready'; exit 1 }",
+        f'$sql = "{sql_ps}"',
+    ]
+    if config.windows_mssql_pass:
+        pass_escaped = (
+            config.windows_mssql_pass
+            .replace("`", "``")
+            .replace('"', '`"')
+            .replace("$", "`$")
+        )
+        ps_lines.append(f'$pass = "{pass_escaped}"')
+        ps_lines.append("sqlcmd -S localhost -U sa -P $pass -Q $sql -b -l 30 -t 60")
+    else:
+        ps_lines.append("sqlcmd -S localhost -E -Q $sql -b -l 30 -t 60")
+    ps_lines.append("if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }")
+
+    cmd = build_powershell_command("; ".join(ps_lines))
+    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        futures = [
+            pool.submit(
+                executor.execute_command,
+                host,
+                cmd,
+                f"Setting max server memory to {cap_mb} MB on {host}",
+                config.timeout_default,
+            )
+            for host in config.db_hosts
+        ]
+        failed = 0
+        for future in as_completed(futures):
+            success, output = future.result()
+            if not success:
+                logger.error(f"Failed to set max server memory: {output}")
+                failed += 1
+            else:
+                logger.info(f"max server memory configured: {output.strip()[:200]}")
+        if failed > 0:
+            logger.error(f"{failed}/{len(config.db_hosts)} hosts failed to set max server memory")
+            sys.exit(1)
+
+    logger.info(f"Max server memory set to {cap_mb} MB on all Windows hosts")
 
 
 def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) -> None:
@@ -2519,6 +2617,7 @@ EXAMPLES:
         if not config.windows_rebuilddb:
             logger.error("windows.rebuild_only is enabled but windows.rebuilddb is false")
             sys.exit(1)
+        configure_mssql_memory_windows(config, executor)
         build_database_windows(config, executor)
         logger.info("Rebuild-only mode complete; skipping tests and result collection")
         return
@@ -2528,6 +2627,7 @@ EXAMPLES:
         _move_log_to_results(log_file, results_dir)
         return
 
+    configure_mssql_memory_windows(config, executor)
     if not config.windows_test_only:
         build_database_windows(config, executor)
 

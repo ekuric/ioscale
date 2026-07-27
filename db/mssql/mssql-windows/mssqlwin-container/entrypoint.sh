@@ -66,6 +66,11 @@ else
         MSSQL_PASS_LINE=$'\n'"  mssql_pass: \"${MSSQL_PASS}\""
     fi
 
+    MAX_SERVER_MEMORY_LINE=""
+    if [[ -n "${MAX_SERVER_MEMORY_MB:-}" ]]; then
+        MAX_SERVER_MEMORY_LINE=$'\n'"  max_server_memory_mb: ${MAX_SERVER_MEMORY_MB}"
+    fi
+
     cat > "${CONFIG}" <<EOF
 description: "${DESCRIPTION}"
 
@@ -76,7 +81,7 @@ ${HOST_BLOCK}
   build_users: ${BUILD_USERS}
   mssql_total_iterations: ${MSSQL_TOTAL_ITERATIONS}
   test_duration: ${TEST_DURATION}${RAMPUP_LINE}
-  user_count: "${USER_COUNT}"${MSSQL_PASS_LINE}
+  user_count: "${USER_COUNT}"${MSSQL_PASS_LINE}${MAX_SERVER_MEMORY_LINE}
 
 windows:
   hammerdb_path: '${HAMMERDB_PATH}'
