@@ -37,7 +37,11 @@ database:
   test_duration: 15              # Test duration in minutes
   # rampup_time: 2               # Ramp-up time in minutes (defaults to 2 if not set)
   mssql_pass: "mssqlpasswd1!"    # SA password for sqlcmd/ODBC
-  # max_server_memory_mb: 38000   # SQL Server memory cap in MB (e.g. 38000 on ~50GB VM; omit = unlimited)
+  # Optional: cap SQL Server buffer pool via sp_configure 'max server memory' (MB).
+  # Applied on all hosts after MSSQL setup (no service restart). Minimum 2048.
+  # Leave omitted/empty for SQL Server default (effectively unlimited / OS-managed).
+  # Example: 38000 on a ~50GB VM leaves headroom for HammerDB and the OS.
+  # max_server_memory_mb: 38000
   rebuilddb: true                # Build database before tests
   rebuild_only: false            # Only rebuild database, skip tests/results
   test_only: false               # Only run tests on existing database

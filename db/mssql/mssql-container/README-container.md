@@ -71,6 +71,7 @@ podman run --rm --init --pids-limit=-1 \
   -e TEST_DURATION=15 \
   -e USER_COUNT="1 10 20 50" \
   -e MSSQL_PASS="mssqlpasswd1!" \
+  -e MAX_SERVER_MEMORY_MB=38000 \
   -e REBUILDDB=true \
   -e HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts" \
   -v /root/mssqldb-results:/work/results \
@@ -108,6 +109,7 @@ Env vars are used when no config file is mounted (Mode 2).
 | `TEST_DURATION` | `15` | Test duration in minutes |
 | `USER_COUNT` | `1` | Space-separated user counts (e.g. `"1 10 20 50"`) |
 | `MSSQL_PASS` | `mssqlpasswd1!` | SA password for sqlcmd/ODBC |
+| `MAX_SERVER_MEMORY_MB` | -- | Optional SQL Server `max server memory` cap in MB (e.g. `38000` on a ~50GB VM). Omit/empty = unlimited. Minimum `2048`. Set via `sp_configure` (no restart). |
 | `REBUILDDB` | `true` | Build database before tests (true/false) |
 | `REBUILD_ONLY` | `false` | Only rebuild database, skip tests (true/false) |
 | `TEST_ONLY` | `false` | Only run tests on existing database (true/false) |
@@ -122,6 +124,20 @@ Env vars are used when no config file is mounted (Mode 2).
 | `MONITOR_INTERVAL` | `60` | Task monitor interval in seconds |
 | `KUBEADMIN_PASSWORD` | -- | If set, runs `oc login` before the test |
 | `API_URL` | `https://api.ocp.example.com:6443` | Cluster API URL for `oc login` |
+
+### Optional SQL Server max memory
+
+Cap the SQL Server buffer pool so HammerDB and the OS keep RAM:
+
+**YAML** (`database` section):
+```yaml
+database:
+  max_server_memory_mb: 38000   # MB; omit = unlimited; min 2048
+```
+
+**Env / Jenkins:** `-e MAX_SERVER_MEMORY_MB=38000` (parameter `MAX_SERVER_MEMORY_MB`).
+
+Applied after MSSQL setup with `sp_configure 'max server memory'` (no restart).
 
 ## mssqldb.py CLI Parameters
 
@@ -344,3 +360,4 @@ Or mount the entire `.ssh` directory:
 - Templates are not baked in -- they come from the git repo cloned on remote hosts at runtime.
 - The entrypoint always prints the config before running, so you can see exactly what values are used.
 - `mssql_pass` is required for MSSQL Server SA authentication via sqlcmd/ODBC.
+- Optional `MAX_SERVER_MEMORY_MB` / YAML `database.max_server_memory_mb` sets SQL Server `max server memory` (MB) on all hosts after setup via `sp_configure` (no restart). Omit for unlimited. Use a value below VM RAM so HammerDB and the OS keep headroom (e.g. `38000` on a ~50GB VM). Minimum `2048`.
