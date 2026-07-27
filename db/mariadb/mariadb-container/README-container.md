@@ -7,8 +7,17 @@ environment variables.
 ## Building
 
 ```bash
-cd db/mariadb/mariadb-container
+cd containers-bench/mariadb-container
 podman build -t quay.io/ekuric/mariadb-benchmark:latest .
+```
+
+HammerDB MariaDB wrapper scripts from [ioscale](https://github.com/ekuric/ioscale) are
+baked into the image at `/work/hammerdb-bundled` at build time. Pin a specific version:
+
+```bash
+podman build \
+  --build-arg IOSCALE_REF=main \
+  -t quay.io/ekuric/mariadb-benchmark:latest .
 ```
 
 Override the virtctl version at build time:
@@ -59,7 +68,7 @@ podman run --rm --init --pids-limit=-1 \
   -e WAREHOUSE_COUNT=50 \
   -e TEST_DURATION=15 \
   -e USER_COUNT="1 10 20 50" \
-  -e HAMMERDB_REPO="https://github.com/ekuric/fusion-access.git" \
+  -e HAMMERDB_SOURCE=bundled \
   -e HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts" \
   -e HAMMERDB_INSTALL_DIR="/usr/local/HammerDB" \
   -v /root/mariadb-results:/work/results \
@@ -95,9 +104,11 @@ Env vars are used when no config file is mounted (Mode 2).
 | `WAREHOUSE_COUNT` | `50` | TPCC warehouse count |
 | `TEST_DURATION` | `15` | Test duration in minutes |
 | `USER_COUNT` | `1` | Space-separated user counts (e.g. `"1 10 20 50"`) |
-| `HAMMERDB_REPO` | `https://github.com/ekuric/fusion-access.git` | Git repo with HammerDB wrapper scripts |
-| `HAMMERDB_PATH` | `/root/hammerdb-tpcc-wrapper-scripts` | Clone path on remote hosts |
+| `HAMMERDB_SOURCE` | `bundled` | Script source: `bundled` (from image) or `remote_git` (clone on each VM) |
+| `HAMMERDB_BUNDLED_PATH` | `/work/hammerdb-bundled` | Path to bundled scripts inside the container |
+| `HAMMERDB_PATH` | `/root/hammerdb-tpcc-wrapper-scripts` | Deploy path on remote hosts |
 | `HAMMERDB_INSTALL_DIR` | `/usr/local/HammerDB` | HammerDB installation directory on remote hosts |
+| `HAMMERDB_REPO` | `https://github.com/ekuric/ioscale.git` | Only used when `HAMMERDB_SOURCE=remote_git` |
 | `MIGRATE_USER_COUNTS` | -- | User counts that trigger VM migration (e.g. `"4 8"`) |
 | `MIGRATE_INTERVAL` | `0` | Seconds between migrations (0 = parallel) |
 | `RETRY_INTERVAL` | `30` | Retry interval in seconds |
@@ -177,6 +188,9 @@ podman run --rm --init --pids-limit=-1 \
 
 ### Env vars only (all parameters)
 
+Default HammerDB source is **bundled** (scripts from `/work/hammerdb-bundled` in the image).
+`HAMMERDB_REPO` is only used when `HAMMERDB_SOURCE=remote_git`.
+
 ```bash
 podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="vm-{1..10}" \
@@ -187,7 +201,8 @@ podman run --rm --init --pids-limit=-1 \
   -e WAREHOUSE_COUNT=50 \
   -e TEST_DURATION=15 \
   -e USER_COUNT="1 10 20 50" \
-  -e HAMMERDB_REPO="https://github.com/ekuric/fusion-access.git" \
+  -e HAMMERDB_SOURCE=bundled \
+  -e HAMMERDB_BUNDLED_PATH="/work/hammerdb-bundled" \
   -e HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts" \
   -e HAMMERDB_INSTALL_DIR="/usr/local/HammerDB" \
   -e RETRY_INTERVAL=30 \
@@ -200,6 +215,14 @@ podman run --rm --init --pids-limit=-1 \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
   quay.io/ekuric/mariadb-benchmark:latest
+```
+
+Optional: clone scripts from git on each VM instead of using the image bundle:
+
+```bash
+  -e HAMMERDB_SOURCE=remote_git \
+  -e HAMMERDB_REPO="https://github.com/ekuric/ioscale.git" \
+  -e HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts" \
 ```
 
 ### Dry run with verbose output
@@ -248,6 +271,7 @@ Or mount the entire `.ssh` directory:
 /work/
   mariadb.py
   entrypoint.sh
+  hammerdb-bundled/         (ioscale templates/mariadb, baked at image build)
   mariadb-config.yaml         (mounted by user, or generated from env vars)
   examples/
     mariadb-config.yaml       (baked-in reference config)
@@ -346,5 +370,5 @@ When using env vars (no config file), set:
 - `--privileged` is needed for the virtctl SSH proxy to work.
 - `/root/.kube/config` mount gives the container access to the OCP cluster.
 - Mount your SSH private key to `/root/.ssh/id_rsa` so `virtctl ssh` can authenticate.
-- Templates are not baked in -- they come from the git repo cloned on remote hosts at runtime.
+- Default `HAMMERDB_SOURCE=bundled` deploys scripts from `/work/hammerdb-bundled` in the image. Use `remote_git` only when you want each VM to clone `HAMMERDB_REPO` at runtime.
 - The entrypoint always prints the config before running, so you can see exactly what values are used.

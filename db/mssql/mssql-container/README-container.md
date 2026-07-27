@@ -73,6 +73,7 @@ podman run --rm --init --pids-limit=-1 \
   -e MSSQL_PASS="mssqlpasswd1!" \
   -e MAX_SERVER_MEMORY_MB=38000 \
   -e REBUILDDB=true \
+  -e HAMMERDB_SOURCE=bundled \
   -e HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts" \
   -v /root/mssqldb-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
@@ -210,6 +211,9 @@ podman run --rm --init --pids-limit=-1 \
 
 ### Env vars only (all parameters)
 
+Default HammerDB source is **bundled** (scripts from `/work/hammerdb-bundled` in the image).
+`HAMMERDB_REPO` is only used when `HAMMERDB_SOURCE=remote_git`.
+
 ```bash
 podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="mssql-{1..10}" \
@@ -222,10 +226,12 @@ podman run --rm --init --pids-limit=-1 \
   -e TEST_DURATION=15 \
   -e USER_COUNT="1 10 20 50" \
   -e MSSQL_PASS="mssqlpasswd1!" \
+  -e MAX_SERVER_MEMORY_MB=38000 \
   -e REBUILDDB=true \
   -e REBUILD_ONLY=false \
   -e TEST_ONLY=false \
-  -e HAMMERDB_REPO="https://github.com/ekuric/fusion-access.git" \
+  -e HAMMERDB_SOURCE=bundled \
+  -e HAMMERDB_BUNDLED_PATH="/work/hammerdb-bundled" \
   -e HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts" \
   -e RETRY_INTERVAL=30 \
   -e MAX_RETRIES=10 \
@@ -237,6 +243,14 @@ podman run --rm --init --pids-limit=-1 \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
   quay.io/ekuric/mssqllin-benchmark:latest
+```
+
+Optional: clone scripts from git on each VM instead of using the image bundle:
+
+```bash
+  -e HAMMERDB_SOURCE=remote_git \
+  -e HAMMERDB_REPO="https://github.com/ekuric/ioscale.git" \
+  -e HAMMERDB_PATH="/root/hammerdb-tpcc-wrapper-scripts" \
 ```
 
 ### Dry run with verbose output
