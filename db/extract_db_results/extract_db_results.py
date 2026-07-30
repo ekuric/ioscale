@@ -9,8 +9,11 @@ and generates PNG graphs showing VM numbers vs TPM performance.
 
 Supports:
 - PostgreSQL: Files containing "test_postgresql_pg" or "test_ESX_pg" and "PostgreSQL TPM" results
+  (formats: "System achieved X PostgreSQL TPM at Y NOPM" or "System achieved Y NOPM from X PostgreSQL TPM")
 - MariaDB: Files containing "test_mariadb" and "MySQL TPM" results
+  (formats: "System achieved X MySQL TPM at Y NOPM" or "System achieved Y NOPM from X MySQL TPM")
 - MSSQL Server: Files containing "test_mssql" and "SQL Server TPM" results
+  (formats: "System achieved X SQL Server TPM at Y NOPM" or "System achieved Y NOPM from X SQL Server TPM")
 
 Usage:
     # Single directory processing (new recommended syntax)
@@ -18,6 +21,10 @@ Usage:
     
     # Multiple directories with comparison graphs (new recommended syntax)
     python3 extract_db_results.py --input-dir dir1 --input-dir dir2 --input-dir dir3 --output-dir output_directory
+
+    # Custom display names for comparison legends/tables (paired with --input-dir order)
+    python3 extract_db_results.py --input-dir dir1 --input-dir dir2 --output-dir out \\
+        --run-labels "250vm,500vm"
     
     # Force comparison graphs even with single directory
     python3 extract_db_results.py --input-dir input_directory --output-dir output_directory --compare
@@ -36,6 +43,9 @@ Usage:
 Arguments:
     --input-dir: Input directory containing subdirectories with .out files (can be specified multiple times)
     --output-dir: Directory to save CSV and PNG output files (default: postgresql_analysis)
+    --run-labels: Comma-separated display labels for --input-dir entries, paired by position
+                  (1st label → 1st dir, …). Count must match. Used as-is in comparison
+                  legends/tables and per-run output subdirectory names. Default: directory basenames
     --compare: Force creation of comparison graphs
     --chart-type: Type of chart to create - scatter (dots only), line (with connections), or bar (default: scatter)
     --users: Comma-separated list of user counts to include in graphs (e.g., "1,20" or "1, 20"). Only specified user counts will be shown on graphs.
@@ -95,6 +105,33 @@ def format_tpm_value(value):
             return f'{value/1000:.1f}K'
     else:
         return f'{value:.0f}'
+
+
+def get_machine_xaxis_step(num_machines):
+    """
+    Return x-axis label interval based on the number of test machines.
+
+    - Fewer than 100 machines: label every 10th
+    - 100-499 machines: label every 25th
+    - 500 or more machines: label every 50th
+    """
+    if num_machines < 100:
+        return 10
+    if num_machines < 500:
+        return 25
+    return 50
+
+
+def get_machine_xaxis_ticks(positions, labels, num_machines):
+    """Return sparse (x_positions, x_labels) for machine-number x-axis ticks."""
+    step = get_machine_xaxis_step(num_machines)
+    x_positions = []
+    x_labels = []
+    for i, (pos, label) in enumerate(zip(positions, labels)):
+        if (i + 1) % step == 1 or i == 0:
+            x_positions.append(pos)
+            x_labels.append(label)
+    return x_positions, x_labels
 
 
 def add_value_labels_with_offset(x_positions, y_values, max_y, fontsize=10, min_offset_ratio=0.02):
@@ -232,16 +269,61 @@ def wrap_table_header(text, width=18):
     return textwrap.fill(text, width=width)
 
 
-def build_dir_label_map(dir_names, label_prefix="Run"):
+def build_dir_label_map(dir_names, label_prefix="Run", custom_labels=None):
     """
     Build short column labels and a readable mapping for long directory names.
+
+    When custom_labels is provided (from --run-labels), those names are used
+    directly as column headers and no Run-N mapping is produced.
     """
+    if custom_labels is not None:
+        return list(custom_labels), ""
     labels = [f"{label_prefix} {i + 1}" for i in range(len(dir_names))]
     mapping_lines = []
     for i, name in enumerate(dir_names, start=1):
         wrapped = textwrap.fill(name, width=60, subsequent_indent=" " * 7)
         mapping_lines.append(f"{label_prefix} {i}: {wrapped}")
     return labels, "\n".join(mapping_lines)
+
+
+def resolve_run_labels(run_labels_arg, input_dirs):
+    """
+    Resolve display labels for input directories.
+
+    Returns:
+        (labels, use_custom): labels paired 1:1 with input_dirs; use_custom True
+        when --run-labels was provided.
+    """
+    if run_labels_arg:
+        labels = [label.strip() for label in run_labels_arg.split(',') if label.strip()]
+        if len(labels) != len(input_dirs):
+            raise ValueError(
+                f"Error: --run-labels count ({len(labels)}) must match "
+                f"--input-dir count ({len(input_dirs)})"
+            )
+        if len(set(labels)) != len(labels):
+            raise ValueError("Error: --run-labels values must be unique")
+        return labels, True
+    labels = [os.path.basename(path.rstrip(os.sep)) or path for path in input_dirs]
+    return labels, False
+
+
+def comparison_series_label(index, name, use_custom_labels=False):
+    """Legend/series label for one compared run."""
+    if use_custom_labels:
+        return name
+    return f"Run {index + 1}: {name}"
+
+
+def _match_tpm(content, tpm_first_pattern, nopm_first_pattern, db_type):
+    """Match HammerDB result line in either TPM-first or NOPM-first word order."""
+    match = re.search(tpm_first_pattern, content)
+    if match:
+        return int(match.group(1)), int(match.group(2)), db_type
+    match = re.search(nopm_first_pattern, content)
+    if match:
+        return int(match.group(2)), int(match.group(1)), db_type
+    return None, None, None
 
 
 def extract_tpm_from_file(file_path):
@@ -257,34 +339,28 @@ def extract_tpm_from_file(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-            
-        # Look for PostgreSQL pattern: "System achieved XXXX PostgreSQL TPM at YYYY NOPM"
-        postgresql_pattern = r'System achieved (\d+) PostgreSQL TPM at (\d+) NOPM'
-        postgresql_match = re.search(postgresql_pattern, content)
-        
-        if postgresql_match:
-            tpm = int(postgresql_match.group(1))
-            nopm = int(postgresql_match.group(2))
-            return tpm, nopm, 'PostgreSQL'
-        
-        # Look for MariaDB/MySQL pattern: "System achieved XXXX MySQL TPM at YYYY NOPM"
-        mariadb_pattern = r'System achieved (\d+) MySQL TPM at (\d+) NOPM'
-        mariadb_match = re.search(mariadb_pattern, content)
-        
-        if mariadb_match:
-            tpm = int(mariadb_match.group(1))
-            nopm = int(mariadb_match.group(2))
-            return tpm, nopm, 'MariaDB'
-        
-        # Look for MSSQL Server pattern: "System achieved XXXX SQL Server TPM at YYYY NOPM"
-        mssql_pattern = r'System achieved (\d+) SQL Server TPM at (\d+) NOPM'
-        mssql_match = re.search(mssql_pattern, content)
-        
-        if mssql_match:
-            tpm = int(mssql_match.group(1))
-            nopm = int(mssql_match.group(2))
-            return tpm, nopm, 'MSSQL'
-        
+
+        for tpm_pat, nopm_pat, db_type in (
+            (
+                r'System achieved (\d+) PostgreSQL TPM at (\d+) NOPM',
+                r'System achieved (\d+) NOPM from (\d+) PostgreSQL TPM',
+                'PostgreSQL',
+            ),
+            (
+                r'System achieved (\d+) MySQL TPM at (\d+) NOPM',
+                r'System achieved (\d+) NOPM from (\d+) MySQL TPM',
+                'MariaDB',
+            ),
+            (
+                r'System achieved (\d+) SQL Server TPM at (\d+) NOPM',
+                r'System achieved (\d+) NOPM from (\d+) SQL Server TPM',
+                'MSSQL',
+            ),
+        ):
+            tpm, nopm, db = _match_tpm(content, tpm_pat, nopm_pat, db_type)
+            if tpm is not None:
+                return tpm, nopm, db
+
         return None, None, None
             
     except Exception as e:
@@ -398,13 +474,18 @@ def filter_test_types(df, user_filter):
 def create_tpm_graphs(csv_file_path, output_dir, chart_type='scatter', user_filter=None, show_values=False):
     """
     Create PNG graphs from database CSV files showing VM numbers vs TPM values.
+
+    Per-machine detailed/summary charts never annotate values (too dense);
+    show_values is ignored here. Use Average_tpm / Total_tpm graphs for labels.
     
     Args:
         csv_file_path (str): Path to the CSV file
         output_dir (str): Output directory for PNG files
         chart_type (str): Type of chart to create ('scatter', 'line', 'bar')
         user_filter (set): Optional set of test types to include (e.g., {"1_user", "20_users"})
+        show_values (bool): Ignored — value labels are not drawn on these graphs
     """
+    show_values = False  # dense per-user machine charts stay unlabeled
     try:
         # Read the CSV file
         df = pd.read_csv(csv_file_path)
@@ -482,20 +563,10 @@ def create_tpm_graphs(csv_file_path, output_dir, chart_type='scatter', user_filt
             num_machines = len(test_data['VM_Number'].unique())
             
             # Set X-axis labels based on number of machines
-            if num_machines <= 20:
-                # Show all machine numbers if 20 or fewer
-                vm_numbers = sorted(test_data['VM_Number'].unique())
-                plt.xticks(vm_numbers, [int(x) for x in vm_numbers], rotation=45, ha='right')
-            else:
-                # Show every 10th machine if more than 20 machines
-                vm_numbers = sorted(test_data['VM_Number'].unique())
-                x_positions = []
-                x_labels = []
-                for i, vm_num in enumerate(vm_numbers):
-                    if (i + 1) % 10 == 1 or i == 0:  # 1st, 11th, 21st, etc.
-                        x_positions.append(vm_num)
-                        x_labels.append(int(vm_num))
-                plt.xticks(x_positions, x_labels, rotation=45, ha='right')
+            vm_numbers = sorted(test_data['VM_Number'].unique())
+            vm_labels = [int(x) for x in vm_numbers]
+            x_positions, x_labels = get_machine_xaxis_ticks(vm_numbers, vm_labels, num_machines)
+            plt.xticks(x_positions, x_labels, rotation=45, ha='right')
             
             # Add grid for better readability
             plt.grid(True, alpha=0.3)
@@ -869,18 +940,9 @@ def create_combined_tpm_graph(csv_file_path, output_dir, chart_type='scatter', u
         
         # Set X-axis labels based on number of machines
         all_vm_numbers = sorted(df['VM_Number'].unique())
-        if num_machines <= 20:
-            # Show all machine numbers if 20 or fewer
-            plt.xticks(all_vm_numbers, [int(x) for x in all_vm_numbers], rotation=45, ha='right')
-        else:
-            # Show every 10th machine if more than 20 machines
-            x_positions = []
-            x_labels = []
-            for i, vm_num in enumerate(all_vm_numbers):
-                if (i + 1) % 10 == 1 or i == 0:  # 1st, 11th, 21st, etc.
-                    x_positions.append(vm_num)
-                    x_labels.append(int(vm_num))
-            plt.xticks(x_positions, x_labels, rotation=45, ha='right')
+        vm_labels = [int(x) for x in all_vm_numbers]
+        x_positions, x_labels = get_machine_xaxis_ticks(all_vm_numbers, vm_labels, num_machines)
+        plt.xticks(x_positions, x_labels, rotation=45, ha='right')
         
         # Determine database type from filename
         filename = os.path.basename(csv_file_path)
@@ -1106,23 +1168,23 @@ def process_postgresql_results(input_dir, output_dir, chart_type='scatter', user
         if not test_types:
             print("Warning: No test types match the user filter, no graphs will be created")
     
-    # Create graphs from detailed results
-    create_tpm_graphs(detailed_csv, output_dir, chart_type, user_filter, show_values)
+    # Create graphs from detailed results (no value labels — too dense / unreadable)
+    create_tpm_graphs(detailed_csv, output_dir, chart_type, user_filter, show_values=False)
     
     # Create combined comparison graph (disabled - confusing)
     # create_combined_tpm_graph(detailed_csv, output_dir, chart_type, user_filter)
     
-    # Create average TPM graph
+    # Create average TPM graph (--show-values applies here)
     create_average_tpm_graph(detailed_csv, output_dir, chart_type, user_filter, show_values)
     
-    # Create total TPM graph (sum of all machines)
+    # Create total TPM graph (sum of all machines; --show-values applies here)
     create_total_tpm_graph(detailed_csv, output_dir, chart_type, user_filter, show_values)
     
-    # Create graphs from summary files
+    # Create graphs from summary files (per-user machine charts — no value labels)
     for test_type in sorted(test_types, key=get_user_count_from_test_type):
         summary_csv = os.path.join(output_dir, f'{db_type}_summary_{test_type}.csv')
         if os.path.exists(summary_csv):
-            create_tpm_graphs(summary_csv, output_dir, chart_type, user_filter, show_values)
+            create_tpm_graphs(summary_csv, output_dir, chart_type, user_filter, show_values=False)
     
     # Print summary statistics
     print(f"\n=== SUMMARY STATISTICS ===")
@@ -1137,7 +1199,9 @@ def process_postgresql_results(input_dir, output_dir, chart_type='scatter', user
             print(f"{test_type}: {len(test_results)} VMs, Avg TPM: {avg_tpm:.2f}")
 
 
-def create_comparison_graphs(input_dirs, output_dir, chart_type='scatter', database_type=None, user_filter=None, show_values=False):
+def create_comparison_graphs(input_dirs, output_dir, chart_type='scatter', database_type=None,
+                             user_filter=None, show_values=False, run_labels=None,
+                             use_custom_labels=False):
     """
     Create comparison graphs across multiple test result directories.
     
@@ -1147,19 +1211,24 @@ def create_comparison_graphs(input_dirs, output_dir, chart_type='scatter', datab
         chart_type (str): Type of chart to create ('scatter', 'line', 'bar')
         database_type (str): Optional database type ('MariaDB' or 'PostgreSQL') for graph titles
         user_filter (set): Optional set of test types to include (e.g., {"1_user", "20_users"})
+        run_labels (list): Display labels paired with input_dirs (default: directory basenames)
+        use_custom_labels (bool): True when labels came from --run-labels
     """
     print(f"\n=== CREATING COMPARISON GRAPHS ===")
     
     # Create output directory if it doesn't exist
     os.makedirs(output_dir, exist_ok=True)
+
+    if run_labels is None:
+        run_labels, use_custom_labels = resolve_run_labels(None, input_dirs)
     
-    # Process each directory and collect data
+    # Process each directory and collect data (keyed by display label)
     all_data = {}
     test_types_union = set()
     
-    for input_dir in input_dirs:
+    for input_dir, run_label in zip(input_dirs, run_labels):
         dir_name = os.path.basename(input_dir.rstrip('/'))
-        print(f"Processing {dir_name} for comparison...")
+        print(f"Processing {dir_name} as '{run_label}' for comparison...")
         
         # Process this directory
         temp_output = os.path.join(output_dir, f'temp_{dir_name}')
@@ -1174,7 +1243,7 @@ def create_comparison_graphs(input_dirs, output_dir, chart_type='scatter', datab
         
         if detailed_csv and os.path.exists(detailed_csv):
             df = pd.read_csv(detailed_csv)
-            all_data[dir_name] = df
+            all_data[run_label] = df
             
             # Collect all test types
             if 'Test_Type' in df.columns:
@@ -1195,23 +1264,35 @@ def create_comparison_graphs(input_dirs, output_dir, chart_type='scatter', datab
             print("Warning: No test types match the user filter, no comparison graphs will be created")
             return
     
-    # Create comparison graphs
-    create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, chart_type, database_type, user_filter, show_values)
-    create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, chart_type, database_type, user_filter, show_values)
-    create_detailed_comparison_graphs(all_data, test_types_union, output_dir, chart_type, database_type, user_filter, show_values)
+    # Create comparison graphs (--show-values only on Average/Total, not detailed)
+    create_average_tpm_comparison_graph(
+        all_data, test_types_union, output_dir, chart_type, database_type, user_filter,
+        show_values, use_custom_labels=use_custom_labels
+    )
+    create_total_tpm_comparison_graph(
+        all_data, test_types_union, output_dir, chart_type, database_type, user_filter,
+        show_values, use_custom_labels=use_custom_labels
+    )
+    create_detailed_comparison_graphs(
+        all_data, test_types_union, output_dir, chart_type, database_type, user_filter,
+        show_values=False, use_custom_labels=use_custom_labels
+    )
 
 
-def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, chart_type='line', database_type=None, user_filter=None, show_values=False):
+def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, chart_type='line',
+                                        database_type=None, user_filter=None, show_values=False,
+                                        use_custom_labels=False):
     """
     Create a comparison graph showing average TPM values across different test directories.
     
     Args:
-        all_data (dict): Dictionary mapping directory names to DataFrames
+        all_data (dict): Dictionary mapping run labels / directory names to DataFrames
         test_types_union (set): Set of all test types found across directories
         output_dir (str): Output directory for the graph
         chart_type (str): Type of chart to create ('scatter', 'line', 'bar') - default 'line' for comparison
         database_type (str): Optional database type ('MariaDB' or 'PostgreSQL') for graph titles
         user_filter (set): Optional set of test types to include (e.g., {"1_user", "20_users"})
+        use_custom_labels (bool): True when series names came from --run-labels
     """
     try:
         # Apply user filter if provided
@@ -1273,7 +1354,8 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
             for i, (dir_name, dir_averages) in enumerate(comparison_data.items()):
                 values = [dir_averages.get(test_type, 0) for test_type in sorted_test_types]
                 plt.plot(x_pos, values, marker=markers[i % len(markers)], linewidth=2, markersize=8,
-                        label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
+                        label=comparison_series_label(i, dir_name, use_custom_labels),
+                        color=colors[i % len(colors)], alpha=0.8)
                 # Add value labels on top of markers if show_values is enabled
                 if show_values and max_value > 0:
                     # Collect all x positions and values for this directory (filter out zeros)
@@ -1286,7 +1368,8 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
             for i, (dir_name, dir_averages) in enumerate(comparison_data.items()):
                 values = [dir_averages.get(test_type, 0) for test_type in sorted_test_types]
                 plt.scatter(x_pos, values, s=100, marker=markers[i % len(markers)],
-                          label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
+                          label=comparison_series_label(i, dir_name, use_custom_labels),
+                          color=colors[i % len(colors)], alpha=0.8)
         else:  # bar (default)
             # Plot bars for each directory
             max_bar_value = 0
@@ -1294,7 +1377,9 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
             for i, (dir_name, dir_averages) in enumerate(comparison_data.items()):
                 values = [dir_averages.get(test_type, 0) for test_type in sorted_test_types]
                 bars = plt.bar([x + i * bar_width for x in x_pos], values, 
-                              bar_width, label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
+                              bar_width,
+                              label=comparison_series_label(i, dir_name, use_custom_labels),
+                              color=colors[i % len(colors)], alpha=0.8)
                 all_bars.append((bars, values))
                 max_bar_value = max(max_bar_value, max(values) if values else 0)
             
@@ -1351,9 +1436,13 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
                 row.append(f'{value:.0f}' if value > 0 else '-')
             table_data.append(row)
         
-        # Create column headers with short labels and add a mapping below
-        run_labels, run_mapping = build_dir_label_map(dir_names_list, label_prefix="Run")
-        table_headers = ['Test Type'] + run_labels
+        # Create column headers with short labels (or --run-labels as-is)
+        table_run_labels, run_mapping = build_dir_label_map(
+            dir_names_list,
+            label_prefix="Run",
+            custom_labels=dir_names_list if use_custom_labels else None,
+        )
+        table_headers = ['Test Type'] + table_run_labels
         
         # Add table - position it to the right with more width for directory names
         ax = plt.gca()
@@ -1412,17 +1501,20 @@ def create_average_tpm_comparison_graph(all_data, test_types_union, output_dir, 
         print(f"Error creating comparison graph: {e}")
 
 
-def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, chart_type='line', database_type=None, user_filter=None, show_values=False):
+def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, chart_type='line',
+                                      database_type=None, user_filter=None, show_values=False,
+                                      use_custom_labels=False):
     """
     Create a comparison graph showing total TPM values (sum of all machines) across different test directories.
     
     Args:
-        all_data (dict): Dictionary mapping directory names to DataFrames
+        all_data (dict): Dictionary mapping run labels / directory names to DataFrames
         test_types_union (set): Set of all test types found across directories
         output_dir (str): Output directory for the graph
         chart_type (str): Type of chart to create ('scatter', 'line', 'bar') - default 'line' for comparison
         database_type (str): Optional database type ('MariaDB' or 'PostgreSQL') for graph titles
         user_filter (set): Optional set of test types to include (e.g., {"1_user", "20_users"})
+        use_custom_labels (bool): True when series names came from --run-labels
     """
     try:
         # Apply user filter if provided
@@ -1484,7 +1576,8 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
             for i, (dir_name, dir_totals) in enumerate(comparison_data.items()):
                 values = [dir_totals.get(test_type, 0) for test_type in sorted_test_types]
                 plt.plot(x_pos, values, marker=markers[i % len(markers)], linewidth=2, markersize=8,
-                        label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
+                        label=comparison_series_label(i, dir_name, use_custom_labels),
+                        color=colors[i % len(colors)], alpha=0.8)
                 # Add value labels on top of markers if show_values is enabled
                 if show_values and max_value > 0:
                     # Collect all x positions and values for this directory (filter out zeros)
@@ -1497,7 +1590,8 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
             for i, (dir_name, dir_totals) in enumerate(comparison_data.items()):
                 values = [dir_totals.get(test_type, 0) for test_type in sorted_test_types]
                 plt.scatter(x_pos, values, s=100, marker=markers[i % len(markers)],
-                          label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
+                          label=comparison_series_label(i, dir_name, use_custom_labels),
+                          color=colors[i % len(colors)], alpha=0.8)
         else:  # bar (default)
             # Plot bars for each directory
             max_bar_value = 0
@@ -1505,7 +1599,9 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
             for i, (dir_name, dir_totals) in enumerate(comparison_data.items()):
                 values = [dir_totals.get(test_type, 0) for test_type in sorted_test_types]
                 bars = plt.bar([x + i * bar_width for x in x_pos], values, 
-                              bar_width, label=f"Run {i + 1}: {dir_name}", color=colors[i % len(colors)], alpha=0.8)
+                              bar_width,
+                              label=comparison_series_label(i, dir_name, use_custom_labels),
+                              color=colors[i % len(colors)], alpha=0.8)
                 all_bars.append((bars, values))
                 max_bar_value = max(max_bar_value, max(values) if values else 0)
             
@@ -1562,9 +1658,13 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
                 row.append(f'{value:.0f}' if value > 0 else '-')
             table_data.append(row)
         
-        # Create column headers with short labels and add a mapping below
-        run_labels, run_mapping = build_dir_label_map(dir_names_list, label_prefix="Run")
-        table_headers = ['Test Type'] + run_labels
+        # Create column headers with short labels (or --run-labels as-is)
+        table_run_labels, run_mapping = build_dir_label_map(
+            dir_names_list,
+            label_prefix="Run",
+            custom_labels=dir_names_list if use_custom_labels else None,
+        )
+        table_headers = ['Test Type'] + table_run_labels
         
         # Add table - position it to the right with more width for directory names
         ax = plt.gca()
@@ -1623,18 +1723,26 @@ def create_total_tpm_comparison_graph(all_data, test_types_union, output_dir, ch
         print(f"Error creating total TPM comparison graph: {e}")
 
 
-def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, chart_type='scatter', database_type=None, user_filter=None, show_values=False):
+def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, chart_type='scatter',
+                                      database_type=None, user_filter=None, show_values=False,
+                                      use_custom_labels=False):
     """
     Create detailed comparison graphs for each test type across directories.
+
+    Value labels are not drawn on these dense per-machine charts; use
+    Average/Total comparison graphs with --show-values instead.
     
     Args:
-        all_data (dict): Dictionary mapping directory names to DataFrames
+        all_data (dict): Dictionary mapping run labels / directory names to DataFrames
         test_types_union (set): Set of all test types found across directories
         output_dir (str): Output directory for the graphs
         chart_type (str): Type of chart to create ('scatter', 'line', 'bar')
         database_type (str): Optional database type ('MariaDB' or 'PostgreSQL') for graph titles
         user_filter (set): Optional set of test types to include (e.g., {"1_user", "20_users"})
+        show_values (bool): Ignored — value labels are not drawn on these graphs
+        use_custom_labels (bool): True when series names came from --run-labels
     """
+    show_values = False  # dense detailed comparison charts stay unlabeled
     try:
         # Apply user filter if provided
         if user_filter is not None:
@@ -1721,7 +1829,8 @@ def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, ch
                         
                         bars = plt.bar(x_positions, y_values, 
                                width=bar_width, alpha=0.7,
-                           color=colors[i % len(colors)], label=f"Run {i + 1}: {dir_name}")
+                           color=colors[i % len(colors)],
+                           label=comparison_series_label(i, dir_name, use_custom_labels))
                         # Add value labels on top of bars if show_values is enabled
                         if show_values and y_values:
                             max_bar_val = max([v for v in y_values if v > 0] or [0])
@@ -1767,11 +1876,14 @@ def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, ch
                         if chart_type == 'line':
                             plt.plot(sequential_positions, complete_tpm_values, 
                                     marker='o', linewidth=2, markersize=6, 
-                                    color=colors[i % len(colors)], label=f"Run {i + 1}: {dir_name}", alpha=0.8)
+                                    color=colors[i % len(colors)],
+                                    label=comparison_series_label(i, dir_name, use_custom_labels),
+                                    alpha=0.8)
                         else:  # scatter (default)
                             plt.scatter(sequential_positions, complete_tpm_values, 
                                        s=50, alpha=0.8, 
-                                       color=colors[i % len(colors)], label=f"Run {i + 1}: {dir_name}")
+                                       color=colors[i % len(colors)],
+                                       label=comparison_series_label(i, dir_name, use_custom_labels))
             
             # Determine database types being compared - use provided type or auto-detect
             if database_type:
@@ -1820,18 +1932,10 @@ def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, ch
                     plt.xlim(0, num_machines + 0.5)
                     plt.ylim(bottom=0)
             
-            if num_machines <= 20:
-                # Show all machine labels if 20 or fewer
-                plt.xticks(sequential_positions, machine_labels, rotation=45, ha='right')
-            else:
-                # Show every 10th machine if more than 20 machines
-                x_positions = []
-                x_labels = []
-                for i, pos in enumerate(sequential_positions):
-                    if (i + 1) % 10 == 1 or i == 0:  # 1st, 11th, 21st, etc.
-                        x_positions.append(pos)
-                        x_labels.append(machine_labels[i])
-                plt.xticks(x_positions, x_labels, rotation=45, ha='right')
+            x_positions, x_labels = get_machine_xaxis_ticks(
+                sequential_positions, machine_labels, num_machines
+            )
+            plt.xticks(x_positions, x_labels, rotation=45, ha='right')
             
             # Add grid
             plt.grid(True, alpha=0.3)
@@ -1864,7 +1968,8 @@ def create_detailed_comparison_graphs(all_data, test_types_union, output_dir, ch
             
             if table_data:
                 # Create column headers
-                table_headers = ['Directory', 'Avg TPM', 'Min TPM', 'Max TPM', 'VMs']
+                table_headers = ['Run' if use_custom_labels else 'Directory',
+                                 'Avg TPM', 'Min TPM', 'Max TPM', 'VMs']
                 
                 # Add table to the right with more width for directory names
                 ax = plt.gca()
@@ -1937,12 +2042,19 @@ def main():
                        help='Input directory containing database result files (can be specified multiple times: --input-dir dir1 --input-dir dir2, or provide multiple paths: --input-dir dir1 dir2)')
     parser.add_argument('--output-dir', default='postgresql_analysis',
                        help='Output directory for CSV and PNG files (default: postgresql_analysis)')
+    parser.add_argument('--run-labels',
+                       type=str,
+                       help='Comma-separated display labels for --input-dir entries, paired by '
+                            'position (1st label → 1st dir, …). Count must match. Used as-is in '
+                            'comparison legends/tables and per-run output subdirectory names. '
+                            'Default: directory basenames')
     parser.add_argument('--compare', action='store_true',
                        help='Create comparison graphs when multiple input directories are provided')
     parser.add_argument('--chart-type', choices=['scatter', 'line', 'bar'], default='scatter',
                        help='Type of chart to create: scatter (dots only), line (with connections), or bar (default: scatter)')
     parser.add_argument('--show-values', action='store_true',
-                       help='Show TPM values as labels on line graphs (default: values are not shown)')
+                       help='Annotate TPM values on Total_tpm and Average_tpm graphs only '
+                            '(not on dense per-user detailed/summary machine graphs)')
     parser.add_argument('--database', choices=['MariaDB', 'PostgreSQL', 'MSSQL', 'mariadb', 'postgresql', 'mssql'], 
                       help='Specify database type for graph titles (MariaDB, PostgreSQL, MSSQL). If not set, auto-detected from directory names.')
     parser.add_argument('--users', type=str,
@@ -1978,13 +2090,21 @@ def main():
         input_dirs = ['postgresql-results-20250828-140741']
         output_dir = args.output_dir
     
-    # Validate input directories
+    try:
+        all_run_labels, use_custom_labels = resolve_run_labels(args.run_labels, input_dirs)
+    except ValueError as e:
+        print(e)
+        return 1
+
+    # Validate input directories (keep label pairing)
     valid_dirs = []
-    for input_dir in input_dirs:
+    run_labels = []
+    for input_dir, run_label in zip(input_dirs, all_run_labels):
         if not os.path.exists(input_dir):
             print(f"Warning: Input directory '{input_dir}' does not exist, skipping")
         else:
             valid_dirs.append(input_dir)
+            run_labels.append(run_label)
     
     if not valid_dirs:
         print("Error: No valid input directories found")
@@ -1996,6 +2116,7 @@ def main():
         print(f"User filter: {sorted(user_filter, key=get_user_count_from_test_type)}")
     
     print(f"Input directories: {valid_dirs}")
+    print(f"Run labels: {run_labels}")
     print(f"Output directory: {output_dir}")
     print(f"Comparison requested: {args.compare}")
     print(f"Chart type: {args.chart_type}")
@@ -2013,10 +2134,10 @@ def main():
     else:
         # Multiple directories - process each and create comparison graphs
         print(f"Processing {len(valid_dirs)} directories for comparison...")
-        for input_dir in valid_dirs:
-            dir_name = os.path.basename(input_dir.rstrip('/'))
-            dir_output = os.path.join(output_dir, dir_name)
-            print(f"Processing {input_dir} -> {dir_output}")
+        for input_dir, run_label in zip(valid_dirs, run_labels):
+            safe_label = run_label.replace('/', '_').replace('\\', '_')
+            dir_output = os.path.join(output_dir, safe_label)
+            print(f"Processing {input_dir} -> {dir_output} (label: {run_label})")
             process_postgresql_results(input_dir, dir_output, args.chart_type, user_filter, args.show_values)
         
         # Create comparison graphs if requested or if multiple directories
@@ -2033,7 +2154,10 @@ def main():
                     database_type = 'MariaDB'
                 elif database_type.lower() == 'mssql':
                     database_type = 'MSSQL'
-            create_comparison_graphs(valid_dirs, comparison_output, args.chart_type, database_type, user_filter, args.show_values)
+            create_comparison_graphs(
+                valid_dirs, comparison_output, args.chart_type, database_type, user_filter,
+                args.show_values, run_labels=run_labels, use_custom_labels=use_custom_labels
+            )
         else:
             print("\nSkipping comparison graphs (not requested and not automatically triggered)")
     
