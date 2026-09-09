@@ -60,11 +60,11 @@ Output Files:
     - {database}_detailed_results.csv: All individual results (postgresql_ or mariadb_)
     - {database}_summary_*.csv: Summary files by test type
     - {database}_overall_summary.csv: Overall statistics
-    - {database}-perf-{N}machines.md: Scaling / concurrency performance report (N = VM count)
+    - {database}-perf-{N}machines.md / .html: Scaling / concurrency performance report (N = VM count)
     - *.png: Performance graphs showing VM numbers vs TPM values with appropriate database labels
     - comparison/: Directory containing comparison graphs when multiple directories are processed
-      - perf-reports-index.md: Links to each run's *-perf-*machines.md plus cross-run TPM summary tables
-      - comparative_report_{N}_vs_{M}.md: Pairwise analysis in --output-dir (N, M = VM counts per run)
+      - perf-reports-index.md / .html: Links to each run's *-perf-*machines reports plus cross-run TPM summary tables
+      - comparative_report_{N}_vs_{M}.md / .html: Pairwise analysis in --output-dir (N, M = VM counts per run)
       - Average_TPM_Comparison.png: Bar chart comparing average TPM across test runs
       - TPM_Comparison_*.png: Line graphs comparing TPM performance for each test type
 """
@@ -72,6 +72,7 @@ Output Files:
 import os
 import re
 import csv
+import html
 import argparse
 import tempfile
 import shutil
@@ -998,6 +999,256 @@ def _pct_ratio(ratio):
     return f'{(ratio - 1) * 100:+.1f}%'
 
 
+def _normalize_report_text(text):
+    """
+    Replace Unicode punctuation with ASCII in generated markdown reports.
+
+    Reports are written as UTF-8, but HTTP static servers (Jenkins artifacts, nginx,
+    simple directory listings) often serve .md as text/plain without charset=utf-8.
+    Browsers then default to Latin-1 and mojibake characters like -> and x appear as
+    garbled sequences (e.g. â†', Ãx).
+    """
+    for old, new in (
+        ('\u2192', '->'),     # rightwards arrow
+        ('\u00d7', 'x'),      # multiplication sign
+        ('\u00f7', '/'),      # division sign
+        ('\u2013', '-'),      # en dash
+        ('\u2014', '-'),      # em dash
+        ('\u2248', '~'),      # approximately equal
+        ('\u2265', '>='),     # greater-than or equal
+        ('\u03c3', 'stdev'),  # sigma
+        ('\u2026', '...'),    # ellipsis
+    ):
+        text = text.replace(old, new)
+    return text
+
+
+_MD_LINK_RE = re.compile(r'\[(?:`)?([^\]`]+)(?:`)?\]\(([^)]+)\)')
+_MD_BOLD_RE = re.compile(r'\*\*(.+?)\*\*')
+_MD_ITALIC_RE = re.compile(r'(?<!\*)\*([^*]+?)\*(?!\*)')
+_MD_CODE_RE = re.compile(r'`([^`]+)`')
+_MD_TABLE_SEP_RE = re.compile(r'^\|[\s\-:|]+\|$')
+
+_HTML_REPORT_CSS = """
+body {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+  max-width: 1100px;
+  margin: 2rem auto;
+  padding: 0 1.25rem 3rem;
+  line-height: 1.55;
+  color: #1f2328;
+  background: #fff;
+}
+h1 { font-size: 1.75rem; border-bottom: 2px solid #d0d7de; padding-bottom: 0.35rem; }
+h2 { font-size: 1.35rem; margin-top: 2rem; border-bottom: 1px solid #eaeef2; padding-bottom: 0.25rem; }
+h3 { font-size: 1.1rem; margin-top: 1.5rem; }
+p { margin: 0.75rem 0; }
+ul { margin: 0.75rem 0; padding-left: 1.5rem; }
+li { margin: 0.35rem 0; }
+table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+  font-size: 0.92rem;
+  overflow-x: auto;
+  display: block;
+}
+thead th { background: #f6f8fa; }
+th, td {
+  border: 1px solid #d0d7de;
+  padding: 0.4rem 0.65rem;
+  text-align: left;
+  vertical-align: top;
+}
+tbody tr:nth-child(even) { background: #fafbfc; }
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: #f6f8fa;
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  font-size: 0.9em;
+}
+a { color: #0969da; text-decoration: none; }
+a:hover { text-decoration: underline; }
+strong { font-weight: 600; }
+.report-meta { color: #656d76; font-size: 0.95rem; }
+"""
+
+
+def _rewrite_markdown_href(href):
+    """Point .md links at sibling .html reports for web viewing."""
+    base, sep, fragment = href.partition('#')
+    if base.endswith('.md'):
+        base = base[:-3] + '.html'
+    return base + (sep + fragment if sep else '')
+
+
+def _inline_markdown_to_html(text):
+    """Convert inline markdown (links, bold, code) to HTML."""
+    if not text:
+        return ''
+
+    code_spans = []
+
+    def stash_code(match):
+        code_spans.append(match.group(1))
+        return f'\x00CODE{len(code_spans) - 1}\x00'
+
+    link_spans = []
+
+    def stash_link(match):
+        link_spans.append((match.group(1), _rewrite_markdown_href(match.group(2))))
+        return f'\x00LINK{len(link_spans) - 1}\x00'
+
+    text = _MD_CODE_RE.sub(stash_code, text)
+    text = _MD_LINK_RE.sub(stash_link, text)
+    text = html.escape(text, quote=False)
+    text = _MD_BOLD_RE.sub(r'<strong>\1</strong>', text)
+    text = _MD_ITALIC_RE.sub(r'<em>\1</em>', text)
+
+    for idx, (label, url) in enumerate(link_spans):
+        replacement = (
+            f'<a href="{html.escape(url, quote=True)}">'
+            f'{html.escape(label)}</a>'
+        )
+        text = text.replace(f'\x00LINK{idx}\x00', replacement)
+
+    for idx, code in enumerate(code_spans):
+        text = text.replace(f'\x00CODE{idx}\x00', f'<code>{html.escape(code)}</code>')
+
+    return text
+
+
+def _parse_markdown_table_row(line):
+    return [cell.strip() for cell in line.strip().strip('|').split('|')]
+
+
+def _markdown_table_to_html(table_lines):
+    rows = [
+        _parse_markdown_table_row(line)
+        for line in table_lines
+        if line.strip() and not _MD_TABLE_SEP_RE.match(line.strip())
+    ]
+    if not rows:
+        return ''
+
+    thead_html = ''
+    body_rows = rows
+    if len(table_lines) >= 2 and _MD_TABLE_SEP_RE.match(table_lines[1].strip()):
+        thead_html = (
+            '<thead><tr>'
+            + ''.join(f'<th>{_inline_markdown_to_html(cell)}</th>' for cell in rows[0])
+            + '</tr></thead>'
+        )
+        body_rows = rows[1:]
+
+    tbody_html = ''.join(
+        '<tr>'
+        + ''.join(f'<td>{_inline_markdown_to_html(cell)}</td>' for cell in row)
+        + '</tr>'
+        for row in body_rows
+    )
+    return f'<table>{thead_html}<tbody>{tbody_html}</tbody></table>'
+
+
+def _extract_markdown_title(markdown_text):
+    for line in markdown_text.splitlines():
+        if line.startswith('# '):
+            return line[2:].strip()
+    return 'Database performance report'
+
+
+def _markdown_to_html_body(markdown_text):
+    """Convert report markdown (headings, lists, tables, paragraphs) to HTML body."""
+    lines = markdown_text.splitlines()
+    parts = []
+    idx = 0
+    total = len(lines)
+
+    while idx < total:
+        line = lines[idx]
+        stripped = line.strip()
+
+        if not stripped:
+            idx += 1
+            continue
+
+        if stripped.startswith('#'):
+            level = min(len(stripped) - len(stripped.lstrip('#')), 6)
+            content = stripped[level:].strip()
+            parts.append(f'<h{level}>{_inline_markdown_to_html(content)}</h{level}>')
+            idx += 1
+            continue
+
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table_lines = []
+            while idx < total and lines[idx].strip().startswith('|'):
+                table_lines.append(lines[idx])
+                idx += 1
+            parts.append(_markdown_table_to_html(table_lines))
+            continue
+
+        if stripped.startswith('- '):
+            parts.append('<ul>')
+            while idx < total and lines[idx].strip().startswith('- '):
+                item = lines[idx].strip()[2:]
+                parts.append(f'<li>{_inline_markdown_to_html(item)}</li>')
+                idx += 1
+            parts.append('</ul>')
+            continue
+
+        paragraph_lines = []
+        while idx < total:
+            current = lines[idx].strip()
+            if not current:
+                break
+            if current.startswith('#'):
+                break
+            if current.startswith('|') and current.endswith('|'):
+                break
+            if current.startswith('- '):
+                break
+            paragraph_lines.append(current)
+            idx += 1
+
+        if paragraph_lines:
+            parts.append(f'<p>{_inline_markdown_to_html(" ".join(paragraph_lines))}</p>')
+
+    return '\n'.join(parts)
+
+
+def _markdown_report_to_html_document(markdown_text):
+    """Wrap converted markdown in a UTF-8 HTML document for HTTP viewing."""
+    title = _extract_markdown_title(markdown_text)
+    body = _markdown_to_html_body(markdown_text)
+    return (
+        '<!DOCTYPE html>\n'
+        '<html lang="en">\n'
+        '<head>\n'
+        '  <meta charset="utf-8">\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f'  <title>{html.escape(title)}</title>\n'
+        f'  <style>{_HTML_REPORT_CSS}\n  </style>\n'
+        '</head>\n'
+        '<body>\n'
+        f'{body}\n'
+        '</body>\n'
+        '</html>\n'
+    )
+
+
+def _write_markdown_report(report_path, lines):
+    """Write markdown report and a sibling .html version for web viewing."""
+    markdown_text = _normalize_report_text('\n'.join(lines))
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(markdown_text)
+
+    html_path = os.path.splitext(report_path)[0] + '.html'
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(_markdown_report_to_html_document(markdown_text))
+    return report_path, html_path
+
+
 def _test_type_stats(test_results):
     """Compute TPM/NOPM statistics for one test type (list of result dicts)."""
     tpms = [r['tpm'] for r in test_results]
@@ -1300,9 +1551,9 @@ def write_perf_report(all_results, db_type, output_dir, run_label=None, input_di
     lines.append('')
 
     report_path = os.path.join(output_dir, perf_report_filename(db_type, vm_count))
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
+    _, html_path = _write_markdown_report(report_path, lines)
     print(f'Performance report saved to: {report_path}')
+    print(f'Performance report HTML saved to: {html_path}')
     return report_path
 
 
@@ -1408,9 +1659,9 @@ def write_compare_perf_index(output_dir, perf_report_entries, comparative_report
         lines.append('')
 
     index_path = os.path.join(comparison_dir, 'perf-reports-index.md')
-    with open(index_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
+    _, html_path = _write_markdown_report(index_path, lines)
     print(f'Compare-mode perf index saved to: {index_path}')
+    print(f'Compare-mode perf index HTML saved to: {html_path}')
     return index_path
 
 
@@ -1750,9 +2001,9 @@ def write_comparative_report_pair(output_dir, run_a, run_b):
 
     filename = comparative_report_filename(vm_a, vm_b, label_a, label_b)
     report_path = os.path.join(output_dir, filename)
-    with open(report_path, 'w', encoding='utf-8') as f:
-        f.write('\n'.join(lines))
+    _, html_path = _write_markdown_report(report_path, lines)
     print(f'Comparative report saved to: {report_path}')
+    print(f'Comparative report HTML saved to: {html_path}')
     return report_path
 
 
