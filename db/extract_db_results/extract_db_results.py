@@ -64,6 +64,7 @@ Output Files:
     - *.png: Performance graphs showing VM numbers vs TPM values with appropriate database labels
     - comparison/: Directory containing comparison graphs when multiple directories are processed
       - perf-reports-index.md: Links to each run's *-perf-*machines.md plus cross-run TPM summary tables
+      - comparative_report_{N}_vs_{M}.md: Pairwise analysis in --output-dir (N, M = VM counts per run)
       - Average_TPM_Comparison.png: Bar chart comparing average TPM across test runs
       - TPM_Comparison_*.png: Line graphs comparing TPM performance for each test type
 """
@@ -76,6 +77,7 @@ import tempfile
 import shutil
 import textwrap
 import statistics
+import itertools
 from pathlib import Path
 from collections import defaultdict
 import matplotlib.pyplot as plt
@@ -1155,7 +1157,7 @@ def write_perf_report(all_results, db_type, output_dir, run_label=None, input_di
     lines.append('')
 
     # Spread table per test type
-    lines.extend(['## Per-VM throughput by concurrency', '', '| Users / VM | Avg TPM | Median | Min | Max | P10–P90 | Std dev |', '|-----------:|--------:|-------:|----:|----:|--------:|--------:|'])
+    lines.extend([f'## Per-VM throughput by concurrency — {vm_count} VMs', '', '| Users / VM | Avg TPM | Median | Min | Max | P10–P90 | Std dev |', '|-----------:|--------:|-------:|----:|----:|--------:|--------:|'])
     for tt in test_types:
         s = by_type[tt]
         users = get_user_count_from_test_type(tt)
@@ -1304,12 +1306,13 @@ def write_perf_report(all_results, db_type, output_dir, run_label=None, input_di
     return report_path
 
 
-def write_compare_perf_index(output_dir, perf_report_entries):
+def write_compare_perf_index(output_dir, perf_report_entries, comparative_reports=None):
     """
     Write comparison/perf-reports-index.md linking per-run *-perf-*machines.md reports.
 
     perf_report_entries: list of dicts with keys label, dir_output, report_path,
     input_dir, db_type (optional).
+    comparative_reports: optional list of paths to comparative_report_*_vs_*.md files.
     """
     entries = [e for e in perf_report_entries if e.get('report_path')]
     if len(entries) < 2:
@@ -1392,11 +1395,379 @@ def write_compare_perf_index(output_dir, perf_report_entries):
             lines.append(f'| {rs["label"]} | ' + ' | '.join(cells) + ' |')
         lines.append('')
 
+    if comparative_reports:
+        lines.extend([
+            '## Comparative reports',
+            '',
+            'Pairwise analysis (`comparative_report_{N}_vs_{M}.md`) in the output directory:',
+            '',
+        ])
+        for path in comparative_reports:
+            rel = os.path.relpath(path, output_dir)
+            lines.append(f'- [`{os.path.basename(path)}`]({rel})')
+        lines.append('')
+
     index_path = os.path.join(comparison_dir, 'perf-reports-index.md')
     with open(index_path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
     print(f'Compare-mode perf index saved to: {index_path}')
     return index_path
+
+
+def _vm_count_from_report_path(report_path):
+    """Extract VM count from e.g. mariadb-perf-242machines.md."""
+    if not report_path:
+        return None
+    m = re.search(r'-perf-(\d+)machines\.md$', os.path.basename(report_path))
+    return int(m.group(1)) if m else None
+
+
+def _load_run_perf_data(dir_output, db_type):
+    """Load detailed results and per-test-type stats from a processed run directory."""
+    detailed_csv = os.path.join(dir_output, f'{db_type}_detailed_results.csv')
+    if not os.path.isfile(detailed_csv):
+        return None
+
+    all_results = []
+    with open(detailed_csv, newline='') as f:
+        for row in csv.DictReader(f):
+            all_results.append({
+                'vm_name': row['VM_Name'],
+                'vm_number': int(row['VM_Number']),
+                'test_type': row['Test_Type'],
+                'tpm': float(row['TPM']),
+                'nopm': float(row['NOPM']) if row.get('NOPM') else None,
+            })
+
+    if not all_results:
+        return None
+
+    test_types = sorted(
+        {r['test_type'] for r in all_results},
+        key=get_user_count_from_test_type,
+    )
+    by_type = {
+        tt: _test_type_stats([r for r in all_results if r['test_type'] == tt])
+        for tt in test_types
+    }
+    vm_count = by_type[test_types[0]]['n']
+    return {
+        'all_results': all_results,
+        'test_types': test_types,
+        'by_type': by_type,
+        'vm_count': vm_count,
+    }
+
+
+def comparative_report_filename(vm_a, vm_b, label_a=None, label_b=None):
+    """Build comparative report filename, e.g. comparative_report_242_vs_500.md."""
+    if vm_a == vm_b and label_a and label_b:
+        safe_a = label_a.replace('/', '_').replace('\\', '_')
+        safe_b = label_b.replace('/', '_').replace('\\', '_')
+        return f'comparative_report_{vm_a}_{safe_a}_vs_{vm_b}_{safe_b}.md'
+    return f'comparative_report_{vm_a}_vs_{vm_b}.md'
+
+
+def _ratio_cell(ratio):
+    """Format B÷A ratio with percent change."""
+    if ratio is None:
+        return '—'
+    return f'{ratio:.3f}× ({_pct_ratio(ratio)})'
+
+
+def _find_test_type_by_users(test_types, users):
+    for tt in test_types:
+        if get_user_count_from_test_type(tt) == users:
+            return tt
+    return None
+
+
+def write_comparative_report_pair(output_dir, run_a, run_b):
+    """
+    Write comparative_report_{vm_a}_vs_{vm_b}.md comparing two processed runs.
+
+    run_a/run_b: perf_report_entries dicts with label, input_dir, dir_output, report_path, db_type.
+    """
+    if run_a.get('db_type') != run_b.get('db_type'):
+        print(
+            f'Skipping comparative report {run_a["label"]} vs {run_b["label"]}: '
+            f'different database types'
+        )
+        return None
+
+    db_type = run_a.get('db_type', 'database')
+    data_a = _load_run_perf_data(run_a['dir_output'], db_type)
+    data_b = _load_run_perf_data(run_b['dir_output'], db_type)
+    if not data_a or not data_b:
+        print(
+            f'Skipping comparative report {run_a["label"]} vs {run_b["label"]}: '
+            f'missing detailed results'
+        )
+        return None
+
+    vm_a = run_a.get('vm_count') or data_a['vm_count']
+    vm_b = run_b.get('vm_count') or data_b['vm_count']
+    test_types = sorted(
+        set(data_a['test_types']) & set(data_b['test_types']),
+        key=get_user_count_from_test_type,
+    )
+    if len(test_types) < 2:
+        print(
+            f'Skipping comparative report {vm_a} vs {vm_b}: '
+            f'need 2+ shared concurrency levels'
+        )
+        return None
+
+    db_display = {
+        'mariadb': 'MariaDB',
+        'postgresql': 'PostgreSQL',
+        'mssql': 'MSSQL',
+    }.get(db_type.lower(), db_type.capitalize())
+
+    label_a, label_b = run_a['label'], run_b['label']
+    by_a, by_b = data_a['by_type'], data_b['by_type']
+    baseline_tt = test_types[0]
+    high_tt = test_types[-1]
+    base_u = get_user_count_from_test_type(baseline_tt)
+    high_u = get_user_count_from_test_type(high_tt)
+
+    report_a_rel = os.path.relpath(run_a['report_path'], output_dir) if run_a.get('report_path') else ''
+    report_b_rel = os.path.relpath(run_b['report_path'], output_dir) if run_b.get('report_path') else ''
+
+    lines = [
+        f'# {db_display} TPC-C comparative analysis — {vm_a} VMs vs {vm_b} VMs',
+        '',
+        'Auto-generated by `extract_db_results.py` comparing two benchmark runs.',
+        '',
+        '| | Run A | Run B |',
+        '|---|-------|-------|',
+        f'| **Label** | {label_a} | {label_b} |',
+        f'| **VMs** | {vm_a} | {vm_b} |',
+        f'| **Input directory** | `{run_a.get("input_dir", "")}` | `{run_b.get("input_dir", "")}` |',
+    ]
+    if report_a_rel and report_b_rel:
+        lines.append(
+            f'| **Per-run report** | '
+            f'[`{os.path.basename(run_a["report_path"])}`]({report_a_rel}) | '
+            f'[`{os.path.basename(run_b["report_path"])}`]({report_b_rel}) |'
+        )
+    lines.append('')
+
+    # Executive summary side-by-side
+    lines.extend([
+        '## Executive summary',
+        '',
+        '| Users / VM | Avg TPM / VM (A) | Avg TPM / VM (B) | B ÷ A | '
+        'Cluster TPM (A) | Cluster TPM (B) | Cluster B ÷ A |',
+        '|-----------:|-----------------:|-----------------:|------:|'
+        '----------------:|----------------:|--------------:|',
+    ])
+    for tt in test_types:
+        sa, sb = by_a[tt], by_b[tt]
+        users = get_user_count_from_test_type(tt)
+        avg_ratio = sb['avg_tpm'] / sa['avg_tpm'] if sa['avg_tpm'] else None
+        cluster_ratio = sb['total_tpm'] / sa['total_tpm'] if sa['total_tpm'] else None
+        lines.append(
+            f'| **{users}** | {_fmt_int(sa["avg_tpm"])} | {_fmt_int(sb["avg_tpm"])} | '
+            f'{_ratio_cell(avg_ratio)} | {_fmt_millions(sa["total_tpm"])} | '
+            f'{_fmt_millions(sb["total_tpm"])} | {_ratio_cell(cluster_ratio)} |'
+        )
+    lines.append('')
+
+    # Per-VM throughput spread
+    lines.extend([
+        f'## Per-VM throughput by concurrency — {vm_a} VMs vs {vm_b} VMs',
+        '',
+        '| Users / VM | Avg TPM (A) | Avg TPM (B) | B ÷ A | Median (A) | Median (B) | '
+        'Min (A) | Min (B) | Max (A) | Max (B) | Std dev (A) | Std dev (B) |',
+        '|-----------:|------------:|------------:|------:|-----------:|-----------:|'
+        '--------:|--------:|--------:|--------:|------------:|------------:|',
+    ])
+    for tt in test_types:
+        sa, sb = by_a[tt], by_b[tt]
+        users = get_user_count_from_test_type(tt)
+        avg_ratio = sb['avg_tpm'] / sa['avg_tpm'] if sa['avg_tpm'] else None
+        lines.append(
+            f'| {users} | {_fmt_int(sa["avg_tpm"])} | {_fmt_int(sb["avg_tpm"])} | '
+            f'{_ratio_cell(avg_ratio)} | {_fmt_int(sa["med_tpm"])} | {_fmt_int(sb["med_tpm"])} | '
+            f'{_fmt_int(sa["min_tpm"])} | {_fmt_int(sb["min_tpm"])} | '
+            f'{_fmt_int(sa["max_tpm"])} | {_fmt_int(sb["max_tpm"])} | '
+            f'{_fmt_int(sa["stdev_tpm"])} | {_fmt_int(sb["stdev_tpm"])} |'
+        )
+    lines.append('')
+
+    # P10-P90 subsection
+    lines.extend([
+        '### P10–P90 spread',
+        '',
+        '| Users / VM | Run A | Run B |',
+        '|-----------:|-------|-------|',
+    ])
+    for tt in test_types:
+        sa, sb = by_a[tt], by_b[tt]
+        users = get_user_count_from_test_type(tt)
+        lines.append(
+            f'| {users} | {_fmt_int(sa["p10"])} – {_fmt_int(sa["p90"])} | '
+            f'{_fmt_int(sb["p10"])} – {_fmt_int(sb["p90"])} |'
+        )
+    lines.append('')
+
+    # Concurrency step impact per run
+    lines.extend(['## Concurrency impact per run', ''])
+    for tag, by_type in ((f'Run A ({label_a}, {vm_a} VMs)', by_a), (f'Run B ({label_b}, {vm_b} VMs)', by_b)):
+        lines.append(f'### {tag}')
+        lines.append('')
+        for i in range(1, len(test_types)):
+            prev_tt, cur_tt = test_types[i - 1], test_types[i]
+            prev_u = get_user_count_from_test_type(prev_tt)
+            cur_u = get_user_count_from_test_type(cur_tt)
+            tpm_ratio = by_type[cur_tt]['total_tpm'] / by_type[prev_tt]['total_tpm']
+            avg_ratio = by_type[cur_tt]['avg_tpm'] / by_type[prev_tt]['avg_tpm']
+            lines.append(
+                f'- **{prev_u} → {cur_u} users/VM:** cluster TPM {_ratio_cell(tpm_ratio)}, '
+                f'avg TPM/VM {_ratio_cell(avg_ratio)}'
+            )
+        lines.append('')
+
+    # Cluster scaling efficiency (B cluster / A cluster vs B VMs / A VMs)
+    vm_ratio = vm_b / vm_a if vm_a else None
+    lines.extend([
+        '## Cluster scaling efficiency (B vs A)',
+        '',
+        f'VM count ratio (B ÷ A): **{vm_ratio:.2f}×** ({vm_b} ÷ {vm_a})',
+        '',
+        '| Users / VM | Cluster TPM ratio (B ÷ A) | vs VM count ratio |',
+        '|-----------:|--------------------------:|------------------:|',
+    ])
+    for tt in test_types:
+        users = get_user_count_from_test_type(tt)
+        cluster_ratio = by_b[tt]['total_tpm'] / by_a[tt]['total_tpm'] if by_a[tt]['total_tpm'] else None
+        vs_vm = cluster_ratio / vm_ratio if cluster_ratio and vm_ratio else None
+        vs_cell = f'{vs_vm:.0%} of linear' if vs_vm is not None else '—'
+        lines.append(f'| {users} | {_ratio_cell(cluster_ratio)} | {vs_cell} |')
+    lines.append('')
+
+    # Auto-generated conclusions
+    lines.extend(['## Key conclusions', ''])
+
+    sa_base, sb_base = by_a[baseline_tt], by_b[baseline_tt]
+    sa_high, sb_high = by_a[high_tt], by_b[high_tt]
+    avg_at_base = sb_base['avg_tpm'] / sa_base['avg_tpm'] if sa_base['avg_tpm'] else 1
+    avg_at_high = sb_high['avg_tpm'] / sa_high['avg_tpm'] if sa_high['avg_tpm'] else 1
+
+    if abs(avg_at_base - 1) < 0.05:
+        lines.append(
+            f'- At **{base_u} user/VM**, per-VM throughput is **similar** '
+            f'(B ÷ A = {avg_at_base:.3f}×); both fleets behave alike under light load.'
+        )
+    elif avg_at_base > 1:
+        lines.append(
+            f'- At **{base_u} user/VM**, run B is **faster per VM** '
+            f'({_ratio_cell(avg_at_base)} avg TPM).'
+        )
+    else:
+        lines.append(
+            f'- At **{base_u} user/VM**, run A is **faster per VM** '
+            f'(B ÷ A = {avg_at_base:.3f}× avg TPM).'
+        )
+
+    spread_a_base = sa_base['stdev_tpm'] / sa_base['avg_tpm'] if sa_base['avg_tpm'] else 0
+    spread_b_base = sb_base['stdev_tpm'] / sb_base['avg_tpm'] if sb_base['avg_tpm'] else 0
+    if spread_a_base > 0.2 and spread_b_base > 0.2:
+        lines.append(
+            f'- At **{base_u} user/VM**, both runs show **wide per-VM spread** '
+            f'(σ/avg ≈ {spread_a_base:.0%} vs {spread_b_base:.0%}) — fast/slow VM tiers exist in both fleets.'
+        )
+
+    tt_32 = _find_test_type_by_users(test_types, 32)
+    if tt_32 and tt_32 != baseline_tt:
+        drop_a = by_a[tt_32]['avg_tpm'] / sa_base['avg_tpm']
+        drop_b = by_b[tt_32]['avg_tpm'] / sb_base['avg_tpm']
+        if drop_a > drop_b + 0.1:
+            lines.append(
+                f'- Run B **saturates earlier**: at **32 users/VM**, B retains '
+                f'{drop_b:.0%} of baseline avg TPM/VM vs A at {drop_a:.0%}.'
+            )
+        elif drop_b > drop_a + 0.1:
+            lines.append(
+                f'- Run A **saturates earlier**: at **32 users/VM**, A retains '
+                f'{drop_a:.0%} of baseline avg TPM/VM vs B at {drop_b:.0%}.'
+            )
+        else:
+            lines.append(
+                f'- At **32 users/VM**, both runs show similar saturation '
+                f'(A retains {drop_a:.0%}, B retains {drop_b:.0%} of baseline avg TPM/VM).'
+            )
+
+    if avg_at_high < avg_at_base * 0.9:
+        faster = 'A' if avg_at_high < 1 else 'B'
+        slower = 'B' if faster == 'A' else 'A'
+        lines.append(
+            f'- At **{high_u} users/VM**, run {faster} delivers **{_fmt_int(by_a[high_tt]["avg_tpm"] if faster == "A" else by_b[high_tt]["avg_tpm"])}** '
+            f'avg TPM/VM vs run {slower} at **{_fmt_int(by_b[high_tt]["avg_tpm"] if faster == "A" else by_a[high_tt]["avg_tpm"])}** '
+            f'(B ÷ A = {avg_at_high:.3f}×).'
+        )
+
+    cluster_base = sb_base['total_tpm'] / sa_base['total_tpm'] if sa_base['total_tpm'] else None
+    cluster_high = sb_high['total_tpm'] / sa_high['total_tpm'] if sa_high['total_tpm'] else None
+    if vm_ratio and cluster_base and cluster_high:
+        if cluster_base >= vm_ratio * 0.95 and cluster_high < vm_ratio * 0.75:
+            lines.append(
+                f'- **Cluster scaling degrades under load**: at {base_u} user/VM cluster TPM ratio '
+                f'({_ratio_cell(cluster_base)}) is near-linear with VM count ({vm_ratio:.2f}×), but at '
+                f'{high_u} users/VM it falls to {_ratio_cell(cluster_high)} — adding VMs does not '
+                f'proportionally increase usable OLTP capacity at high concurrency.'
+            )
+        elif cluster_high >= vm_ratio * 0.9:
+            lines.append(
+                f'- Cluster TPM scales **near-linearly** with VM count even at {high_u} users/VM '
+                f'(cluster ratio {_ratio_cell(cluster_high)} vs {vm_ratio:.2f}× VM ratio).'
+            )
+
+    fair_a = sa_high['stdev_tpm']
+    fair_b = sb_high['stdev_tpm']
+    if fair_a < fair_b and sb_high['avg_tpm'] < sa_high['avg_tpm']:
+        lines.append(
+            f'- At **{high_u} users/VM**, run A is **faster and more uniform** '
+            f'(σ {_fmt_int(fair_a)} vs {_fmt_int(fair_b)}).'
+        )
+    elif fair_b < fair_a and sa_high['avg_tpm'] < sb_high['avg_tpm']:
+        lines.append(
+            f'- At **{high_u} users/VM**, run B is **faster and more uniform** '
+            f'(σ {_fmt_int(fair_b)} vs {_fmt_int(fair_a)}).'
+        )
+
+    lines.append('')
+    lines.extend([
+        '## Source files',
+        '',
+        f'Run A (`{label_a}`): `{db_type}_detailed_results.csv`, `{db_type}_overall_summary.csv`',
+        f'Run B (`{label_b}`): `{db_type}_detailed_results.csv`, `{db_type}_overall_summary.csv`',
+        '',
+        f'Per-run reports: `{os.path.basename(run_a["report_path"])}`, `{os.path.basename(run_b["report_path"])}`',
+        '',
+    ])
+
+    filename = comparative_report_filename(vm_a, vm_b, label_a, label_b)
+    report_path = os.path.join(output_dir, filename)
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
+    print(f'Comparative report saved to: {report_path}')
+    return report_path
+
+
+def write_comparative_reports(output_dir, perf_report_entries):
+    """Write pairwise comparative_report_{N}_vs_{M}.md for each pair of runs with perf data."""
+    entries = [e for e in perf_report_entries if e.get('report_path')]
+    if len(entries) < 2:
+        return []
+
+    written = []
+    for run_a, run_b in itertools.combinations(entries, 2):
+        path = write_comparative_report_pair(output_dir, run_a, run_b)
+        if path:
+            written.append(path)
+    return written
 
 
 def process_postgresql_results(input_dir, output_dir, chart_type='scatter', user_filter=None,
@@ -2593,9 +2964,11 @@ def main():
                 'dir_output': dir_output,
                 'report_path': report_path,
                 'db_type': db_type,
+                'vm_count': _vm_count_from_report_path(report_path),
             })
 
-        write_compare_perf_index(output_dir, perf_report_entries)
+        comparative_reports = write_comparative_reports(output_dir, perf_report_entries)
+        write_compare_perf_index(output_dir, perf_report_entries, comparative_reports)
 
         # Create comparison graphs if requested or if multiple directories
         if args.compare or len(valid_dirs) > 1:
