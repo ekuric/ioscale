@@ -12,7 +12,7 @@ Supports:
   (formats: "System achieved X PostgreSQL TPM at Y NOPM" or "System achieved Y NOPM from X PostgreSQL TPM")
 - MariaDB: Files containing "test_mariadb" and "MySQL TPM" results
   (formats: "System achieved X MySQL TPM at Y NOPM" or "System achieved Y NOPM from X MySQL TPM")
-- MSSQL Server: Files containing "test_mssql" and "SQL Server TPM" results
+- MSSQL Server: Legacy "test_mssql" .out files or HammerDB "mssqls_tprocc_*vu*.out" results
   (formats: "System achieved X SQL Server TPM at Y NOPM" or "System achieved Y NOPM from X SQL Server TPM")
 
 Usage:
@@ -332,6 +332,22 @@ def _match_tpm(content, tpm_first_pattern, nopm_first_pattern, db_type):
     return None, None, None
 
 
+def read_benchmark_result_text(file_path):
+    """
+    Read HammerDB / benchmark .out text (UTF-8 or UTF-16 from Windows redirection).
+    """
+    with open(file_path, 'rb') as f:
+        raw = f.read()
+    if not raw:
+        return ''
+    if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+        return raw.decode('utf-16')
+    # UTF-16 LE without BOM (common when PowerShell redirects HammerDB output)
+    if len(raw) > 1 and raw[1:2] == b'\x00':
+        return raw.decode('utf-16-le', errors='replace')
+    return raw.decode('utf-8', errors='replace')
+
+
 def extract_tpm_from_file(file_path):
     """
     Extract TPM (Transactions Per Minute) value from a PostgreSQL, MariaDB, or MSSQL Server result file.
@@ -343,8 +359,7 @@ def extract_tpm_from_file(file_path):
         tuple: (tpm_value, nopm_value, database_type) or (None, None, None) if not found
     """
     try:
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
+        content = read_benchmark_result_text(file_path)
 
         for tpm_pat, nopm_pat, db_type in (
             (
@@ -403,6 +418,46 @@ def get_vm_number(vm_dir_name):
     
     # If no number found, return 0 (will be handled in sorting)
     return 0
+
+
+def is_benchmark_out_file(filename):
+    """
+    Return True if a filename is a HammerDB or legacy benchmark result .out file.
+    """
+    if not filename.endswith('.out'):
+        return False
+    return (
+        'test_postgresql_pg' in filename
+        or 'test_ESX_pg' in filename
+        or 'test_mariadb' in filename
+        or 'test_mssql' in filename
+        or re.search(r'mssqls_.*tprocc.*\.out$', filename, re.IGNORECASE) is not None
+    )
+
+
+def get_test_type_from_out_filename(out_file):
+    """
+    Determine concurrency test type from a benchmark .out filename.
+
+    Supports legacy names (test_mssql_*_10.out) and HammerDB MSSQL names
+    (mssqls_tprocc_010vu_run1.out).
+    """
+    match = re.search(r'_(\d+)vu_', out_file, re.IGNORECASE)
+    if match:
+        user_count = int(match.group(1))
+        return '1_user' if user_count == 1 else f'{user_count}_users'
+
+    if '_1.out' in out_file:
+        return '1_user'
+    if '_10.out' in out_file:
+        return '10_users'
+
+    match = re.search(r'_(\d+)\.out$', out_file)
+    if match:
+        user_count = int(match.group(1))
+        return '1_user' if user_count == 1 else f'{user_count}_users'
+
+    return 'unknown'
 
 
 def get_user_count_from_test_type(test_type):
@@ -990,8 +1045,12 @@ def _fmt_int(value):
 
 
 def _fmt_millions(value):
-    """Format large TPM totals as millions with one decimal."""
-    return f'{value / 1_000_000:.2f} M'
+    """Format cluster totals: use M suffix only when value is in the millions."""
+    if value >= 1_000_000:
+        if value >= 10_000_000:
+            return f'{value / 1_000_000:.0f} M'
+        return f'{value / 1_000_000:.2f} M'
+    return _fmt_int(value)
 
 
 def _pct_ratio(ratio):
@@ -2049,16 +2108,7 @@ def process_postgresql_results(input_dir, output_dir, chart_type='scatter', user
         item_path = os.path.join(input_dir, item)
         if os.path.isdir(item_path):
             # Check if this directory contains .out files (PostgreSQL, MariaDB, or MSSQL)
-            out_files = [
-                f for f in os.listdir(item_path)
-                if f.endswith('.out')
-                and (
-                    'test_postgresql_pg' in f
-                    or 'test_ESX_pg' in f
-                    or 'test_mariadb' in f
-                    or 'test_mssql' in f
-                )
-            ]
+            out_files = [f for f in os.listdir(item_path) if is_benchmark_out_file(f)]
             if out_files:
                 vm_dirs.append(item)
     
@@ -2079,29 +2129,11 @@ def process_postgresql_results(input_dir, output_dir, chart_type='scatter', user
         print(f"Processing {vm_dir} (VM {vm_number})...")
         
         # Find all .out files in the VM directory (PostgreSQL, MariaDB, or MSSQL)
-        out_files = [
-            f for f in os.listdir(vm_path)
-            if f.endswith('.out')
-            and (
-                'test_postgresql_pg' in f
-                or 'test_ESX_pg' in f
-                or 'test_mariadb' in f
-                or 'test_mssql' in f
-            )
-        ]
+        out_files = [f for f in os.listdir(vm_path) if is_benchmark_out_file(f)]
         
         for out_file in out_files:
             file_path = os.path.join(vm_path, out_file)
-            
-            # Determine test type from filename
-            if '_1.out' in out_file:
-                test_type = '1_user'
-            elif '_10.out' in out_file:
-                test_type = '10_users'
-            else:
-                # Extract number from filename if it's different
-                match = re.search(r'_(\d+)\.out$', out_file)
-                test_type = f"{match.group(1)}_users" if match else 'unknown'
+            test_type = get_test_type_from_out_filename(out_file)
             
             # Extract TPM and NOPM values
             tpm, nopm, database_type = extract_tpm_from_file(file_path)
