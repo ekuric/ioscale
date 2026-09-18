@@ -18,7 +18,8 @@ windows:
   # OR use pattern: 
   #host_pattern: "win-vm-{1..10}"
   
-  # Windows Storage Configuration
+  # Windows Storage Configuration (ignored when fio-tests.py is run with --testdir:
+  # then data is c:/testdir, results c:/fio-results, FIO from c:/tools/fio)
   storage_win:
     devices:
       # Individual host configuration

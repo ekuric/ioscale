@@ -51,6 +51,7 @@ else
     MONITOR_VM="${MONITOR_VM:-false}"
     MONITOR_VM_INTERVAL="${MONITOR_VM_INTERVAL:-10}"
     MAX_WORKERS="${MAX_WORKERS:-}"
+    USE_TESTDIR="${USE_TESTDIR:-false}"
 
     # Detect what's requested
     HAS_LINUX=false
@@ -101,21 +102,28 @@ else
             HOST_BLOCK="  host_labels: \"${HOST_LABELS}\""
         fi
 
+        LINUX_DEVICES_SECTION=""
         if [[ -z "${DEVICES:-}" ]]; then
-            echo "ERROR: DEVICES is required for Linux hosts (e.g. DEVICES=\"vm-{1..10}=vdc\")" >&2
-            exit 1
-        fi
-
-        DEVICE_BLOCK=""
-        IFS=',' read -ra DEVICE_PAIRS <<< "${DEVICES}"
-        for pair in "${DEVICE_PAIRS[@]}"; do
-            pattern="${pair%%=*}"
-            device="${pair#*=}"
-            pattern="$(echo "${pattern}" | xargs)"
-            device="$(echo "${device}" | xargs)"
-            DEVICE_BLOCK="${DEVICE_BLOCK}    \"${pattern}\": \"${device}\"
+            if [[ "${USE_TESTDIR}" == "true" ]]; then
+                LINUX_DEVICES_SECTION="  devices: {}"
+            else
+                echo "ERROR: DEVICES is required for Linux hosts (e.g. DEVICES=\"vm-{1..10}=vdc\")" >&2
+                exit 1
+            fi
+        else
+            DEVICE_BLOCK=""
+            IFS=',' read -ra DEVICE_PAIRS <<< "${DEVICES}"
+            for pair in "${DEVICE_PAIRS[@]}"; do
+                pattern="${pair%%=*}"
+                device="${pair#*=}"
+                pattern="$(echo "${pattern}" | xargs)"
+                device="$(echo "${device}" | xargs)"
+                DEVICE_BLOCK="${DEVICE_BLOCK}    \"${pattern}\": \"${device}\"
 "
-        done
+            done
+            LINUX_DEVICES_SECTION="  devices:
+${DEVICE_BLOCK}"
+        fi
 
         case "${FIO_INSTALLED,,}" in
             true|1|yes) FIO_INSTALLED_VALUE=true ;;
@@ -145,8 +153,8 @@ ${HOST_BLOCK}
   namespace: \"${NAMESPACE}\"
 
 storage:
-  devices:
-${DEVICE_BLOCK}  mount_point: \"${MOUNT_POINT}\"
+${LINUX_DEVICES_SECTION}
+  mount_point: \"${MOUNT_POINT}\"
   filesystem: \"${FILESYSTEM}\"
   persistent: \"${PERSISTENT}\"
 
@@ -188,21 +196,28 @@ output:
             WIN_HOST_BLOCK="  host_pattern: \"${WIN_HOST_PATTERN}\""
         fi
 
+        WIN_DEVICES_SECTION=""
         if [[ -z "${WIN_DEVICES:-}" ]]; then
-            echo "ERROR: WIN_DEVICES is required for Windows hosts (e.g. WIN_DEVICES=\"win-vm-{1..10}=1\")" >&2
-            exit 1
-        fi
-
-        WIN_DEVICE_BLOCK=""
-        IFS=',' read -ra WIN_DEVICE_PAIRS <<< "${WIN_DEVICES}"
-        for pair in "${WIN_DEVICE_PAIRS[@]}"; do
-            pattern="${pair%%=*}"
-            device="${pair#*=}"
-            pattern="$(echo "${pattern}" | xargs)"
-            device="$(echo "${device}" | xargs)"
-            WIN_DEVICE_BLOCK="${WIN_DEVICE_BLOCK}      \"${pattern}\": \"${device}\"
+            if [[ "${USE_TESTDIR}" == "true" ]]; then
+                WIN_DEVICES_SECTION="    devices: {}"
+            else
+                echo "ERROR: WIN_DEVICES is required for Windows hosts (e.g. WIN_DEVICES=\"win-vm-{1..10}=1\")" >&2
+                exit 1
+            fi
+        else
+            WIN_DEVICE_BLOCK=""
+            IFS=',' read -ra WIN_DEVICE_PAIRS <<< "${WIN_DEVICES}"
+            for pair in "${WIN_DEVICE_PAIRS[@]}"; do
+                pattern="${pair%%=*}"
+                device="${pair#*=}"
+                pattern="$(echo "${pattern}" | xargs)"
+                device="$(echo "${device}" | xargs)"
+                WIN_DEVICE_BLOCK="${WIN_DEVICE_BLOCK}      \"${pattern}\": \"${device}\"
 "
-        done
+            done
+            WIN_DEVICES_SECTION="    devices:
+${WIN_DEVICE_BLOCK}"
+        fi
 
         WIN_RATE_IOPS_LINE=""
         if [[ -n "${WIN_RATE_IOPS:-}" ]]; then
@@ -227,8 +242,8 @@ windows:
 ${WIN_HOST_BLOCK}
 
   storage_win:
-    devices:
-${WIN_DEVICE_BLOCK}    mount_point: '${WIN_MOUNT_POINT}'
+${WIN_DEVICES_SECTION}
+    mount_point: '${WIN_MOUNT_POINT}'
 
   fio_win:
     run_dir: '${WIN_RUN_DIR}'
@@ -282,11 +297,14 @@ echo "---"
 cd /work/results
 
 EXTRA_ARGS=""
-if [[ "${MONITOR_VM}" == "true" ]]; then
-    EXTRA_ARGS="${EXTRA_ARGS} --monitor-vm --monitor-vm-interval ${MONITOR_VM_INTERVAL}"
+if [[ "${MONITOR_VM:-}" == "true" ]]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --monitor-vm --monitor-vm-interval ${MONITOR_VM_INTERVAL:-10}"
 fi
 if [[ -n "${MAX_WORKERS:-}" ]]; then
     EXTRA_ARGS="${EXTRA_ARGS} --max-workers ${MAX_WORKERS}"
+fi
+if [[ "${USE_TESTDIR:-}" == "true" ]]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --testdir"
 fi
 
 exec python3 /work/fio-tests.py \

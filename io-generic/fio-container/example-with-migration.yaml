@@ -10,6 +10,7 @@ vm:
   namespace: "default"
 
 # Storage Configuration
+# Default: dedicated disk below. OS-disk load: add --testdir to fio-tests.py (see fio-config.yaml).
 storage:
   devices:
     "vm{1..50}": "vdc"

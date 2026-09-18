@@ -94,7 +94,13 @@ WIN_IO_PATTERNS:   write
 MIGRATE_WORKLOADS: (empty)
 MIGRATE_INTERVAL:  0
 DESCRIPTION:       jenkins-fio-test
+USE_TESTDIR:       false
 ```
+
+Set **USE_TESTDIR** to `true` to run FIO on the OS disk (`/root/testdir` / `c:/testdir`)
+without formatting separate data disks (see `README-container.md`). You can leave
+**DEVICES** / **WIN_DEVICES** empty in that mode; only **HOST_PATTERN** /
+**WIN_HOST_PATTERN** are required.
 
 3. Modify any values you want for this run
 4. Click **Build**

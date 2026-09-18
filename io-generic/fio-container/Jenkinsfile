@@ -12,9 +12,9 @@ pipeline {
         string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/fio-benchmark:latest', description: 'Container image to run')
 
         string(name: 'HOST_PATTERN',      defaultValue: 'vml-{1..3}',         description: 'Linux VM host pattern')
-        string(name: 'DEVICES',           defaultValue: 'vml-{1..3}=vdc',     description: 'Linux device mapping (pattern=device, comma-separated)')
+        string(name: 'DEVICES',           defaultValue: 'vml-{1..3}=vdc',     description: 'Linux device mapping. Leave empty when USE_TESTDIR=true')
         string(name: 'WIN_HOST_PATTERN',  defaultValue: 'vm-{1..2}',          description: 'Windows VM host pattern (leave empty to skip Windows)')
-        string(name: 'WIN_DEVICES',       defaultValue: 'vm-{1..2}=2',        description: 'Windows device mapping (pattern=diskid, comma-separated)')
+        string(name: 'WIN_DEVICES',       defaultValue: '',                   description: 'Windows device mapping. Leave empty when USE_TESTDIR=true')
         string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
 
         // Linux FIO parameters
@@ -48,6 +48,11 @@ pipeline {
         string(name: 'MONITOR_VM',        defaultValue: 'false',              description: 'Monitor VM node placement during tests and log migrations (true/false)')
         string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',               description: 'VM migration monitor polling interval in seconds')
         string(name: 'DESCRIPTION',       defaultValue: 'jenkins-fio-test',   description: 'Test run description (included in results directory name)')
+        choice(
+            name: 'USE_TESTDIR',
+            choices: ['false', 'true'],
+            description: 'OS-disk FIO mode: Linux /root/testdir, Windows c:/testdir (no data-disk format; pass --testdir to fio-tests.py)'
+        )
     }
 
     environment {
@@ -76,6 +81,7 @@ pipeline {
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
                             podman run --rm --pids-limit=-1 \
                               -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e USE_TESTDIR="${params.USE_TESTDIR}" \
                               -e DEVICES="${params.DEVICES}" \
                               -e WIN_HOST_PATTERN="${params.WIN_HOST_PATTERN}" \
                               -e WIN_DEVICES="${params.WIN_DEVICES}" \

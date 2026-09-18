@@ -10,6 +10,7 @@ vm:
   namespace: "default"
 
 # Linux Storage Configuration
+# Default: dedicated disk below. OS-disk load: add --testdir to fio-tests.py (see fio-config.yaml).
 storage:
   devices:
     "linux-vm-{1..5}": "vdc"
@@ -35,7 +36,7 @@ output:
 windows:
   host_pattern: "win-vm-{1..5}"
   
-  # Windows Storage Configuration
+  # Windows Storage Configuration (ignored with --testdir; see fio-config.yaml storage comments)
   storage_win:
     devices:
       "win-vm-{1..5}": "1"  # Disk ID (not /dev/ path)

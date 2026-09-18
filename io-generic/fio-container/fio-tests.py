@@ -3,6 +3,9 @@
 FIO Remote Testing Script
 This script executes FIO performance tests on remote machines/VMs via SSH
 Supports YAML configuration and multiple machines/VMs testing
+
+Use --testdir to run on the OS disk (/root/testdir or c:/testdir) without
+formatting separate data disks (see fio-config.yaml storage section).
 """
 
 import argparse
@@ -56,6 +59,12 @@ WINDOWS_PREP_RESTART_AFTER_ATTEMPT = 5  # Windows prep: restart VM after this ma
 DEFAULT_LINUX_IOENGINE = "libaio"
 LINUX_THREAD_IOENGINES = frozenset({"libaio", "io_uring", "posixaio"})
 
+# Fixed paths for --testdir (OS-disk FIO mode; no separate data disk format/provision)
+LINUX_TESTDIR = "/root/testdir"
+WINDOWS_TESTDIR = "c:/testdir"
+WINDOWS_FIO_DIR_TESTDIR = "c:/tools/fio"
+WINDOWS_OUTPUT_TESTDIR = "c:/fio-results"
+
 # Import required dependencies
 try:
     import yaml
@@ -88,6 +97,41 @@ def normalize_windows_path(path: str) -> str:
     normalized = re.sub(r'([a-zA-Z])/:/', r'\1:/', normalized)
     
     return normalized
+
+
+def apply_testdir_overrides(config: "FioTestConfig") -> None:
+    """
+    Override FIO data/output paths for OS-disk testing (--testdir).
+
+    YAML storage devices are left validated but unused; no mkfs/mount/provision.
+    """
+    if not config.use_testdir:
+        return
+
+    linux_hosts = config.get_linux_hosts()
+    windows_hosts = config.get_windows_hosts()
+
+    if linux_hosts:
+        config.mount_point = LINUX_TESTDIR
+
+    if windows_hosts:
+        config.windows_mount_point = normalize_windows_path(WINDOWS_TESTDIR)
+        config.windows_fio_dir = normalize_windows_path(WINDOWS_FIO_DIR_TESTDIR)
+        if not config.windows_fio_dir.endswith('/'):
+            config.windows_fio_dir += '/'
+        config.windows_output_dir = normalize_windows_path(WINDOWS_OUTPUT_TESTDIR)
+
+    logger.info(
+        "TESTDIR MODE: FIO runs on OS disk — no separate disk format/provision. "
+        "YAML storage devices are ignored."
+    )
+    if linux_hosts:
+        logger.info(f"  Linux FIO data directory: {LINUX_TESTDIR}")
+        logger.info(f"  Linux results directory: {config.output_dir} (from YAML)")
+    if windows_hosts:
+        logger.info(f"  Windows FIO data directory: {config.windows_mount_point}")
+        logger.info(f"  Windows FIO executable dir: {config.windows_fio_dir}")
+        logger.info(f"  Windows results directory: {config.windows_output_dir}")
 
 
 def parse_bool(value, default: bool = False) -> bool:
@@ -218,6 +262,7 @@ class FioTestConfig:
         self.storage_devices = {}  # host -> device mapping
         self.persistent_mount = False  # Whether to create /etc/fstab entries
         self.copy_results = False  # Whether to only copy results (skip all other steps)
+        self.use_testdir = False  # OS-disk mode: fixed testdir paths, no data-disk format
         self.windows_hosts = set()  # Set of Windows hostnames
         # Windows-specific configuration (optional, only used if windows_hosts is set)
         self.windows_storage_devices = {}  # host -> device mapping for Windows
@@ -1652,6 +1697,8 @@ class ConfigLoader:
                     device = self._get_device_from_pattern(host, devices)
                 if device:
                     self.config.storage_devices[host] = device
+                elif self.config.use_testdir:
+                    self.config.storage_devices[host] = "unused"
                 else:
                     raise FioConfigError(f"CRITICAL: No storage device specified for Linux host '{host}'")
         
@@ -1783,6 +1830,8 @@ class ConfigLoader:
                             device = self._get_device_from_pattern(host, devices_win)
                         if device:
                             self.config.windows_storage_devices[host] = device
+                        elif self.config.use_testdir:
+                            self.config.windows_storage_devices[host] = "0"
                         else:
                             raise FioConfigError(f"CRITICAL: No storage device specified for Windows host '{host}'")
                     
@@ -2058,7 +2107,11 @@ def main():
     """
     parser = argparse.ArgumentParser(
         description="FIO Remote Testing Script (Python version)",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Example (OS-disk load on /root/testdir or c:/testdir, no data-disk format):\n"
+            "  python3 fio-tests.py -c fio-config.yaml --testdir --yes-i-mean-it"
+        ),
     )
     parser.add_argument('-c', '--config', default='fio-config.yaml',
                        help='Path to YAML configuration file (default: fio-config.yaml)')
@@ -2094,7 +2147,16 @@ def main():
                        help='Query and display historical VM migration data from cluster (post-hoc)')
     parser.add_argument('--max-workers', type=int, default=None,
                        help='Override default max workers per pool (default: 50)')
-    
+    parser.add_argument(
+        '--testdir',
+        action='store_true',
+        help=(
+            'Run FIO on OS disk: Linux /root/testdir, Windows c:/testdir; '
+            'use c:/tools/fio in place (no copy to data disk); results on '
+            'c:/fio-results. Skips format/mount/provision of YAML storage devices.'
+        ),
+    )
+
     args = parser.parse_args()
     
     # Set up logging
@@ -2117,12 +2179,14 @@ def main():
     config.monitor_vm_interval = args.monitor_vm_interval
     config.migration_report = args.migration_report
     config.max_workers_cli = args.max_workers
-    
+    config.use_testdir = args.testdir
+
     # Load configuration (YAML sets defaults)
     try:
         config_loader = ConfigLoader(config)
         config_loader.load_config()
-        
+        apply_testdir_overrides(config)
+
         # Override config values with command-line arguments after loading YAML
         # (CLI args take precedence over YAML config)
         if args.interval is not None:
@@ -2176,23 +2240,36 @@ def main():
     else:
         logger.info("Namespace: N/A (SSH-only mode)")
     
-    logger.info(f"Storage device configuration:")
     linux_hosts = config.get_linux_hosts()
     windows_hosts = config.get_windows_hosts()
-    for host in linux_hosts:
-        device = config.storage_devices.get(host, "N/A")
-        logger.info(f"  {host} (Linux): /dev/{device}")
-    for host in windows_hosts:
-        device = config.windows_storage_devices.get(host, "N/A")
-        logger.info(f"  {host} (Windows): Disk {device}")
-    
-    if linux_hosts:
-        logger.info(f"Mount point (Linux): {config.mount_point}")
-        logger.info(f"Filesystem (Linux): {config.filesystem}")
-    if windows_hosts:
-        logger.info(f"Mount point (Windows): {config.windows_mount_point}")
-        logger.info(f"FIO directory (Windows): {config.windows_fio_dir}")
-    logger.info(f"Persistent mount: {'ENABLED (will create /etc/fstab entries)' if config.persistent_mount else 'DISABLED (temporary mounts only)'}")
+
+    if config.use_testdir:
+        logger.info("Storage: TESTDIR MODE (OS disk — YAML storage devices not used)")
+        if linux_hosts:
+            logger.info(f"  Linux FIO data directory: {config.mount_point}")
+            logger.info(f"  Linux results directory: {config.output_dir}")
+        if windows_hosts:
+            logger.info(f"  Windows FIO data directory: {config.windows_mount_point}")
+            logger.info(f"  Windows FIO directory: {config.windows_fio_dir}")
+            logger.info(f"  Windows results directory: {config.windows_output_dir}")
+    else:
+        logger.info(f"Storage device configuration:")
+        for host in linux_hosts:
+            device = config.storage_devices.get(host, "N/A")
+            logger.info(f"  {host} (Linux): /dev/{device}")
+        for host in windows_hosts:
+            device = config.windows_storage_devices.get(host, "N/A")
+            logger.info(f"  {host} (Windows): Disk {device}")
+
+        if linux_hosts:
+            logger.info(f"Mount point (Linux): {config.mount_point}")
+            logger.info(f"Filesystem (Linux): {config.filesystem}")
+        if windows_hosts:
+            logger.info(f"Mount point (Windows): {config.windows_mount_point}")
+            logger.info(f"FIO directory (Windows): {config.windows_fio_dir}")
+        logger.info(
+            f"Persistent mount: {'ENABLED (will create /etc/fstab entries)' if config.persistent_mount else 'DISABLED (temporary mounts only)'}"
+        )
     logger.info(f"Test size: {config.test_size}")
     logger.info(
         "Dataset write: always size-based (full --size, no --runtime); "
@@ -2246,7 +2323,10 @@ def main():
                 logger.info("  1. Skip FIO package check on Linux VMs (fio_installed=true)")
             else:
                 logger.info("  1. Install FIO and dependencies on VMs")
-            logger.info("  2. Prepare storage (format and mount devices)")
+            if config.use_testdir:
+                logger.info("  2. Create test directories on OS disk (testdir mode, no format)")
+            else:
+                logger.info("  2. Prepare storage (format and mount devices)")
             logger.info("  3. Write initial test dataset")
             logger.info("  4. Run FIO performance tests")
             logger.info("  5. Collect test results")
@@ -2328,18 +2408,35 @@ def main():
     # Confirmation prompt
     if not config.skip_confirmation:
         print("\n")
-        logger.warning("WARNING: This script will format storage devices on all hosts!")
-        logger.warning(f"Hosts: {' '.join(config.vm_hosts)}")
-        logger.warning("Devices to be formatted:")
-        for host in config.vm_hosts:
-            if executor.is_windows_host(host):
-                # Windows: Get device from windows_storage_devices (disk number, not /dev/)
-                device = config.windows_storage_devices.get(host, "N/A")
-                logger.warning(f"  {host}: {device}")
-            else:
-                # Linux: Get device from storage_devices (device name like vdc)
-                device = config.storage_devices.get(host, "N/A")
-                logger.warning(f"  {host}: /dev/{device}")
+        if config.use_testdir:
+            logger.warning(
+                "WARNING: TESTDIR MODE — FIO will run on the OS disk (not separate data disks)."
+            )
+            logger.warning(f"Hosts: {' '.join(config.vm_hosts)}")
+            if config.get_linux_hosts():
+                logger.warning(
+                    f"  Linux: data under {config.mount_point}, results under {config.output_dir}"
+                )
+            if config.get_windows_hosts():
+                logger.warning(
+                    f"  Windows: data under {config.windows_mount_point}, "
+                    f"results under {config.windows_output_dir}"
+                )
+            logger.warning(
+                "Test artifacts under those paths may be removed during cleanup. "
+                "YAML storage devices will NOT be formatted."
+            )
+        else:
+            logger.warning("WARNING: This script will format storage devices on all hosts!")
+            logger.warning(f"Hosts: {' '.join(config.vm_hosts)}")
+            logger.warning("Devices to be formatted:")
+            for host in config.vm_hosts:
+                if executor.is_windows_host(host):
+                    device = config.windows_storage_devices.get(host, "N/A")
+                    logger.warning(f"  {host}: {device}")
+                else:
+                    device = config.storage_devices.get(host, "N/A")
+                    logger.warning(f"  {host}: /dev/{device}")
         print("\n")
         confirm = input("Are you sure you want to continue? (yes/no): ")
         if confirm != "yes":
@@ -2421,6 +2518,93 @@ def main():
     return 0
 
 
+def _ensure_windows_fio_copied_to_data_disk(
+    config: FioTestConfig, executor: CommandExecutor, windows_hosts: List[str]
+) -> None:
+    """Provision data disk if needed and copy FIO from c:\\tools\\fio to the data drive."""
+    logger.info(f"Installing FIO on Windows hosts: {windows_hosts}")
+    root_dir = "d:/"
+    if config.windows_fio_dir:
+        fio_dir_normalized = normalize_windows_path(config.windows_fio_dir)
+        fio_dir_normalized = fio_dir_normalized.rstrip('/')
+        if '/' in fio_dir_normalized:
+            root_dir = fio_dir_normalized.rsplit('/', 1)[0] + '/'
+        else:
+            root_dir = fio_dir_normalized + '/'
+
+    root_dir_ps = root_dir.replace('/', '\\').rstrip('\\')
+    root_dir_ps_with_slash = root_dir_ps + '\\'
+
+    drive_letter = root_dir_ps[0].upper() if root_dir_ps else "D"
+    logger.info(f"Ensuring Windows disk is provisioned for drive {drive_letter}: before FIO installation...")
+
+    with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
+        provision_futures = []
+        for host in windows_hosts:
+            device = config.windows_storage_devices.get(host, "1")
+            cmd = (
+                f"powershell -Command \""
+                f"if (Test-Path '{drive_letter}:\\') {{ Write-Host 'DRIVE_EXISTS' }} "
+                f"else {{ "
+                f"Write-Host 'PROVISIONING'; "
+                f"& c:\\tools\\setup\\provision-data-disk.ps1 -DiskID {device}; "
+                f"Write-Host 'PROVISIONED' "
+                f"}}\""
+            )
+            future = pool.submit(
+                executor.execute_prep_command,
+                host,
+                cmd,
+                f"Checking/provisioning drive {drive_letter}: on {host}",
+                timeout=config.timeout_default,
+            )
+            provision_futures.append((future, host))
+
+        provisioned = 0
+        existed = 0
+        for future, host in provision_futures:
+            success, output = future.result()
+            if not success:
+                logger.error(f"Failed to check/provision disk on {host}: {output}")
+                sys.exit(1)
+            elif output and 'DRIVE_EXISTS' in output:
+                existed += 1
+            else:
+                provisioned += 1
+        if existed > 0:
+            logger.info(f"Drive {drive_letter}: already existed on {existed} host(s)")
+        if provisioned > 0:
+            logger.info(f"Drive {drive_letter}: provisioned on {provisioned} host(s)")
+
+    logger.info(f"Copying FIO from c:\\tools\\fio to {root_dir_ps_with_slash} on Windows hosts...")
+    with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
+        futures = []
+        for host in windows_hosts:
+            cmd = (
+                f"powershell -Command \"if (Test-Path 'c:\\tools\\fio') {{ "
+                f"copy-item -Path c:\\tools\\fio -Destination {root_dir_ps_with_slash} "
+                f"-recurse -force; Write-Host 'FIO_COPIED' }} else {{ Write-Host 'SOURCE_NOT_FOUND' }}\""
+            )
+            futures.append(
+                pool.submit(executor.execute_prep_command, host, cmd, f"Installing FIO on {host}")
+            )
+
+        failed = 0
+        for future in as_completed(futures):
+            success, output = future.result()
+            if not success:
+                failed += 1
+            elif output and 'SOURCE_NOT_FOUND' in output:
+                logger.warning("Source c:\\tools\\fio not found on a host")
+                failed += 1
+
+        if failed > 0:
+            logger.error(f"{failed}/{len(windows_hosts)} Windows hosts failed to install FIO")
+            sys.exit(1)
+
+    logger.info("FIO installation completed on all Windows hosts")
+
+
 def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) -> None:
     """
     Ensure FIO and required packages are installed on all hosts.
@@ -2442,99 +2626,38 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
 
     # Install FIO on Windows hosts (copy from c:\tools\fio to root_dir)
     if windows_hosts:
-        logger.info(f"Installing FIO on Windows hosts: {windows_hosts}")
-        # Get root_dir from windows_fio_dir (e.g., "d:/fio/" -> "d:/")
-        # If windows_fio_dir is not set, default to "d:/"
-        root_dir = "d:/"
-        if config.windows_fio_dir:
-            # Extract root directory from fio_dir (e.g., "d:/fio/" -> "d:/")
-            fio_dir_normalized = normalize_windows_path(config.windows_fio_dir)
-            # Remove trailing slash if present
-            fio_dir_normalized = fio_dir_normalized.rstrip('/')
-            # Get parent directory (root_dir)
-            if '/' in fio_dir_normalized:
-                root_dir = fio_dir_normalized.rsplit('/', 1)[0] + '/'
-            else:
-                root_dir = fio_dir_normalized + '/'
-        
-        # Normalize root_dir for PowerShell (convert forward slashes to backslashes)
-        # PowerShell accepts both, but bash script uses backslashes
-        root_dir_ps = root_dir.replace('/', '\\')
-        # Remove trailing backslash if present (Copy-Item will create the directory)
-        root_dir_ps = root_dir_ps.rstrip('\\')
-        
-        # Ensure destination has trailing backslash (PowerShell Copy-Item needs it to copy INTO the directory)
-        if not root_dir_ps.endswith('\\'):
-            root_dir_ps_with_slash = root_dir_ps + '\\'
-        else:
-            root_dir_ps_with_slash = root_dir_ps
-        
-        # CRITICAL: For Windows hosts, we need to provision/format the disk BEFORE copying FIO
-        # The disk must exist (be partitioned and formatted) before we can copy files to it
-        # Extract drive letter from root_dir (e.g., "d:\" -> "d")
-        drive_letter = root_dir_ps[0].upper() if root_dir_ps else "D"
-        logger.info(f"Ensuring Windows disk is provisioned for drive {drive_letter}: before FIO installation...")
-        
-        # Check if the drive exists, and if not, provision it -- all in parallel
-        with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
-            provision_futures = []
-            for host in windows_hosts:
-                device = config.windows_storage_devices.get(host, "1")
-                cmd = (
-                    f"powershell -Command \""
-                    f"if (Test-Path '{drive_letter}:\\') {{ Write-Host 'DRIVE_EXISTS' }} "
-                    f"else {{ "
-                    f"Write-Host 'PROVISIONING'; "
-                    f"& c:\\tools\\setup\\provision-data-disk.ps1 -DiskID {device}; "
-                    f"Write-Host 'PROVISIONED' "
-                    f"}}\""
-                )
-                future = pool.submit(executor.execute_prep_command, host, cmd, f"Checking/provisioning drive {drive_letter}: on {host}", timeout=config.timeout_default)
-                provision_futures.append((future, host))
-            
-            # Wait for all check/provision to complete
-            provisioned = 0
-            existed = 0
-            for future, host in provision_futures:
-                success, output = future.result()
-                if not success:
-                    logger.error(f"Failed to check/provision disk on {host}: {output}")
-                    sys.exit(1)
-                elif output and 'DRIVE_EXISTS' in output:
-                    existed += 1
-                else:
-                    provisioned += 1
-            if existed > 0:
-                logger.info(f"Drive {drive_letter}: already existed on {existed} host(s)")
-            if provisioned > 0:
-                logger.info(f"Drive {drive_letter}: provisioned on {provisioned} host(s)")
-        
-        logger.info(f"Copying FIO from c:\\tools\\fio to {root_dir_ps_with_slash} on Windows hosts...")
-        logger.info(f"Source path: c:\\tools\\fio, Destination path: {root_dir_ps_with_slash}")
-        with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
-            futures = []
-            for host in windows_hosts:
-                cmd = f"powershell -Command \"if (Test-Path 'c:\\tools\\fio') {{ copy-item -Path c:\\tools\\fio -Destination {root_dir_ps_with_slash} -recurse -force; Write-Host 'FIO_COPIED' }} else {{ Write-Host 'SOURCE_NOT_FOUND' }}\""
-                future = pool.submit(executor.execute_prep_command, host, cmd, f"Installing FIO on {host}")
-                futures.append(future)
-            
-            # Wait for all installations to complete
-            failed = 0
-            for future in as_completed(futures):
-                success, output = future.result()
-                if not success:
-                    failed += 1
-                elif output:
-                    if 'SOURCE_NOT_FOUND' in output:
-                        logger.warning(f"Source c:\\tools\\fio not found on a host")
+        if config.use_testdir:
+            logger.info(
+                f"TESTDIR MODE: Verifying FIO at c:\\tools\\fio on Windows hosts: {windows_hosts}"
+            )
+            with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
+                futures = []
+                for host in windows_hosts:
+                    cmd = (
+                        "powershell -Command \""
+                        "if (Test-Path 'c:\\tools\\fio\\fio.exe') { Write-Host 'FIO_OK' } "
+                        "else { Write-Host 'FIO_NOT_FOUND'; exit 1 }\""
+                    )
+                    futures.append(
+                        pool.submit(
+                            executor.execute_prep_command, host, cmd, f"Verifying FIO on {host}"
+                        )
+                    )
+                failed = 0
+                for future in as_completed(futures):
+                    success, output = future.result()
+                    if not success or (output and 'FIO_NOT_FOUND' in output):
                         failed += 1
-            
-            if failed > 0:
-                logger.error(f"{failed}/{len(windows_hosts)} Windows hosts failed to install FIO")
-                sys.exit(1)
-        
-        logger.info(f"FIO installation completed on all Windows hosts")
-    
+                        logger.error(f"FIO not found at c:\\tools\\fio\\fio.exe: {output}")
+                if failed:
+                    logger.error(
+                        f"{failed}/{len(windows_hosts)} Windows hosts missing FIO at c:\\tools\\fio"
+                    )
+                    sys.exit(1)
+            logger.info("FIO verified on all Windows hosts (testdir mode, no copy to data disk)")
+        else:
+            _ensure_windows_fio_copied_to_data_disk(config, executor, windows_hosts)
+
     if not linux_hosts:
         return
 
@@ -2645,7 +2768,32 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # Separate Linux and Windows hosts
     linux_hosts = config.get_linux_hosts()
     windows_hosts = config.get_windows_hosts()
-    
+
+    if config.use_testdir:
+        logger.info("TESTDIR MODE: Creating test directories only (no format/mount/provision)...")
+        with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
+            futures = []
+            for host in linux_hosts:
+                cmd = f"mkdir -p {config.output_dir} {config.mount_point}"
+                future = pool.submit(executor.execute_prep_command, host, cmd, "Creating test directories")
+                futures.append(future)
+            for host in windows_hosts:
+                mount_point_win = normalize_windows_path(config.windows_mount_point)
+                output_dir_win = normalize_windows_path(config.windows_output_dir)
+                cmd = (
+                    f"powershell -Command \"New-Item -ItemType Directory -Force "
+                    f"-Path '{mount_point_win}', '{output_dir_win}'\""
+                )
+                future = pool.submit(executor.execute_prep_command, host, cmd, "Creating test directories")
+                futures.append(future)
+            for future in as_completed(futures):
+                success, output = future.result()
+                if not success:
+                    logger.error(f"Failed to create directories: {output}")
+                    sys.exit(1)
+        logger.info("Storage preparation completed on all hosts (testdir mode)!")
+        return
+
     # Step 1: Validate devices (Linux only - Windows uses PowerShell script)
     logger.info("Step 1/7: Validating test devices on all hosts...")
     with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
@@ -3000,7 +3148,7 @@ def _dataset_files_full_size(nbytes: int, expected_bytes: Optional[int]) -> bool
 
 
 def _linux_dataset_fio_cmd(config: FioTestConfig) -> str:
-    # Dataset pre-write is always size-based: write full --size then exit.
+    # Dataset pre-write is always size-based: full sequential write of --size (fast fill).
     # Configured --runtime applies only to the later FIO performance tests.
     return (
         f"cd {config.output_dir} && fio "
@@ -3008,12 +3156,12 @@ def _linux_dataset_fio_cmd(config: FioTestConfig) -> str:
         f"--name=testfile "
         f"--directory={config.mount_point} "
         f"--size={config.test_size} "
-        f"--rw=randwrite "
-        f"--bs=4k "
+        f"--rw=write "
+        f"--bs=1M "
         f"--direct={config.direct_io} "
         f"{build_fio_fsync_option(config.fsync)}"
         f"--numjobs={config.numjobs} "
-        f"--iodepth={config.iodepth} "
+        f"--iodepth=32 "
         f"{build_linux_fio_thread_option(config.ioengine)}"
         f"--output-format={config.output_format} "
         f"--overwrite=1 "
@@ -3022,7 +3170,8 @@ def _linux_dataset_fio_cmd(config: FioTestConfig) -> str:
 
 
 def _windows_dataset_fio_cmd(config: FioTestConfig) -> str:
-    # Dataset pre-write is always size-based (no --runtime / --time_based).
+    # Windows: one full sequential write of --size (not randwrite/time-based) so NTFS
+    # allocates the test file before perf runs — see linux-win-differences.md.
     fio_dir = normalize_windows_path(config.windows_fio_dir)
     mount_point_win = normalize_windows_path(config.windows_mount_point)
     output_dir_win = normalize_windows_path(config.windows_output_dir)
@@ -3037,12 +3186,12 @@ def _windows_dataset_fio_cmd(config: FioTestConfig) -> str:
         f"--name=fiodatafile "
         f"--directory={mount_point_fio} "
         f"--size={config.windows_test_size} "
-        f"--rw=randwrite "
-        f"--bs=4k "
+        f"--rw=write "
+        f"--bs=1M "
         f"--direct={config.windows_direct_io} "
         f"{build_fio_fsync_option(config.windows_fsync)}"
         f"--numjobs={config.windows_numjobs} "
-        f"--iodepth={config.windows_iodepth} "
+        f"--iodepth=32 "
         f"--output-format={config.windows_output_format} "
         f"--thread "
         f"--overwrite=1 "
@@ -3987,6 +4136,7 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
                     f"--iodepth={config.windows_iodepth} "
                     f"--output-format={config.windows_output_format} "
                     f"--thread "
+                    f"--overwrite=1 "
                     f"--group_reporting"
                 )
                 
@@ -4531,7 +4681,36 @@ def cleanup_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
     # Separate Linux and Windows hosts
     linux_hosts = config.get_linux_hosts()
     windows_hosts = config.get_windows_hosts()
-    
+
+    if config.use_testdir:
+        logger.info("TESTDIR MODE: Cleaning test artifacts (no umount of data volumes)...")
+        with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
+            futures = []
+            for host in linux_hosts:
+                cmd = (
+                    f"rm -rf {config.output_dir}/*.json {config.mount_point}/* "
+                    f"2>/dev/null || true && echo 'Test results cleanup completed'"
+                )
+                futures.append(
+                    pool.submit(executor.execute_command, host, cmd, "Cleaning up test results")
+                )
+            for host in windows_hosts:
+                output_dir_win = normalize_windows_path(config.windows_output_dir)
+                mount_point_win = normalize_windows_path(config.windows_mount_point)
+                cmd = (
+                    f"powershell -Command \"Remove-Item -Path '{output_dir_win}/*' "
+                    f"-Recurse -Force -ErrorAction SilentlyContinue; "
+                    f"Remove-Item -Path '{mount_point_win}/*' -Recurse -Force "
+                    f"-ErrorAction SilentlyContinue; Write-Host 'Test results cleanup completed'\""
+                )
+                futures.append(
+                    pool.submit(executor.execute_command, host, cmd, "Cleaning up test results")
+                )
+            for future in as_completed(futures):
+                future.result()
+        logger.info("Storage cleanup completed")
+        return
+
     # Unmount mount points (Linux only - Windows doesn't need unmounting)
     if linux_hosts:
         logger.info("Step 1/3: Cleaning up storage mount points on Linux hosts...")

@@ -28,7 +28,7 @@ pipeline {
         string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace for the VMs')
 
         string(name: 'WIN_HOST_PATTERN',  defaultValue: 'win-vm-{1..10}',     description: 'Windows VM host pattern')
-        string(name: 'WIN_DEVICES',       defaultValue: 'win-vm-{1..10}=2',   description: 'Device mapping (pattern=diskid, comma-separated)')
+        string(name: 'WIN_DEVICES',       defaultValue: '',                   description: 'Device mapping (pattern=diskid). Leave empty when USE_TESTDIR=true (OS disk / c:/testdir)')
 
         string(name: 'WIN_TEST_SIZE',     defaultValue: '10GB',               description: 'FIO test file size')
         string(name: 'WIN_RUNTIME',       defaultValue: '300',                 description: 'Test runtime in seconds (leave empty = size-based: write full WIN_TEST_SIZE then stop)')
@@ -62,6 +62,11 @@ pipeline {
         )
         string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',               description: 'VM migration monitor polling interval in seconds')
         string(name: 'DESCRIPTION',       defaultValue: 'jenkins-fio-windows', description: 'Test run description')
+        choice(
+            name: 'USE_TESTDIR',
+            choices: ['false', 'true'],
+            description: 'OS-disk FIO on c:/testdir (no data-disk provision; FIO from c:/tools/fio; pass --testdir)'
+        )
     }
 
     environment {
@@ -142,6 +147,7 @@ pipeline {
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
                             podman run --rm --pids-limit=-1 --privileged \
                               -e WIN_HOST_PATTERN="${params.WIN_HOST_PATTERN}" \
+                              -e USE_TESTDIR="${params.USE_TESTDIR}" \
                               -e WIN_DEVICES="${params.WIN_DEVICES}" \
                               -e NAMESPACE="${params.NAMESPACE}" \
                               -e WIN_TEST_SIZE="${params.WIN_TEST_SIZE}" \

@@ -22,6 +22,9 @@ vm:
   namespace: "default"
 
 # Storage Configuration
+# Default runs: format/mount the devices below for FIO test data.
+# OS-disk load instead: pass --testdir to fio-tests.py (Linux /root/testdir,
+# Windows c:/testdir; no format of these devices; Windows uses c:/tools/fio in place).
 storage:
   # Per-host device configuration (MANDATORY - no global fallback for safety)
   devices:
