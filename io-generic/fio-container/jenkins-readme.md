@@ -98,9 +98,9 @@ USE_TESTDIR:       false
 ```
 
 Set **USE_TESTDIR** to `true` to run FIO on the OS disk (`/root/testdir` / `c:/testdir`)
-without formatting separate data disks (see `README-container.md`). You can leave
-**DEVICES** / **WIN_DEVICES** empty in that mode; only **HOST_PATTERN** /
-**WIN_HOST_PATTERN** are required.
+without formatting separate data disks. Leave **DEVICES** / **WIN_DEVICES** empty.
+YAML `storage` / `windows.storage_win` sections in a mounted config are ignored in
+this mode (see `README-container.md` → OS-disk load).
 
 3. Modify any values you want for this run
 4. Click **Build**

@@ -34,12 +34,30 @@ if [[ -n "${KUBEADMIN_PASSWORD:-}" ]]; then
 fi
 
 # --- Mode detection ---
+# Normalize OS-disk mode early: env USE_TESTDIR or CLI --testdir (args are passed
+# through to fio-tests.py after config generation, so detect them here too).
+_testdir_raw="${USE_TESTDIR:-false}"
+case "${_testdir_raw,,}" in
+    true|1|yes|on) USE_TESTDIR=true ;;
+    *) USE_TESTDIR=false ;;
+esac
+for _arg in "$@"; do
+    if [[ "${_arg}" == "--testdir" ]]; then
+        USE_TESTDIR=true
+        break
+    fi
+done
+export USE_TESTDIR
+
 if [[ -f "${CONFIG}" ]]; then
     # Mode 1: config file provided -- use it as-is
     echo "Using config: ${CONFIG}"
 else
     # Mode 2/3: no config file -- generate from env vars
     echo "No config file at ${CONFIG}, generating from env vars..."
+    if [[ "${USE_TESTDIR}" == "true" ]]; then
+        echo "USE_TESTDIR/testdir active — DEVICES/WIN_DEVICES optional (OS-disk paths)"
+    fi
 
     NAMESPACE="${NAMESPACE:-default}"
     DESCRIPTION="${DESCRIPTION:-}"
@@ -51,7 +69,7 @@ else
     MONITOR_VM="${MONITOR_VM:-false}"
     MONITOR_VM_INTERVAL="${MONITOR_VM_INTERVAL:-10}"
     MAX_WORKERS="${MAX_WORKERS:-}"
-    USE_TESTDIR="${USE_TESTDIR:-false}"
+    # USE_TESTDIR already normalized above
 
     # Detect what's requested
     HAS_LINUX=false
@@ -108,6 +126,7 @@ else
                 LINUX_DEVICES_SECTION="  devices: {}"
             else
                 echo "ERROR: DEVICES is required for Linux hosts (e.g. DEVICES=\"vm-{1..10}=vdc\")" >&2
+                echo "Or set USE_TESTDIR=true / pass --testdir to use OS disk (/root/testdir) without DEVICES." >&2
                 exit 1
             fi
         else
@@ -202,6 +221,7 @@ output:
                 WIN_DEVICES_SECTION="    devices: {}"
             else
                 echo "ERROR: WIN_DEVICES is required for Windows hosts (e.g. WIN_DEVICES=\"win-vm-{1..10}=1\")" >&2
+                echo "Or set USE_TESTDIR=true / pass --testdir to use OS disk (c:/testdir) without WIN_DEVICES." >&2
                 exit 1
             fi
         else

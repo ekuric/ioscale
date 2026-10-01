@@ -123,7 +123,7 @@ Env vars are used when no config file is mounted (Modes 2 and 3).
 | `HOST_PATTERN` | -- | Brace-expansion pattern, e.g. `vm-{1..10}` |
 | `HOST_LABELS` | -- | OCP label selector for VMs |
 | `NAMESPACE` | `default` | OpenShift namespace |
-| `DEVICES` | **required** | Device mapping: `"pattern=device"`, comma-separated for multiple (e.g. `"vm-{1..10}=vdc,host1=sdb"`) |
+| `DEVICES` | **required** unless `USE_TESTDIR=true` | Device mapping: `"pattern=device"`, comma-separated for multiple (e.g. `"vm-{1..10}=vdc,host1=sdb"`). Omit when using OS-disk `--testdir` mode. |
 | `MOUNT_POINT` | `/root/tests/data` | Mount point for the test filesystem |
 | `FILESYSTEM` | `xfs` | Filesystem type to create |
 | `PERSISTENT` | -- | Set to `true` for persistent mounts via /etc/fstab |
@@ -140,7 +140,7 @@ Env vars are used when no config file is mounted (Modes 2 and 3).
 | `OUTPUT_DIR` | `/root/fio-results` | Result directory on remote hosts |
 | `OUTPUT_FORMAT` | `json+` | FIO output format |
 | `DESCRIPTION` | -- | Test run description (included in results dir name) |
-| `USE_TESTDIR` | `false` | Set to `true` to add `--testdir` (FIO on OS disk: Linux `/root/testdir`, Windows `c:/testdir`; no data-disk format) |
+| `USE_TESTDIR` | `false` | Set to `true` to add `--testdir` (FIO on OS disk: Linux `/root/testdir`, Windows `c:/testdir`). YAML/env data-disk settings are ignored — see [OS-disk load](#os-disk-load---testdir). |
 | `MIGRATE_WORKLOADS` | -- | Space-separated workloads to trigger VM migration (e.g. `"write randwrite"`) |
 | `MIGRATE_INTERVAL` | `0` | Seconds between migrations (0 = parallel) |
 | `RETRY_INTERVAL` | `30` | Retry interval in seconds |
@@ -157,9 +157,9 @@ Set `WIN_HOSTS` or `WIN_HOST_PATTERN` to activate the Windows section.
 |---|---|---|
 | `WIN_HOSTS` | -- | Space-separated Windows VM names |
 | `WIN_HOST_PATTERN` | -- | Brace-expansion pattern, e.g. `win-vm-{1..10}` |
-| `WIN_DEVICES` | required unless `USE_TESTDIR=true` | Device mapping with Disk IDs: `"win-vm-{1..10}=1"` |
-| `WIN_MOUNT_POINT` | `d\:/fio/data` | Windows mount point for test data |
-| `WIN_RUN_DIR` | `d:/fio` | Directory containing fio.exe |
+| `WIN_DEVICES` | required unless `USE_TESTDIR=true` | Device mapping with Disk IDs: `"win-vm-{1..10}=1"`. Omit when using OS-disk `--testdir` mode. |
+| `WIN_MOUNT_POINT` | `d\:/fio/data` | Windows mount point for test data (ignored when `USE_TESTDIR=true`) |
+| `WIN_RUN_DIR` | `d:/fio` | Directory containing fio.exe (ignored when `USE_TESTDIR=true`; uses `c:/tools/fio`) |
 | `WIN_TEST_SIZE` | `10GB` | FIO test file size |
 | `WIN_RUNTIME` | `600` | Test runtime in seconds |
 | `WIN_BLOCK_SIZES` | `4k 8k 128k 1024k` | Space-separated block sizes |
@@ -206,19 +206,42 @@ from the fio golden image (`Jenkinsfile`, `Jenkinsfile-linux`).
 
 ## OS-disk load (`--testdir`)
 
-By default, FIO uses a **separate data disk** from YAML/env (`DEVICES`, `WIN_DEVICES`):
-format/mount on Linux, `provision-data-disk.ps1` on Windows, and copy FIO to the data
-drive on Windows.
+By default, FIO uses a **separate data disk** from YAML/env (`DEVICES`, `WIN_DEVICES` /
+`storage.devices`, `windows.storage_win.devices`): format/mount on Linux,
+`provision-data-disk.ps1` on Windows, and copy FIO to the data drive on Windows.
 
-**`--testdir`** runs load on the **OS disk** instead (no formatting of the data disk):
+**`--testdir`** / **`USE_TESTDIR=true`** runs load on the **OS disk** instead (no
+formatting of a separate data disk):
 
 | OS | FIO test data | FIO binary (Windows) | JSON results |
 |---|---|---|---|
 | Linux | `/root/testdir` | n/a (system `fio`) | `OUTPUT_DIR` from config (default `/root/fio-results`) |
 | Windows | `c:/testdir` | `c:/tools/fio` (in place, no copy to `d:`) | `c:/fio-results` |
 
-With `USE_TESTDIR=true` / `--testdir`, omit `DEVICES` / `WIN_DEVICES` (entrypoint emits
-`devices: {}`; fio-tests ignores block disks and uses OS testdir paths).
+### What is ignored in `--testdir` mode
+
+fio-tests does **not** use data-disk settings from the config. You can leave them in
+a shared YAML for non-testdir runs; with `--testdir` they are skipped and logged as
+ignored:
+
+| Source | Ignored when `--testdir` |
+|---|---|
+| YAML `storage.devices` / `mount_point` / `filesystem` | Yes (Linux) |
+| YAML `windows.storage_win.devices` / `mount_point` | Yes |
+| YAML `windows.fio_win.run_dir` (and `fio_dir` / `root_dir`) | Yes → fixed `c:/tools/fio` |
+| YAML `windows.output_win.directory` | Yes → fixed `c:/fio-results` |
+| Env `DEVICES` / `WIN_DEVICES` | Not required; leave empty |
+| Env `MOUNT_POINT` / `WIN_MOUNT_POINT` / `WIN_RUN_DIR` | Not applied for paths |
+
+Still used from YAML/env in testdir mode: host lists, `fio` / `fio_win` job parameters
+(`test_size`, `runtime`, `block_sizes`, `io_patterns`, `numjobs`, `iodepth`, etc.),
+retry/monitoring, and Linux `output.directory` for results collection.
+
+**Env mode:** omit `DEVICES` / `WIN_DEVICES` when `USE_TESTDIR=true` (entrypoint emits
+`devices: {}`).
+
+**YAML mode:** a config that still contains `storage_win.devices: …` is fine; with
+`--testdir` those entries are not validated as active disks and are not formatted.
 
 **Podman (CLI after image name):**
 
@@ -237,10 +260,13 @@ podman run --rm --init --pids-limit=-1 \
 
 ```bash
 -e USE_TESTDIR=true \
+-e WIN_HOST_PATTERN="winc-1" \
+# WIN_DEVICES not needed
 ```
 
 **Jenkins:** set build parameter `USE_TESTDIR` to `true` (`Jenkinsfile`, `Jenkinsfile-linux`,
-`Jenkinsfile-windows`).
+`Jenkinsfile-windows`). Leave `DEVICES` / `WIN_DEVICES` empty. No Jenkinsfile changes
+are required beyond that existing parameter.
 
 ## Baked-in Example Configs
 
@@ -308,19 +334,19 @@ podman run --rm --init --pids-limit=-1 \
 ### `--testdir`
 
 Run FIO on the OS disk (`/root/testdir` on Linux, `c:/testdir` on Windows). Skips
-data-disk format/mount/provision and Windows copy of FIO to `d:`. See
-[OS-disk load (`--testdir`)](#os-disk-load---testdir) above.
+data-disk format/mount/provision and Windows copy of FIO to `d:`. YAML
+`storage` / `windows.storage_win` device mappings are ignored (see
+[OS-disk load (`--testdir`)](#os-disk-load---testdir)).
 
 ```bash
 podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="vm-{1..10}" \
-  -e DEVICES="vm-{1..10}=vdc" \
+  -e USE_TESTDIR=true \
   -v /root/fio-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
   --privileged \
-  quay.io/ekuric/fio-benchmark:latest \
-  --testdir
+  quay.io/ekuric/fio-benchmark:latest
 ```
 
 ### `--prepare-machine`
@@ -748,7 +774,9 @@ When using env vars (no config file), set:
 - `/root/.kube/config` mount gives the container access to the OCP cluster.
 - Mount your SSH private key to `/root/.ssh/id_rsa` so `virtctl ssh` can authenticate.
 - `--yes-i-mean-it` is passed automatically to skip the device formatting confirmation prompt.
-- Use `--testdir` or `USE_TESTDIR=true` for OS-disk load without formatting YAML `storage` / `storage_win` devices.
+- Use `--testdir` or `USE_TESTDIR=true` for OS-disk load. YAML `storage` /
+  `windows.storage_win` devices and mount points (and Windows `fio_win.run_dir` /
+  `output_win.directory`) are ignored; leave Jenkins `DEVICES` / `WIN_DEVICES` empty.
 - Set `fio_installed: true` (or `FIO_INSTALLED=true`) when using golden Linux images with FIO pre-baked; leave `false` for stock cloud images.
 - Optional `FSYNC` / `WIN_FSYNC` (or YAML `fio.fsync` / `windows.fio_win.fsync`) adds FIO `--fsync=N`. Empty/unset disables it (default). Values like `1` or `32` call `fsync` after every N writes — this measures durable-write cost and typically lowers write IOPS/BW sharply. Applied to dataset pre-write and performance jobs when set.
 - The entrypoint always prints the config before running, so you can see exactly what values are used.
