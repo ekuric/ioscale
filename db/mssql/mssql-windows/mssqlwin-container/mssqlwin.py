@@ -91,6 +91,7 @@ class MSSQLWinConfig:
         self.windows_mssql_pass = None
         self.max_server_memory_mb = None
         self.windows_disk_id = "1"
+        self.windows_use_osdisk = False  # True: TPCC on C: (skip D: provision/copy)
         self.windows_rebuild_timeout = None
         self.windows_mssql_service_name = None
         self.timeout_default = DEFAULT_TIMEOUT
@@ -273,10 +274,15 @@ class CommandExecutor:
         if self.is_vm_host(host):
             if not self.config.namespace or self.config.namespace == "N/A":
                 raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
+            # Flags (-c, -i, --local-ssh-opts) MUST come BEFORE the target (virtctl >=1.6).
+            # Without -i, virtctl often fails with "asked for credentials / Unauthorized".
             return [
                 "virtctl", "-n", self.config.namespace, "ssh",
+                "-i", "/root/.ssh/id_rsa",
                 "--local-ssh-opts=-o StrictHostKeyChecking=no",
-                f"{ssh_user}@vmi/{host}", "-c", command
+                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
+                "-c", command,
+                f"{ssh_user}@vmi/{host}",
             ]
         return [
             "ssh", "-o", "StrictHostKeyChecking=no",
@@ -284,6 +290,7 @@ class CommandExecutor:
             "-o", "ControlMaster=auto",
             "-o", "ControlPersist=60",
             "-o", "ControlPath=/tmp/mssqlwin-ssh-%r@%h:%p",
+            "-i", "/root/.ssh/id_rsa",
             f"{ssh_user}@{host}", command
         ]
 
@@ -300,13 +307,16 @@ class CommandExecutor:
                 raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
             return [
                 "virtctl", "-n", self.config.namespace, "scp",
+                "-i", "/root/.ssh/id_rsa",
                 "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
                 source, destination
             ]
         ssh_source = source.replace("@vmi/", "@")
         return [
             "scp", "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
+            "-i", "/root/.ssh/id_rsa",
             ssh_source, destination
         ]
 
@@ -318,12 +328,15 @@ class CommandExecutor:
                 raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
             return [
                 "virtctl", "-n", self.config.namespace, "scp",
+                "-i", "/root/.ssh/id_rsa",
                 "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
                 local_path, f"{ssh_user}@vmi/{host}:{remote_path}"
             ]
         return [
             "scp", "-o", "StrictHostKeyChecking=no",
             "-o", "UserKnownHostsFile=/dev/null",
+            "-i", "/root/.ssh/id_rsa",
             local_path, f"{ssh_user}@{host}:{remote_path}"
         ]
 
@@ -986,6 +999,9 @@ class ConfigLoader:
         if windows_disk_id in ("null", "", None):
             windows_disk_id = "1"
         self.config.windows_disk_id = str(windows_disk_id)
+        use_osdisk = windows_cfg.get("use_osdisk")
+        if use_osdisk in (True, "true", "True", 1, "1", "yes", "on"):
+            self.config.windows_use_osdisk = True
         windows_rebuild_only = windows_cfg.get("rebuild_only")
         if windows_rebuild_only == "true" or windows_rebuild_only is True:
             self.config.windows_rebuild_only = True
@@ -1162,6 +1178,9 @@ def display_config(config: MSSQLWinConfig) -> None:
         logger.info(f"Windows result dir: {config.windows_result_dir}")
     logger.info(f"Windows SSH user: {config.windows_ssh_user}")
     logger.info(f"Windows disk_id: {config.windows_disk_id}")
+    logger.info(
+        f"Windows use_osdisk: {'ENABLED (TPCC on C:, skip data-disk provision)' if config.windows_use_osdisk else 'DISABLED (D: data disk)'}"
+    )
     logger.info(f"Windows rebuilddb: {'ENABLED' if config.windows_rebuilddb else 'DISABLED'}")
     logger.info(f"Log level: {config.log_level}")
     logger.info(f"Timeouts - default: {config.timeout_default}s, scp: {config.timeout_scp}s, test: {config.timeout_test}s, prepare: {config.timeout_prepare}s")
@@ -1401,8 +1420,70 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
                 sys.exit(1)
 
 
+def apply_osdisk_overrides(config: MSSQLWinConfig) -> None:
+    """Prefer create_dbC.sql and log path overrides when use_osdisk is set."""
+    if not config.windows_use_osdisk:
+        return
+
+    logger.info(
+        "OSDISK MODE: TPCC database files on C:\\mssql\\data — "
+        "skip data-disk format and HammerDB copy to D:"
+    )
+    local = config.windows_create_db_sql_local
+    if local and os.path.isfile(local):
+        base = os.path.basename(local).lower()
+        if base == "create_db.sql":
+            sibling = os.path.join(os.path.dirname(local), "create_dbC.sql")
+            if os.path.isfile(sibling):
+                config.windows_create_db_sql_local = sibling
+                logger.info(f"OSDISK: switching create_db template to {sibling}")
+            else:
+                logger.warning(
+                    f"OSDISK: create_dbC.sql not found next to {local}; "
+                    "will rewrite d:\\mssql\\data → c:\\mssql\\data in generated SQL"
+                )
+    elif not local:
+        # Allow resolving from templates next to this script / CWD
+        for candidate in (
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates", "create_dbC.sql"),
+            os.path.join(os.getcwd(), "templates", "create_dbC.sql"),
+            "/work/templates/create_dbC.sql",
+        ):
+            if os.path.isfile(candidate):
+                config.windows_create_db_sql_local = candidate
+                logger.info(f"OSDISK: using create_db template {candidate}")
+                break
+
+
 def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) -> None:
-    """Prepare Windows machines by formatting the data disk."""
+    """Prepare Windows machines: data disk (D:) by default, or OS disk (C:) with --osdisk."""
+    if config.windows_use_osdisk:
+        logger.info("Preparing Windows machines (OSDISK: C:\\mssql\\data only)...")
+        prep_cmd = build_powershell_command("; ".join([
+            'New-Item -Path "C:\\mssql\\data" -ItemType Directory -Force | Out-Null',
+            # Best-effort ACL for SQL Server service / Users (ignore failures)
+            'icacls "C:\\mssql\\data" /grant "NT SERVICE\\MSSQLSERVER:(OI)(CI)F" /C /T 2>$null | Out-Null',
+            'icacls "C:\\mssql\\data" /grant "Users:(OI)(CI)M" /C /T 2>$null | Out-Null',
+            'Write-Host "OSDISK_READY C:\\mssql\\data"',
+        ]))
+        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+            futures = []
+            for host in config.db_hosts:
+                futures.append(pool.submit(
+                    executor.execute_command,
+                    host,
+                    prep_cmd,
+                    f"Creating C:\\mssql\\data on {host}",
+                    config.timeout_prepare,
+                ))
+            for future in as_completed(futures):
+                success, output = future.result()
+                if not success:
+                    logger.error(f"Windows OSdisk prepare failed: {output}")
+                    sys.exit(1)
+        logger.info("OSDISK prepare complete (HammerDB stays on configured C: path)")
+        return
+
     logger.info("Preparing Windows machines (formatting data disk)...")
     """
     This is delicate task. We have to know in advance on test virtual machines 
@@ -1528,6 +1609,16 @@ def generate_test_files(config: MSSQLWinConfig) -> None:
     if config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
         with open(config.windows_create_db_sql_local, "r", encoding="utf-8") as f:
             create_db_content = f.read()
+        if config.windows_use_osdisk:
+            # Safety net if D: template was still selected
+            rewritten = re.sub(
+                r"(?i)d:\\mssql\\data",
+                r"c:\\mssql\\data",
+                create_db_content,
+            )
+            if rewritten != create_db_content:
+                logger.info("OSDISK: rewrote d:\\mssql\\data → c:\\mssql\\data in create_db.sql")
+                create_db_content = rewritten
         if config.warehouse_count:
             data_size_mb = int(config.warehouse_count) * 150
             log_size_mb = int(config.warehouse_count) * 75
@@ -2496,6 +2587,14 @@ EXAMPLES:
                         help="Rebuild database before each user-count test run")
     parser.add_argument("--prepare-machine", action="store_true",
                         help="Prepare Windows machines by formatting the data disk and exit")
+    parser.add_argument(
+        "--osdisk",
+        action="store_true",
+        help=(
+            "Run TPCC on OS disk (C:\\mssql\\data): skip data-disk provision and "
+            "HammerDB copy to D:; use create_dbC.sql (FIO --testdir analogue)"
+        ),
+    )
     parser.add_argument('--monitor-vm', action='store_true',
                         help='Monitor VM node placement during tests and log migrations')
     parser.add_argument('--monitor-vm-interval', type=int, default=10,
@@ -2519,6 +2618,8 @@ EXAMPLES:
     config.generate_only = args.generate_only
     if args.rebuild_always:
         config.windows_rebuild_always = True
+    if args.osdisk:
+        config.windows_use_osdisk = True
     prepare_machine = args.prepare_machine
     if args.test_script:
         if not os.path.exists(args.test_script):
@@ -2548,6 +2649,10 @@ EXAMPLES:
 
     loader = ConfigLoader(config)
     loader.load_config()
+    # CLI --osdisk wins over YAML false; YAML true is kept if CLI omitted
+    if args.osdisk:
+        config.windows_use_osdisk = True
+    apply_osdisk_overrides(config)
 
     log_date = datetime.now().strftime("%Y%m%d")
     sanitized_desc = re.sub(r"[^a-z0-9]", "_", config.description.lower()) if config.description else ""

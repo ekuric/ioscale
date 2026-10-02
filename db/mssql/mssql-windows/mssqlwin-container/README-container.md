@@ -102,6 +102,9 @@ No merging or patching -- it is one or the other.
   authenticate to Windows VMs.
 - Set `DISK_ID` to the Windows data disk number (`Get-Disk` on the guest). Often `1`
   (OS is disk `0`); some images with an extra device use `2`.
+- For TPCC on the OS disk instead of D:, set `USE_OSDISK=true` or pass `--osdisk`
+  (uses `create_dbC.sql` → `C:\mssql\data`; skips data-disk format). Ensure C: has
+  enough free space for warehouse-scaled MDF/LDF sizes.
 
 ## Environment Variables
 
@@ -122,7 +125,8 @@ No merging or patching -- it is one or the other.
 | `MSSQL_PASS` | -- | MSSQL server password |
 | `MAX_SERVER_MEMORY_MB` | -- | Optional SQL Server `max server memory` cap in MB (e.g. `38000` on a ~50GB VM). Omit/empty = unlimited. Minimum `2048`. Set via `sp_configure` (no restart). |
 | `HAMMERDB_PATH` | `C:\tools\Hammerdb-4.12` | HammerDB install path on Windows |
-| `DISK_ID` | `1` | Data disk ID to format (`Get-Disk` number) |
+| `DISK_ID` | `1` | Data disk ID to format (`Get-Disk` number); ignored when `USE_OSDISK=true` |
+| `USE_OSDISK` | `false` | `true` = TPCC on `C:\mssql\data` (skip D: provision/copy; uses `create_dbC.sql`) |
 | `SSH_USER` | `Administrator` | SSH user on Windows VMs |
 | `REBUILDDB` | `true` | Rebuild database before test |
 | `REBUILD_ONLY` | `false` | Only rebuild, skip test |
@@ -398,7 +402,8 @@ If your key is at a non-standard path, mount it to the expected location:
     mssqls_tprocc_run.tcl
     mssqls_tprocc_buildschema.tcl
     rebuild-db.ps1
-    create_db.sql
+    create_db.sql                 (D:\mssql\data — default)
+    create_dbC.sql                (C:\mssql\data — USE_OSDISK / --osdisk)
   results/                       (output directory)
 ```
 
@@ -408,8 +413,10 @@ If your key is at a non-standard path, mount it to the expected location:
 - `--privileged` is needed for the virtctl SSH proxy to work.
 - `/root/.kube/config` mount gives the container access to the OCP cluster.
 - Mount `/root/.ssh` (or at least `id_rsa`) so `virtctl ssh` can authenticate.
-- Prepare formats the Windows data disk via `C:\tools\setup\provision-data-disk.ps1`
+- Default prepare formats the Windows data disk via `C:\tools\setup\provision-data-disk.ps1`
   using `DISK_ID`, then copies HammerDB tools to `D:` when present.
+- `USE_OSDISK=true` / `--osdisk` / YAML `windows.use_osdisk: true`: skip that prepare path;
+  create `C:\mssql\data` and use `create_dbC.sql` (HammerDB stays under `HAMMERDB_PATH` on C:).
 - Template files baked into `/work/templates/` at build time are silently overridden when you mount a file to the same path.
 - `user_count` is space-separated (e.g. `"1 10 50 100"`), not comma-separated.
 - The entrypoint always prints the config before running, so you can see exactly what values are used.

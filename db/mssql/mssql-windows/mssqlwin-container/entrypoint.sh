@@ -14,6 +14,28 @@ if [[ -n "${KUBEADMIN_PASSWORD:-}" ]]; then
         --insecure-skip-tls-verify=true
 fi
 
+# Normalize OSdisk mode early (env or CLI --osdisk forwarded to mssqlwin.py)
+_osdisk_raw="${USE_OSDISK:-false}"
+case "${_osdisk_raw,,}" in
+    true|1|yes|on) USE_OSDISK=true ;;
+    *) USE_OSDISK=false ;;
+esac
+for _arg in "$@"; do
+    if [[ "${_arg}" == "--osdisk" ]]; then
+        USE_OSDISK=true
+        break
+    fi
+done
+export USE_OSDISK
+
+CREATE_DB_TEMPLATE="${TEMPLATES}/create_db.sql"
+OSDISK_ARGS=()
+if [[ "${USE_OSDISK}" == "true" ]]; then
+    CREATE_DB_TEMPLATE="${TEMPLATES}/create_dbC.sql"
+    OSDISK_ARGS=(--osdisk)
+    echo "USE_OSDISK/osdisk active — TPCC on C:\\mssql\\data (skip D: provision)"
+fi
+
 # --- Mode detection ---
 if [[ -f "${CONFIG}" ]]; then
     # Mode 1: config file provided -- use it as-is
@@ -92,6 +114,7 @@ windows:
   rebuild_script: '${HAMMERDB_PATH}\\rebuild-db.ps1'
   create_db_sql: '${HAMMERDB_PATH}\\create_db.sql'
   disk_id: "${DISK_ID}"
+  use_osdisk: ${USE_OSDISK}
   ssh_user: "${SSH_USER}"
   rebuilddb: ${REBUILDDB}
   rebuild_always: ${REBUILD_ALWAYS}
@@ -115,5 +138,6 @@ exec python3 /work/mssqlwin.py \
     --hammerdb-test-script "${TEMPLATES}/mssqls_tprocc_run.tcl" \
     --build-schema-file "${TEMPLATES}/mssqls_tprocc_buildschema.tcl" \
     --rebuild-script "${TEMPLATES}/rebuild-db.ps1" \
-    --create-db "${TEMPLATES}/create_db.sql" \
+    --create-db "${CREATE_DB_TEMPLATE}" \
+    "${OSDISK_ARGS[@]}" \
     "$@"

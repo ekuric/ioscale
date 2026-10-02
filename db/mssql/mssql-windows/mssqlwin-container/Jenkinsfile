@@ -23,7 +23,12 @@ pipeline {
         string(name: 'MSSQL_PASS',        defaultValue: '',                    description: 'MSSQL server password (empty = Windows auth)')
         string(name: 'MAX_SERVER_MEMORY_MB', defaultValue: '',               description: 'SQL Server max server memory cap in MB (e.g. 38000 on ~50GB VM leaves headroom for HammerDB; empty = unlimited)')
 
-        string(name: 'DISK_ID',           defaultValue: '2',                   description: 'Data disk ID to format')
+        string(name: 'DISK_ID',           defaultValue: '2',                   description: 'Data disk ID to format (ignored when USE_OSDISK=true)')
+        choice(
+            name: 'USE_OSDISK',
+            choices: ['false', 'true'],
+            description: 'TPCC on C:\\mssql\\data (skip D: provision/copy; create_dbC.sql)'
+        )
         string(name: 'REBUILDDB',         defaultValue: 'true',                description: 'Rebuild database before test (true/false)')
         string(name: 'REBUILD_ALWAYS',    defaultValue: 'false',               description: 'Rebuild before every user-count iteration (true/false)')
         string(name: 'TEST_ONLY',         defaultValue: 'false',               description: 'Skip rebuild, only run tests (true/false)')
@@ -67,6 +72,7 @@ pipeline {
                               -e MSSQL_PASS="${params.MSSQL_PASS}" \
                               -e MAX_SERVER_MEMORY_MB="${params.MAX_SERVER_MEMORY_MB}" \
                               -e DISK_ID="${params.DISK_ID}" \
+                              -e USE_OSDISK="${params.USE_OSDISK}" \
                               -e REBUILDDB=${params.REBUILDDB} \
                               -e REBUILD_ALWAYS=${params.REBUILD_ALWAYS} \
                               -e TEST_ONLY=${params.TEST_ONLY} \

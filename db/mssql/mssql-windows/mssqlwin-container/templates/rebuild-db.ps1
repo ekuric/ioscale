@@ -76,6 +76,35 @@ if ($checkResult -match 'NOTEXISTS') {
 }
 Write-Host "Force drop/detach step complete"
 
+# DROP DATABASE removes catalog entries but can leave .mdf/.ldf on disk
+# (common after first run on C:\mssql\data / D:\mssql\data). CREATE then fails
+# with Msg 5170 "file already exists". Always scrub orphan tpcc files before CREATE.
+# For case when "D:" is used for test, this is not necessary as "D:" always 
+# formatted before database create and starting test.
+Write-Host "Removing orphan tpcc database files if present..."
+$dataDirs = @("C:\mssql\data", "D:\mssql\data")
+# Also pick directories from FILENAME= lines in create_db.sql when present
+if (Test-Path $createDbSql) {
+    Select-String -Path $createDbSql -Pattern "FILENAME\s*=\s*'([^']+)'" -AllMatches |
+        ForEach-Object { $_.Matches } |
+        ForEach-Object {
+            $filePath = $_.Groups[1].Value
+            $parent = Split-Path -Parent $filePath
+            if ($parent -and ($dataDirs -notcontains $parent)) {
+                $dataDirs += $parent
+            }
+        }
+}
+foreach ($dir in $dataDirs) {
+    if (-not (Test-Path $dir)) { continue }
+    Get-ChildItem -Path $dir -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^tpcc' } |
+        ForEach-Object {
+            Write-Host "  deleting orphan: $($_.FullName)"
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+}
+
 Write-Host "Running delete schema TCL (cleanup any remaining objects)..."
 .\hammerdbcli auto $deleteSchema
 
