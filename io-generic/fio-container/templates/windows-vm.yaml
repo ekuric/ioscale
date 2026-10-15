@@ -1,0 +1,58 @@
+# Windows VirtualMachine template (clone from source DV + optional blank data disk).
+# Placeholders filled by fio_tests.provision. Requires a golden image with OpenSSH
+# and FIO at c:\tools\fio.
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ${vm_name}
+  namespace: ${namespace}
+  labels:
+    fio-container.ioscale/managed: "true"
+    fio-container.ioscale/os: windows
+    fio-container.ioscale/run: "${run_id}"
+    kubevirt.io/vm: ${vm_name}
+spec:
+  runStrategy: RerunOnFailure
+  dataVolumeTemplates: []  # filled programmatically
+  template:
+    metadata:
+      labels:
+        fio-container.ioscale/managed: "true"
+        fio-container.ioscale/os: windows
+        fio-container.ioscale/run: "${run_id}"
+        kubevirt.io/vm: ${vm_name}
+    spec:
+      terminationGracePeriodSeconds: 180
+      domain:
+        firmware:
+          bootloader:
+            efi:
+              secureBoot: false
+        cpu:
+          cores: ${vm_cpu}
+          sockets: 1
+          threads: 1
+        resources:
+          requests:
+            cpu: "${vm_cpu}"
+            memory: ${vm_memory}
+        devices:
+          disks: []  # filled programmatically
+          interfaces:
+          - masquerade: {}
+            model: virtio
+            name: nic-0
+        machine:
+          type: q35
+        features:
+          acpi: {}
+          apic: {}
+          hyperv:
+            relaxed: {}
+            vapic: {}
+            spinlocks:
+              spinlocks: 8191
+      networks:
+      - name: nic-0
+        pod: {}
+      volumes: []  # filled programmatically

@@ -1,4 +1,4 @@
-"""Shared timeouts, defaults, and OS-disk (--testdir) path constants."""
+"""Shared timeouts, defaults, and OS-disk path constants."""
 
 DEFAULT_TIMEOUT = 300           # General SSH command timeout in seconds
 QUICK_TIMEOUT = 60              # Short commands (mkdir, package check, etc.)
@@ -19,8 +19,13 @@ WINDOWS_PREP_RESTART_AFTER_ATTEMPT = 5  # Windows prep: restart VM after this ma
 DEFAULT_LINUX_IOENGINE = "libaio"
 LINUX_THREAD_IOENGINES = frozenset({"libaio", "io_uring", "posixaio"})
 
-# Fixed paths for --testdir (OS-disk FIO mode; no separate data disk format/provision)
+# Fixed FIO JSON result dirs on OS disk (all storage modes — never on the test disk)
+LINUX_RESULTS_DIR = "/root/fio-results"
+WINDOWS_RESULTS_DIR = "c:/fio-results"
+
+# Fixed paths for --testdir (OS-disk FIO data mode; no separate data disk format/provision)
 LINUX_TESTDIR = "/root/testdir"
 WINDOWS_TESTDIR = "c:/testdir"
 WINDOWS_FIO_DIR_TESTDIR = "c:/tools/fio"
-WINDOWS_OUTPUT_TESTDIR = "c:/fio-results"
+# Back-compat aliases (same fixed OS-disk results paths as above)
+WINDOWS_OUTPUT_TESTDIR = WINDOWS_RESULTS_DIR

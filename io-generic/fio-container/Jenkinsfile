@@ -5,54 +5,119 @@ pipeline {
         disableConcurrentBuilds()
     }
 
+    // Parameter groups (Jenkins shows them in this order on "Build with Parameters"):
+    //   1. Test        2. Bastion/cluster   3. FIO harness image
+    //   4. Disk target 5. VM provision      6. Existing hosts (if not creating)
+    //   7. Linux workload  8. Windows workload  9. Resilience/migration
     parameters {
-        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP. Each user/team sets their own bastion here.')
-        string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host (e.g. root, admin)')
-        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for this bastion SSH key. Each bastion needs its own key registered in Jenkins (Manage Credentials > Add > SSH Username with private key). Use a unique ID per bastion, e.g. team-a-bastion, lab2-bastion.')
-        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/fio-benchmark:latest', description: 'Container image to run')
+        // ----- 1. Test identity -----
+        string(
+            name: 'DESCRIPTION',
+            defaultValue: 'jenkins-fio-test',
+            description: '[1. Test] Run name (results dir / logs)'
+        )
+        string(
+            name: 'NAMESPACE',
+            defaultValue: 'default',
+            description: '[1. Test] OpenShift namespace for VMs'
+        )
 
-        string(name: 'HOST_PATTERN',      defaultValue: 'vml-{1..3}',         description: 'Linux VM host pattern')
-        string(name: 'DEVICES',           defaultValue: 'vml-{1..3}=vdc',     description: 'Linux device mapping. Leave empty when USE_TESTDIR=true')
-        string(name: 'WIN_HOST_PATTERN',  defaultValue: 'vm-{1..2}',          description: 'Windows VM host pattern (leave empty to skip Windows)')
-        string(name: 'WIN_DEVICES',       defaultValue: '',                   description: 'Windows device mapping. Leave empty when USE_TESTDIR=true')
-        string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
+        // ----- 2. Bastion / cluster -----
+        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: '[2. Bastion] Hostname/IP')
+        string(name: 'BASTION_USER',      defaultValue: 'root',                description: '[2. Bastion] SSH user')
+        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: '[2. Bastion] Jenkins SSH credential ID')
+        string(name: 'API_URL',           defaultValue: 'https://api.ocp.example.com:6443', description: '[2. Bastion] Cluster API URL')
+        string(name: 'KUBEADMIN_PASSWORD', defaultValue: '',                   description: '[2. Bastion] Optional oc login password')
 
-        // Linux FIO parameters
-        string(name: 'TEST_SIZE',         defaultValue: '5G',                  description: 'FIO test file size (Linux)')
-        string(name: 'RUNTIME',           defaultValue: '300',                 description: 'Linux test runtime in seconds')
-        string(name: 'BLOCK_SIZES',       defaultValue: '4k 8k 128k 1024k',  description: 'Linux block sizes (space-separated)')
-        string(name: 'IO_PATTERNS',       defaultValue: 'read write randread randwrite randrw', description: 'Linux I/O patterns (space-separated)')
-        string(name: 'NUMJOBS',           defaultValue: '1',                  description: 'Linux number of parallel FIO jobs')
-        string(name: 'IODEPTH',           defaultValue: '16',                 description: 'Linux I/O depth')
-        string(name: 'DIRECT_IO',         defaultValue: '1',                  description: 'Linux direct I/O (1=bypass page cache, 0=use cache)')
-        string(name: 'RATE_IOPS',         defaultValue: '',                   description: 'Linux IOPS rate limit (empty = unlimited)')
+        // ----- 3. FIO harness (podman image that runs fio-tests) -----
+        string(
+            name: 'CONTAINER_IMAGE',
+            defaultValue: 'quay.io/ekuric/fio-benchmark:latest',
+            description: '[3. Harness] fio-container image (not the guest VM OS image)'
+        )
 
-        // Windows FIO parameters
-        string(name: 'WIN_RUNTIME',       defaultValue: '300',                 description: 'Windows test runtime in seconds')
-        string(name: 'WIN_BLOCK_SIZES',   defaultValue: '4k 8k 128k 1024k',  description: 'Windows block sizes (space-separated)')
-        string(name: 'WIN_IO_PATTERNS',   defaultValue: 'read write randread randwrite randrw', description: 'Windows I/O patterns (space-separated)')
-        string(name: 'WIN_NUMJOBS',       defaultValue: '1',                  description: 'Windows number of parallel FIO jobs')
-        string(name: 'WIN_IODEPTH',       defaultValue: '16',                 description: 'Windows I/O depth')
-        string(name: 'INTERVAL',          defaultValue: '30',                 description: 'Seconds between failed ssh command attempts')
-        string(name: 'MAX_RETRIES',       defaultValue: '10',                 description: 'Maximum number of failed ssh command attemts')
-        string(name: 'MONITOR_INTERVAL',  defaultValue: '60',                 description: 'Seconds between task monitor checks')
-        string(name: 'KUBEADMIN_PASSWORD', defaultValue: '',                   description: 'Kubernetes admin password')
-        string(name: 'API_URL',           defaultValue: 'https://api.ocp.example.com:6443', description: 'Kubernetes API URL')
-        string(name: 'WIN_DIRECT_IO',     defaultValue: '1',                  description: 'Windows direct I/O (1=yes, 0=no)')
-        string(name: 'WIN_TEST_SIZE',     defaultValue: '10GB',               description: 'FIO test file size (Windows)')
-        string(name: 'WIN_RATE_IOPS',     defaultValue: '',                   description: 'Windows IOPS rate limit (empty = unlimited)')
-
-        // Migration and general
-        string(name: 'MIGRATE_WORKLOADS', defaultValue: '',                    description: 'I/O patterns triggering VM migration (space-separated, empty = no migration)')
-        string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
-        string(name: 'MONITOR_VM',        defaultValue: 'false',              description: 'Monitor VM node placement during tests and log migrations (true/false)')
-        string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',               description: 'VM migration monitor polling interval in seconds')
-        string(name: 'DESCRIPTION',       defaultValue: 'jenkins-fio-test',   description: 'Test run description (included in results directory name)')
+        // ----- 4. Disk target mode -----
         choice(
             name: 'USE_TESTDIR',
             choices: ['false', 'true'],
-            description: 'OS-disk FIO mode: Linux /root/testdir, Windows c:/testdir (no data-disk format; pass --testdir to fio-tests.py)'
+            description: '[4. Disk] OS-disk FIO (/root/testdir, c:/testdir). Mutually exclusive with USE_RAW_DISK'
         )
+        choice(
+            name: 'USE_RAW_DISK',
+            choices: ['false', 'true'],
+            description: '[4. Disk] Raw block device FIO. Mutually exclusive with USE_TESTDIR'
+        )
+
+        // ----- 5. On-demand VM provision -----
+        choice(
+            name: 'CREATE_VMS',
+            choices: ['false', 'true'],
+            description: '[5. Create VMs] Provision guests before FIO (leave host patterns empty; needs STORAGE_CLASS)'
+        )
+        choice(
+            name: 'CLEANUP',
+            choices: ['false', 'true'],
+            description: '[5. Create VMs] Delete managed VMs after test (default keep; next create still wipes leftovers)'
+        )
+        string(name: 'STORAGE_CLASS',        defaultValue: '',               description: '[5. Create VMs] StorageClass (required if CREATE_VMS=true)')
+        string(name: 'DATA_DISK_SIZE',       defaultValue: '40Gi',           description: '[5. Create VMs] Blank data disk (skipped if USE_TESTDIR)')
+        // Linux guests
+        string(name: 'VMS',                  defaultValue: '0',              description: '[5a. Linux VMs] Count (0 = skip Linux create)')
+        string(name: 'VM_PREFIX',            defaultValue: 'fio-linux',      description: '[5a. Linux VMs] Name prefix → fio-linux-1..N')
+        string(name: 'VM_CPU',               defaultValue: '2',              description: '[5a. Linux VMs] vCPU cores')
+        string(name: 'VM_MEMORY',            defaultValue: '4Gi',            description: '[5a. Linux VMs] Memory')
+        string(
+            name: 'VM_IMAGE',
+            defaultValue: 'quay.io/containerdisks/fedora:41',
+            description: '[5a. Linux VMs] Guest OS containerdisk (registry)'
+        )
+        string(name: 'ROOT_VOLUME_SIZE',     defaultValue: '20Gi',           description: '[5a. Linux VMs] Root PVC size')
+        // Windows guests
+        string(name: 'WIN_VMS',              defaultValue: '0',              description: '[5b. Windows VMs] Count (0 = skip Windows create)')
+        string(name: 'WIN_VM_PREFIX',        defaultValue: 'fio-windows',    description: '[5b. Windows VMs] Name prefix → fio-windows-1..N')
+        string(name: 'WIN_VM_CPU',           defaultValue: '2',              description: '[5b. Windows VMs] vCPU cores')
+        string(name: 'WIN_VM_MEMORY',        defaultValue: '4Gi',            description: '[5b. Windows VMs] Memory')
+        string(
+            name: 'WIN_VM_IMAGE',
+            defaultValue: '',
+            description: '[5b. Windows VMs] Guest OS image HTTP URL (required if WIN_VMS>0)'
+        )
+        string(name: 'WIN_ROOT_VOLUME_SIZE', defaultValue: '60Gi',           description: '[5b. Windows VMs] Root PVC size')
+
+        // ----- 6. Existing hosts (CREATE_VMS=false) -----
+        string(name: 'HOST_PATTERN',     defaultValue: '', description: '[6. Existing hosts] Linux VMs, e.g. vml-{1..3}. Empty when CREATE_VMS=true')
+        string(name: 'DEVICES',          defaultValue: '', description: '[6. Existing hosts] Linux pattern=device. Empty for testdir/create-vms')
+        string(name: 'WIN_HOST_PATTERN', defaultValue: '', description: '[6. Existing hosts] Windows VMs, e.g. win-vm-{1..2}. Empty to skip')
+        string(name: 'WIN_DEVICES',      defaultValue: '', description: '[6. Existing hosts] Windows pattern=diskid. Empty for testdir/create-vms')
+
+        // ----- 7. Linux FIO workload -----
+        string(name: 'TEST_SIZE',         defaultValue: '5G',                 description: '[7. Linux workload] Dataset / job --size')
+        string(name: 'RUNTIME',           defaultValue: '300',                description: '[7. Linux workload] Perf runtime seconds')
+        string(name: 'BLOCK_SIZES',       defaultValue: '4k 8k 128k 1024k',  description: '[7. Linux workload] Block sizes')
+        string(name: 'IO_PATTERNS',       defaultValue: 'read write randread randwrite randrw', description: '[7. Linux workload] I/O patterns')
+        string(name: 'NUMJOBS',           defaultValue: '1',                  description: '[7. Linux workload] Parallel jobs')
+        string(name: 'IODEPTH',           defaultValue: '16',                 description: '[7. Linux workload] Queue depth')
+        string(name: 'DIRECT_IO',         defaultValue: '1',                  description: '[7. Linux workload] Direct I/O (1/0)')
+        string(name: 'RATE_IOPS',         defaultValue: '',                   description: '[7. Linux workload] Optional IOPS cap')
+
+        // ----- 8. Windows FIO workload -----
+        string(name: 'WIN_TEST_SIZE',     defaultValue: '10GB',               description: '[8. Windows workload] Dataset / job --size')
+        string(name: 'WIN_RUNTIME',       defaultValue: '300',                description: '[8. Windows workload] Perf runtime seconds')
+        string(name: 'WIN_BLOCK_SIZES',   defaultValue: '4k 8k 128k 1024k',  description: '[8. Windows workload] Block sizes')
+        string(name: 'WIN_IO_PATTERNS',   defaultValue: 'read write randread randwrite randrw', description: '[8. Windows workload] I/O patterns')
+        string(name: 'WIN_NUMJOBS',       defaultValue: '1',                  description: '[8. Windows workload] Parallel jobs')
+        string(name: 'WIN_IODEPTH',       defaultValue: '16',                 description: '[8. Windows workload] Queue depth')
+        string(name: 'WIN_DIRECT_IO',     defaultValue: '1',                  description: '[8. Windows workload] Direct I/O (1/0)')
+        string(name: 'WIN_RATE_IOPS',     defaultValue: '',                   description: '[8. Windows workload] Optional IOPS cap')
+
+        // ----- 9. Resilience / migration -----
+        string(name: 'INTERVAL',            defaultValue: '30',               description: '[9. Resilience] SSH retry interval (s)')
+        string(name: 'MAX_RETRIES',         defaultValue: '10',               description: '[9. Resilience] SSH max retries')
+        string(name: 'MONITOR_INTERVAL',    defaultValue: '60',               description: '[9. Resilience] Task monitor interval (s)')
+        string(name: 'MIGRATE_WORKLOADS',   defaultValue: '',                description: '[9. Resilience] Patterns that trigger live migrate')
+        string(name: 'MIGRATE_INTERVAL',    defaultValue: '0',               description: '[9. Resilience] Seconds between migrations (0=parallel)')
+        string(name: 'MONITOR_VM',          defaultValue: 'false',           description: '[9. Resilience] Log VM node placement (true/false)')
+        string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',              description: '[9. Resilience] Placement poll interval (s)')
     }
 
     environment {
@@ -79,13 +144,32 @@ pipeline {
                 sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            mkdir -p /tmp/fio-ssh
                             podman run --rm --pids-limit=-1 \
-                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e DESCRIPTION="${params.DESCRIPTION}" \
+                              -e NAMESPACE="${params.NAMESPACE}" \
                               -e USE_TESTDIR="${params.USE_TESTDIR}" \
+                              -e USE_RAW_DISK="${params.USE_RAW_DISK}" \
+                              -e CREATE_VMS="${params.CREATE_VMS}" \
+                              -e CLEANUP="${params.CLEANUP}" \
+                              -e STORAGE_CLASS="${params.STORAGE_CLASS}" \
+                              -e DATA_DISK_SIZE="${params.DATA_DISK_SIZE}" \
+                              -e VMS="${params.VMS}" \
+                              -e VM_PREFIX="${params.VM_PREFIX}" \
+                              -e VM_CPU="${params.VM_CPU}" \
+                              -e VM_MEMORY="${params.VM_MEMORY}" \
+                              -e VM_IMAGE="${params.VM_IMAGE}" \
+                              -e ROOT_VOLUME_SIZE="${params.ROOT_VOLUME_SIZE}" \
+                              -e WIN_VMS="${params.WIN_VMS}" \
+                              -e WIN_VM_PREFIX="${params.WIN_VM_PREFIX}" \
+                              -e WIN_VM_CPU="${params.WIN_VM_CPU}" \
+                              -e WIN_VM_MEMORY="${params.WIN_VM_MEMORY}" \
+                              -e WIN_VM_IMAGE="${params.WIN_VM_IMAGE}" \
+                              -e WIN_ROOT_VOLUME_SIZE="${params.WIN_ROOT_VOLUME_SIZE}" \
+                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
                               -e DEVICES="${params.DEVICES}" \
                               -e WIN_HOST_PATTERN="${params.WIN_HOST_PATTERN}" \
                               -e WIN_DEVICES="${params.WIN_DEVICES}" \
-                              -e NAMESPACE="${params.NAMESPACE}" \
                               -e TEST_SIZE="${params.TEST_SIZE}" \
                               -e RUNTIME=${params.RUNTIME} \
                               -e BLOCK_SIZES="${params.BLOCK_SIZES}" \
@@ -94,13 +178,13 @@ pipeline {
                               -e IODEPTH=${params.IODEPTH} \
                               -e DIRECT_IO=${params.DIRECT_IO} \
                               -e RATE_IOPS="${params.RATE_IOPS}" \
+                              -e WIN_TEST_SIZE="${params.WIN_TEST_SIZE}" \
                               -e WIN_RUNTIME=${params.WIN_RUNTIME} \
                               -e WIN_BLOCK_SIZES="${params.WIN_BLOCK_SIZES}" \
                               -e WIN_IO_PATTERNS="${params.WIN_IO_PATTERNS}" \
                               -e WIN_NUMJOBS=${params.WIN_NUMJOBS} \
                               -e WIN_IODEPTH=${params.WIN_IODEPTH} \
                               -e WIN_DIRECT_IO=${params.WIN_DIRECT_IO} \
-                              -e WIN_TEST_SIZE="${params.WIN_TEST_SIZE}" \
                               -e WIN_RATE_IOPS="${params.WIN_RATE_IOPS}" \
                               -e MIGRATE_WORKLOADS="${params.MIGRATE_WORKLOADS}" \
                               -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
@@ -111,10 +195,10 @@ pipeline {
                               -e MONITOR_VM_INTERVAL=${params.MONITOR_VM_INTERVAL} \
                               -e KUBEADMIN_PASSWORD="${params.KUBEADMIN_PASSWORD}" \
                               -e API_URL="${params.API_URL}" \
-                              -e DESCRIPTION="${params.DESCRIPTION}" \
                               -v ${RESULTS_DIR}:/work/results \
                               -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
                               -v /root/.kube/config:/root/.kube/config \
+                              -v /tmp/fio-ssh:/host-tmp \
                               --privileged \
                               ${params.CONTAINER_IMAGE}
                         '
@@ -150,10 +234,11 @@ pipeline {
             echo "FIO test failed. Check the console output for details."
         }
         always {
-            echo "Test description: ${params.DESCRIPTION}"
-            echo "Hosts: Linux=${params.HOST_PATTERN}, Windows=${params.WIN_HOST_PATTERN}"
-            echo "Block sizes: Linux=${params.BLOCK_SIZES}, Windows=${params.WIN_BLOCK_SIZES}"
-            echo "I/O patterns: Linux=${params.IO_PATTERNS}, Windows=${params.WIN_IO_PATTERNS}"
+            echo "Test: ${params.DESCRIPTION}  ns=${params.NAMESPACE}"
+            echo "Bastion: ${env.BASTION_CONN}  harness=${params.CONTAINER_IMAGE}"
+            echo "Create VMs: ${params.CREATE_VMS} linux=${params.VMS}/${params.VM_PREFIX} win=${params.WIN_VMS}/${params.WIN_VM_PREFIX}"
+            echo "Disk: testdir=${params.USE_TESTDIR} raw=${params.USE_RAW_DISK} cleanup=${params.CLEANUP}"
+            echo "Hosts: Linux=${params.HOST_PATTERN ?: '(none)'} Windows=${params.WIN_HOST_PATTERN ?: '(none)'}"
         }
     }
 }

@@ -1,8 +1,9 @@
-"""Configuration: FioTestConfig, ConfigLoader, and --testdir overrides."""
+"""Configuration: FioTestConfig, ConfigLoader, and path/mode overrides."""
 
 import logging
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime
 from typing import Dict, List, Optional
@@ -26,6 +27,7 @@ from fio_tests.constants import (
     DEFAULT_LINUX_IOENGINE,
     DEFAULT_MAX_WORKERS,
     DEFAULT_TIMEOUT,
+    LINUX_RESULTS_DIR,
     LINUX_TESTDIR,
     MIGRATION_TIMEOUT,
     NOHUP_SETUP_TIMEOUT,
@@ -34,10 +36,12 @@ from fio_tests.constants import (
     RUNTIME_BUFFER,
     SCP_TIMEOUT,
     WINDOWS_FIO_DIR_TESTDIR,
-    WINDOWS_OUTPUT_TESTDIR,
+    WINDOWS_RESULTS_DIR,
     WINDOWS_TESTDIR,
 )
 from fio_tests.util import (
+    is_forbidden_linux_raw_device,
+    is_forbidden_windows_raw_disk,
     normalize_optional_fsync,
     normalize_windows_path,
     parse_bool,
@@ -51,11 +55,51 @@ class FioConfigError(Exception):
     pass
 
 
+def apply_fixed_result_paths(config: "FioTestConfig") -> None:
+    """
+    Force FIO JSON result directories onto the OS disk for every storage mode.
+
+    Linux: /root/fio-results — Windows: c:/fio-results.
+    YAML/env output directories are ignored so test-disk failures cannot lose results.
+    """
+    linux_hosts = config.get_linux_hosts()
+    windows_hosts = config.get_windows_hosts()
+
+    if linux_hosts:
+        if config.output_dir and normalize_windows_path(config.output_dir) not in (
+            LINUX_RESULTS_DIR,
+            LINUX_RESULTS_DIR.rstrip("/"),
+        ):
+            logger.info(
+                f"Forcing Linux FIO JSON directory to {LINUX_RESULTS_DIR} "
+                f"(ignoring configured '{config.output_dir}')"
+            )
+        config.output_dir = LINUX_RESULTS_DIR
+
+    if windows_hosts:
+        if config.windows_output_dir and normalize_windows_path(config.windows_output_dir) not in (
+            WINDOWS_RESULTS_DIR,
+            WINDOWS_RESULTS_DIR.rstrip("/"),
+        ):
+            logger.info(
+                f"Forcing Windows FIO JSON directory to {WINDOWS_RESULTS_DIR} "
+                f"(ignoring configured '{config.windows_output_dir}')"
+            )
+        config.windows_output_dir = normalize_windows_path(WINDOWS_RESULTS_DIR)
+
+    if linux_hosts or windows_hosts:
+        logger.info(
+            "FIO JSON results always on OS disk: "
+            f"Linux {LINUX_RESULTS_DIR}, Windows {WINDOWS_RESULTS_DIR}"
+        )
+
+
 def apply_testdir_overrides(config: "FioTestConfig") -> None:
     """
-    Override FIO data/output paths for OS-disk testing (--testdir).
+    Override FIO data paths for OS-disk testing (--testdir).
 
     storage / storage_win device mappings and mount points from YAML are ignored.
+    JSON results are always set by apply_fixed_result_paths.
     """
     if not config.use_testdir:
         return
@@ -75,7 +119,6 @@ def apply_testdir_overrides(config: "FioTestConfig") -> None:
         config.windows_fio_dir = normalize_windows_path(WINDOWS_FIO_DIR_TESTDIR)
         if not config.windows_fio_dir.endswith('/'):
             config.windows_fio_dir += '/'
-        config.windows_output_dir = normalize_windows_path(WINDOWS_OUTPUT_TESTDIR)
 
     logger.info(
         "TESTDIR MODE: FIO runs on OS disk — no separate disk format/provision. "
@@ -83,10 +126,70 @@ def apply_testdir_overrides(config: "FioTestConfig") -> None:
     )
     if linux_hosts:
         logger.info(f"  Linux FIO data directory: {LINUX_TESTDIR}")
-        logger.info(f"  Linux results directory: {config.output_dir} (from YAML)")
+        logger.info(f"  Linux results directory: {config.output_dir}")
     if windows_hosts:
         logger.info(f"  Windows FIO data directory: {config.windows_mount_point}")
         logger.info(f"  Windows FIO executable dir: {config.windows_fio_dir}")
+        logger.info(f"  Windows results directory: {config.windows_output_dir}")
+
+
+def apply_raw_disk_overrides(config: "FioTestConfig") -> None:
+    """
+    Configure raw-block FIO mode (--raw-disk): no filesystem on the test disk.
+
+    Device maps from YAML remain required. Windows FIO stays at c:/tools/fio.
+    JSON results are always set by apply_fixed_result_paths.
+    """
+    if not config.use_raw_disk:
+        return
+
+    if config.use_testdir:
+        raise FioConfigError("CRITICAL: --raw-disk and --testdir are mutually exclusive")
+
+    linux_hosts = config.get_linux_hosts()
+    windows_hosts = config.get_windows_hosts()
+
+    for host in linux_hosts:
+        device = config.storage_devices.get(host)
+        if not device or device == "unused":
+            raise FioConfigError(
+                f"CRITICAL: --raw-disk requires a storage device for Linux host '{host}'"
+            )
+        if is_forbidden_linux_raw_device(device):
+            raise FioConfigError(
+                f"CRITICAL: refusing --raw-disk on OS disk /dev/{device} for host '{host}'"
+            )
+
+    for host in windows_hosts:
+        device = config.windows_storage_devices.get(host)
+        if not device:
+            raise FioConfigError(
+                f"CRITICAL: --raw-disk requires a Disk ID for Windows host '{host}'"
+            )
+        if is_forbidden_windows_raw_disk(device):
+            raise FioConfigError(
+                f"CRITICAL: refusing --raw-disk on Windows Disk 0 (OS disk) for host '{host}'"
+            )
+
+    if windows_hosts:
+        config.windows_fio_dir = normalize_windows_path(WINDOWS_FIO_DIR_TESTDIR)
+        if not config.windows_fio_dir.endswith('/'):
+            config.windows_fio_dir += '/'
+
+    logger.info(
+        "RAW DISK MODE: FIO runs against the block device (no filesystem). "
+        "No mkfs/mount/provision; JSON results stay on the OS disk."
+    )
+    for host in linux_hosts:
+        logger.info(f"  {host} (Linux): --filename=/dev/{config.storage_devices[host]}")
+    for host in windows_hosts:
+        disk_id = config.windows_storage_devices[host]
+        logger.info(f"  {host} (Windows): --filename=\\\\.\\PhysicalDrive{disk_id}")
+    if windows_hosts:
+        logger.info(f"  Windows FIO executable dir: {config.windows_fio_dir}")
+    if linux_hosts:
+        logger.info(f"  Linux results directory: {config.output_dir}")
+    if windows_hosts:
         logger.info(f"  Windows results directory: {config.windows_output_dir}")
 
 
@@ -133,6 +236,30 @@ class FioTestConfig:
         self.persistent_mount = False  # Whether to create /etc/fstab entries
         self.copy_results = False  # Whether to only copy results (skip all other steps)
         self.use_testdir = False  # OS-disk mode: fixed testdir paths, no data-disk format
+        self.use_raw_disk = False  # Raw block device mode: --filename=, no filesystem
+        # On-demand VM provision (--create-vms)
+        self.create_vms = False
+        self.cleanup_vms = False  # --cleanup: delete managed VMs after test
+        self.vms_count = 0
+        self.win_vms_count = 0
+        self.vm_cpu = "2"
+        self.vm_memory = "4Gi"
+        self.win_vm_cpu = None  # falls back to vm_cpu
+        self.win_vm_memory = None  # falls back to vm_memory
+        self.vm_image = "quay.io/containerdisks/fedora:41"
+        self.win_vm_image = None
+        self.storage_class = None
+        self.access_mode = "ReadWriteMany"
+        self.root_volume_size = "20Gi"
+        self.data_disk_size = "40Gi"
+        self.win_root_volume_size = "76Gi"
+        self.win_data_disk_size = "40Gi"
+        self.vm_prefix = "fio-linux"
+        self.win_vm_prefix = "fio-win"
+        self.ssh_key_path = None  # directory for ephemeral keypair (in-container)
+        self.ssh_identity_file = "/root/.ssh/id_rsa"  # virtctl -i path
+        self.ssh_key_bastion_path = None  # /tmp/fio-ssh-<runid> on bastion when /host-tmp mounted
+        self.provision_run_id = None
         self.windows_hosts = set()  # Set of Windows hostnames
         # Windows-specific configuration (optional, only used if windows_hosts is set)
         self.windows_storage_devices = {}  # host -> device mapping for Windows
@@ -254,8 +381,18 @@ class ConfigLoader:
         else:
             self.config.namespace = "N/A"
         
-        # Load VM hosts (Linux hosts)
-        self.config.vm_hosts = self._get_vm_hosts(yaml_data)
+        # Load VM hosts (Linux hosts). With --create-vms, hosts come from provision
+        # after Ready+SSH — do not expand YAML host_pattern early (that would SSH to
+        # non-existent VMs during testdir/storage prep).
+        if self.config.create_vms:
+            self.config.vm_hosts = []
+            self.config.windows_hosts = set()
+            logger.info(
+                "CREATE_VMS: deferring host list until VMs are Ready and SSH-reachable "
+                "(YAML host_pattern / hosts ignored)"
+            )
+        else:
+            self.config.vm_hosts = self._get_vm_hosts(yaml_data)
         
         # Load storage configuration (required for Linux hosts unless --testdir)
         storage = yaml_data.get('storage', {})
@@ -270,73 +407,107 @@ class ConfigLoader:
                     )
                 for host in self.config.vm_hosts:
                     self.config.storage_devices[host] = "unused"
+            elif self.config.create_vms:
+                # Device maps filled after provision; still accept mount/fs from YAML/env defaults
+                if storage.get('mount_point') and storage.get('mount_point') != "null":
+                    self.config.mount_point = storage['mount_point']
+                if storage.get('filesystem') and storage.get('filesystem') != "null":
+                    self.config.filesystem = storage['filesystem']
+                persistent = storage.get('persistent', False)
+                self.config.persistent_mount = persistent == "true" or persistent is True
+                if self.config.use_raw_disk:
+                    self.config.mount_point = None
+                    self.config.filesystem = None
+                    self.config.persistent_mount = False
             else:
                 if not storage:
                     raise FioConfigError("CRITICAL: 'storage' section is required when Linux hosts are configured")
-                
-                if 'mount_point' not in storage or not storage.get('mount_point') or storage.get('mount_point') == "null":
-                    raise FioConfigError("CRITICAL: 'storage.mount_point' is required when Linux hosts are configured")
-                self.config.mount_point = storage['mount_point']
-                
-                if 'filesystem' not in storage or not storage.get('filesystem') or storage.get('filesystem') == "null":
-                    raise FioConfigError("CRITICAL: 'storage.filesystem' is required when Linux hosts are configured")
-                self.config.filesystem = storage['filesystem']
-                
-                # Load persistent mount option (optional, defaults to False)
-                persistent = storage.get('persistent', False)
-                if persistent == "true" or persistent is True:
-                    self.config.persistent_mount = True
-                else:
-                    self.config.persistent_mount = False
-                
-                # Load device mappings
+
+                # Load device mappings (required for FS disk and raw-disk modes)
                 devices = storage.get('devices', {})
                 for host in self.config.vm_hosts:
                     device = devices.get(host)
                     if not device:
-                        # Try pattern matching
                         device = self._get_device_from_pattern(host, devices)
                     if device:
                         self.config.storage_devices[host] = device
                     else:
                         raise FioConfigError(f"CRITICAL: No storage device specified for Linux host '{host}'")
+
+                if self.config.use_raw_disk:
+                    if storage.get('mount_point') or storage.get('filesystem'):
+                        logger.info(
+                            "RAW DISK MODE: ignoring YAML storage.mount_point / filesystem "
+                            "(FIO targets the block device directly)"
+                        )
+                    self.config.mount_point = None
+                    self.config.filesystem = None
+                    self.config.persistent_mount = False
+                else:
+                    if 'mount_point' not in storage or not storage.get('mount_point') or storage.get('mount_point') == "null":
+                        raise FioConfigError("CRITICAL: 'storage.mount_point' is required when Linux hosts are configured")
+                    self.config.mount_point = storage['mount_point']
+
+                    if 'filesystem' not in storage or not storage.get('filesystem') or storage.get('filesystem') == "null":
+                        raise FioConfigError("CRITICAL: 'storage.filesystem' is required when Linux hosts are configured")
+                    self.config.filesystem = storage['filesystem']
+
+                    persistent = storage.get('persistent', False)
+                    if persistent == "true" or persistent is True:
+                        self.config.persistent_mount = True
+                    else:
+                        self.config.persistent_mount = False
+        elif self.config.create_vms and self.config.vms_count > 0:
+            # No Linux hosts in YAML yet; set defaults for provisioned VMs
+            if storage:
+                if storage.get('mount_point') and storage.get('mount_point') != "null":
+                    self.config.mount_point = storage['mount_point']
+                if storage.get('filesystem') and storage.get('filesystem') != "null":
+                    self.config.filesystem = storage['filesystem']
+            if not self.config.use_testdir and not self.config.use_raw_disk:
+                self.config.mount_point = self.config.mount_point or "/root/tests/data"
+                self.config.filesystem = self.config.filesystem or "xfs"
         
-        # Load FIO configuration (required for Linux hosts, optional if only Windows)
+        # Load FIO configuration (required for Linux hosts, or when --create-vms will add them)
+        need_linux_fio = linux_hosts_present or (
+            self.config.create_vms and int(self.config.vms_count or 0) > 0
+        )
         fio = yaml_data.get('fio', {})
-        if linux_hosts_present:
-            self.config.test_size = fio.get('test_size')
+        if need_linux_fio:
+            self.config.test_size = fio.get('test_size') or self.config.test_size or "1G"
             self.config.test_runtime = parse_optional_runtime(fio.get('runtime'))
-            raw_bs = fio.get('block_sizes', '')
-            self.config.block_sizes = raw_bs if isinstance(raw_bs, list) else raw_bs.split()
-            raw_ip = fio.get('io_patterns', '')
-            self.config.io_patterns = raw_ip if isinstance(raw_ip, list) else raw_ip.split()
+            raw_bs = fio.get('block_sizes', '') or "4k 8k 128k"
+            self.config.block_sizes = raw_bs if isinstance(raw_bs, list) else str(raw_bs).split()
+            raw_ip = fio.get('io_patterns', '') or "read write randread randwrite"
+            self.config.io_patterns = raw_ip if isinstance(raw_ip, list) else str(raw_ip).split()
             self.config.numjobs = int(fio.get('numjobs', 1))
             self.config.iodepth = int(fio.get('iodepth', 1))
             self.config.ioengine = str(fio.get('ioengine', DEFAULT_LINUX_IOENGINE)).strip() or DEFAULT_LINUX_IOENGINE
             self.config.direct_io = str(fio.get('direct_io', 1))
-            self.config.fsync = normalize_optional_fsync(fio.get('fsync'))
+            try:
+                self.config.fsync = normalize_optional_fsync(fio.get('fsync'))
+            except ValueError as e:
+                raise FioConfigError(str(e)) from e
             self.config.rate_iops = fio.get('rate_iops')
             if self.config.rate_iops == "null" or not self.config.rate_iops:
                 self.config.rate_iops = None
             else:
-                # Ensure rate_iops is an integer if it's set
                 if isinstance(self.config.rate_iops, str):
                     self.config.rate_iops = int(self.config.rate_iops)
             self.config.fio_installed = parse_bool(fio.get('fio_installed'), False)
         
-        # Load output configuration (required for Linux hosts, optional if only Windows)
+        # Load output configuration (JSON always forced to OS-disk path later)
         output = yaml_data.get('output', {})
-        if linux_hosts_present:
-            if not output:
-                raise FioConfigError("CRITICAL: 'output' section is required when Linux hosts are configured")
-            
-            if 'directory' not in output or not output.get('directory') or output.get('directory') == "null":
-                raise FioConfigError("CRITICAL: 'output.directory' is required when Linux hosts are configured")
-            self.config.output_dir = output['directory']
-            
-            if 'format' not in output or not output.get('format') or output.get('format') == "null":
-                raise FioConfigError("CRITICAL: 'output.format' is required when Linux hosts are configured")
-            self.config.output_format = output['format']
+        if need_linux_fio:
+            if output.get('directory') and output.get('directory') != "null":
+                # Accepted for back-compat but overridden by apply_fixed_result_paths
+                self.config.output_dir = output['directory']
+            self.config.output_dir = self.config.output_dir or LINUX_RESULTS_DIR
+
+            if output.get('format') and output.get('format') != "null":
+                self.config.output_format = output['format']
+            else:
+                self.config.output_format = self.config.output_format or "json+"
         
         self.config.description = yaml_data.get('description', '')
         if self.config.description == "null" or not self.config.description:
@@ -390,34 +561,47 @@ class ConfigLoader:
         # Load Windows-specific configuration (optional)
         windows_config = yaml_data.get('windows', {})
         if windows_config:
-            # Load Windows host list
-            windows_hosts = windows_config.get('hosts', [])
-            if isinstance(windows_hosts, str):
-                windows_hosts = windows_hosts.split()
-            elif not isinstance(windows_hosts, list):
+            if self.config.create_vms:
+                # Hosts filled after provision; still load fio_win / storage_win defaults below
                 windows_hosts = []
-            
-            # Also check for Windows host patterns
-            windows_host_pattern = windows_config.get('host_pattern')
-            if windows_host_pattern:
-                if '{' in windows_host_pattern and '..' in windows_host_pattern:
-                    match = re.search(r'([\w-]+)\{(\d+)\.\.(\d+)\}', windows_host_pattern)
-                    if match:
-                        prefix = match.group(1)
-                        start = int(match.group(2))
-                        end = int(match.group(3))
-                        pattern_hosts = [f"{prefix}{i}" for i in range(start, end + 1)]
-                        windows_hosts.extend(pattern_hosts)
-                        logger.info(f"Expanded Windows host pattern to {len(pattern_hosts)} hosts")
+                self.config.windows_hosts = set()
+            else:
+                # Load Windows host list
+                windows_hosts = windows_config.get('hosts', [])
+                if isinstance(windows_hosts, str):
+                    windows_hosts = windows_hosts.split()
+                elif not isinstance(windows_hosts, list):
+                    windows_hosts = []
+
+                # Also check for Windows host patterns
+                windows_host_pattern = windows_config.get('host_pattern')
+                if windows_host_pattern:
+                    if '{' in windows_host_pattern and '..' in windows_host_pattern:
+                        match = re.search(r'([\w-]+)\{(\d+)\.\.(\d+)\}', windows_host_pattern)
+                        if match:
+                            prefix = match.group(1)
+                            start = int(match.group(2))
+                            end = int(match.group(3))
+                            pattern_hosts = [f"{prefix}{i}" for i in range(start, end + 1)]
+                            windows_hosts.extend(pattern_hosts)
+                            logger.info(f"Expanded Windows host pattern to {len(pattern_hosts)} hosts")
+                    else:
+                        windows_hosts.extend(windows_host_pattern.split())
+                        logger.info(f"Using Windows host pattern as literal hostname(s): {windows_host_pattern}")
+
+                self.config.windows_hosts = set(windows_hosts)
+
+            if self.config.windows_hosts or (
+                self.config.create_vms and int(self.config.win_vms_count or 0) > 0
+            ):
+                if self.config.windows_hosts:
+                    logger.info(f"Windows hosts detected: {sorted(self.config.windows_hosts)}")
                 else:
-                    windows_hosts.extend(windows_host_pattern.split())
-                    logger.info(f"Using Windows host pattern as literal hostname(s): {windows_host_pattern}")
-            
-            self.config.windows_hosts = set(windows_hosts)
-            
-            if self.config.windows_hosts:
-                logger.info(f"Windows hosts detected: {sorted(self.config.windows_hosts)}")
-                
+                    logger.info(
+                        f"CREATE_VMS: will provision {self.config.win_vms_count} Windows VM(s) "
+                        "(loading windows.* defaults from YAML)"
+                    )
+
                 # Load Windows storage configuration (ignored entirely with --testdir)
                 storage_win = windows_config.get('storage_win', {})
                 if self.config.use_testdir:
@@ -427,55 +611,63 @@ class ConfigLoader:
                             "(devices / mount_point not used; OS-disk paths will be used)"
                         )
                     self.config.windows_storage_devices = {}
+                elif self.config.create_vms:
+                    if storage_win.get('mount_point') and storage_win.get('mount_point') != "null":
+                        self.config.windows_mount_point = storage_win.get('mount_point')
+                    if self.config.use_raw_disk:
+                        self.config.windows_mount_point = None
                 elif storage_win:
                     devices_win = storage_win.get('devices', {})
                     for host in self.config.windows_hosts:
                         device = devices_win.get(host)
                         if not device:
-                            # Try pattern matching
                             device = self._get_device_from_pattern(host, devices_win)
                         if device:
                             self.config.windows_storage_devices[host] = device
                         else:
                             raise FioConfigError(f"CRITICAL: No storage device specified for Windows host '{host}'")
-                    
-                    self.config.windows_mount_point = storage_win.get('mount_point')
-                    if not self.config.windows_mount_point or self.config.windows_mount_point == "null":
-                        raise FioConfigError("CRITICAL: 'windows.storage_win.mount_point' is required for Windows hosts")
-                
+
+                    if self.config.use_raw_disk:
+                        if storage_win.get('mount_point'):
+                            logger.info(
+                                "RAW DISK MODE: ignoring YAML windows.storage_win.mount_point "
+                                "(FIO targets PhysicalDrive directly)"
+                            )
+                        self.config.windows_mount_point = None
+                    else:
+                        self.config.windows_mount_point = storage_win.get('mount_point')
+                        if not self.config.windows_mount_point or self.config.windows_mount_point == "null":
+                            raise FioConfigError("CRITICAL: 'windows.storage_win.mount_point' is required for Windows hosts")
+                elif not self.config.use_testdir:
+                    raise FioConfigError("CRITICAL: 'windows.storage_win' is required for Windows hosts")
+
                 # Load Windows FIO configuration
                 fio_win = windows_config.get('fio_win', {})
                 if fio_win:
-                    # Load run_dir (location of FIO executable) - this is the directory containing fio.exe
-                    # Also support root_dir for compatibility (though run_dir takes precedence)
                     run_dir = fio_win.get('run_dir') or fio_win.get('fio_dir')
                     root_dir = fio_win.get('root_dir')
-                    
-                    if self.config.use_testdir:
+
+                    if self.config.use_testdir or self.config.use_raw_disk:
                         if run_dir or root_dir:
+                            mode = "TESTDIR" if self.config.use_testdir else "RAW DISK"
                             logger.info(
-                                "TESTDIR MODE: ignoring YAML windows.fio_win.run_dir "
+                                f"{mode} MODE: ignoring YAML windows.fio_win.run_dir "
                                 f"(using {WINDOWS_FIO_DIR_TESTDIR})"
                             )
                     elif run_dir:
-                        # run_dir is explicitly set - normalize and use it directly
                         self.config.windows_fio_dir = normalize_windows_path(run_dir)
                     elif root_dir:
-                        # Only root_dir is set - append 'fio' to it (e.g., "d:/" -> "d:/fio")
-                        # Ensure root_dir ends with / for proper path construction
                         root_dir_normalized = normalize_windows_path(root_dir)
                         if not root_dir_normalized.endswith('/'):
                             root_dir_normalized += '/'
                         self.config.windows_fio_dir = normalize_windows_path(root_dir_normalized + 'fio')
                     else:
-                        # Default fallback
                         self.config.windows_fio_dir = normalize_windows_path('d:/fio')
-                    
-                    if not self.config.use_testdir:
-                        # Ensure fio_dir ends with / for proper path construction (like Windows script FIO_DIR="d:/fio/")
+
+                    if not self.config.use_testdir and not self.config.use_raw_disk:
                         if not self.config.windows_fio_dir.endswith('/'):
                             self.config.windows_fio_dir += '/'
-                    
+
                     self.config.windows_test_size = fio_win.get('test_size')
                     self.config.windows_test_runtime = parse_optional_runtime(fio_win.get('runtime'))
                     raw_wbs = fio_win.get('block_sizes', '')
@@ -485,30 +677,29 @@ class ConfigLoader:
                     self.config.windows_numjobs = int(fio_win.get('numjobs', 1))
                     self.config.windows_iodepth = int(fio_win.get('iodepth', 1))
                     self.config.windows_direct_io = str(fio_win.get('direct_io', 1))
-                    self.config.windows_fsync = normalize_optional_fsync(fio_win.get('fsync'))
+                    try:
+                        self.config.windows_fsync = normalize_optional_fsync(fio_win.get('fsync'))
+                    except ValueError as e:
+                        raise FioConfigError(str(e)) from e
                     self.config.windows_rate_iops = fio_win.get('rate_iops')
                     if self.config.windows_rate_iops == "null" or not self.config.windows_rate_iops:
                         self.config.windows_rate_iops = None
                     else:
                         if isinstance(self.config.windows_rate_iops, str):
                             self.config.windows_rate_iops = int(self.config.windows_rate_iops)
-                
-                # Load Windows output configuration
+
+                # Load Windows output configuration (directory always forced to OS disk later)
                 output_win = windows_config.get('output_win', {})
                 if output_win:
-                    if self.config.use_testdir:
-                        if output_win.get('directory'):
-                            logger.info(
-                                "TESTDIR MODE: ignoring YAML windows.output_win.directory "
-                                f"(using {WINDOWS_OUTPUT_TESTDIR})"
-                            )
-                        self.config.windows_output_format = output_win.get('format', 'json+')
-                    else:
+                    if output_win.get('directory') and output_win.get('directory') != "null":
                         self.config.windows_output_dir = output_win.get('directory')
-                        if not self.config.windows_output_dir or self.config.windows_output_dir == "null":
-                            raise FioConfigError("CRITICAL: 'windows.output_win.directory' is required for Windows hosts")
-                        self.config.windows_output_format = output_win.get('format', 'json+')
-        
+                    self.config.windows_output_format = output_win.get('format', 'json+')
+                self.config.windows_output_dir = self.config.windows_output_dir or WINDOWS_RESULTS_DIR
+                self.config.windows_output_format = self.config.windows_output_format or "json+"
+            else:
+                self.config.windows_output_dir = WINDOWS_RESULTS_DIR
+                self.config.windows_output_format = self.config.windows_output_format or "json+"
+
         # Load optional timeouts
         timeouts = yaml_data.get('timeouts', {})
         if timeouts:
@@ -537,9 +728,12 @@ class ConfigLoader:
             self.config.vm_hosts.extend(list(self.config.windows_hosts))
             logger.info(f"Total hosts (Linux + Windows): {len(self.config.vm_hosts)}")
         
-        # Validate that at least some hosts are configured
-        if not self.config.vm_hosts:
-            raise FioConfigError("CRITICAL: No hosts configured. Please specify hosts in 'vm' section (Linux) or 'windows' section (Windows)")
+        # Validate that at least some hosts are configured (unless --create-vms will provision)
+        if not self.config.vm_hosts and not self.config.create_vms:
+            raise FioConfigError(
+                "CRITICAL: No hosts configured. Please specify hosts in 'vm' section (Linux) "
+                "or 'windows' section (Windows), or use --create-vms"
+            )
     
     def _get_vm_hosts(self, yaml_data: Dict) -> List[str]:
         """

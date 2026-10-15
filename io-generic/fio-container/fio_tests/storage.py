@@ -64,6 +64,126 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
         logger.info("Storage preparation completed on all hosts (testdir mode)!")
         return
 
+    if config.use_raw_disk:
+        logger.info("RAW DISK MODE: Validating devices and clearing filesystems (no mkfs/mount)...")
+
+        # Validate devices
+        with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
+            futures = []
+            for host in linux_hosts:
+                device = config.storage_devices[host]
+                cmd = (
+                    f"test -b /dev/{device} && echo 'Found block device /dev/{device}' "
+                    f"&& lsblk /dev/{device} || "
+                    f"(echo 'ERROR: Block device /dev/{device} not found' && exit 1)"
+                )
+                futures.append(
+                    pool.submit(executor.execute_prep_command, host, cmd, "Validating raw device")
+                )
+            for host in windows_hosts:
+                device = config.windows_storage_devices.get(host, "1")
+                cmd = (
+                    f"powershell -Command \"Get-Disk -Number {device} | "
+                    f"Select-Object -Property Number,Size,PartitionStyle\""
+                )
+                futures.append(
+                    pool.submit(executor.execute_prep_command, host, cmd, "Validating Windows disk")
+                )
+            for future in as_completed(futures):
+                success, output = future.result()
+                if not success:
+                    logger.error(f"Raw device validation failed: {output}")
+                    sys.exit(1)
+
+        # Linux: unmount any mounts of the device / mount point
+        if linux_hosts:
+            with ThreadPoolExecutor(max_workers=min(len(linux_hosts), config.max_workers)) as pool:
+                futures = []
+                for host in linux_hosts:
+                    device = config.storage_devices[host]
+                    cmd = (
+                        f"device=/dev/{device}; "
+                        f"if findmnt -n \"$device\" >/dev/null 2>&1; then "
+                        f"  echo \"Unmounting $device\"; umount \"$device\" || umount -l \"$device\" || true; "
+                        f"fi; "
+                        f"echo \"Raw device $device ready (no filesystem)\""
+                    )
+                    futures.append(
+                        pool.submit(executor.execute_prep_command, host, cmd, "Unmounting raw device")
+                    )
+                for future in as_completed(futures):
+                    future.result()
+
+        # Windows: clear partitions/volumes so nothing is mounted; keep disk online for PhysicalDrive
+        if windows_hosts:
+            logger.info(
+                "RAW DISK MODE (Windows): Clearing disk partitions "
+                "(destructive — no provision-data-disk.ps1)..."
+            )
+            with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
+                futures = {}
+                for host in windows_hosts:
+                    device = config.windows_storage_devices.get(host, "1")
+                    cmd = (
+                        f"powershell -Command \""
+                        f"$ErrorActionPreference='Stop'; "
+                        f"$d = Get-Disk -Number {device}; "
+                        f"if ($d.IsOffline) {{ Set-Disk -Number {device} -IsOffline $false }}; "
+                        f"if ($d.IsReadOnly) {{ Set-Disk -Number {device} -IsReadOnly $false }}; "
+                        f"Get-Disk -Number {device} | Get-Partition -ErrorAction SilentlyContinue | "
+                        f"  ForEach-Object {{ "
+                        f"    $v = $_ | Get-Volume -ErrorAction SilentlyContinue; "
+                        f"    if ($v -and $v.DriveLetter) {{ "
+                        f"      Get-Volume -DriveLetter $v.DriveLetter | "
+                        f"        Get-Partition | Remove-PartitionAccessPath "
+                        f"        -AccessPath \"$($v.DriveLetter):\\\" -ErrorAction SilentlyContinue "
+                        f"    }} "
+                        f"  }}; "
+                        f"Clear-Disk -Number {device} -RemoveData -Confirm:$false -ErrorAction SilentlyContinue; "
+                        f"Set-Disk -Number {device} -IsOffline $false -ErrorAction SilentlyContinue; "
+                        f"Write-Host 'RAW_DISK_READY'\""
+                    )
+                    futures[
+                        pool.submit(
+                            executor.execute_prep_command,
+                            host,
+                            cmd,
+                            f"Preparing Windows raw disk {device}",
+                        )
+                    ] = host
+                for future in as_completed(futures):
+                    host = futures[future]
+                    success, output = future.result()
+                    if not success:
+                        logger.error(f"{host}: Windows raw disk prep failed: {output}")
+                        sys.exit(1)
+
+        # Results directories only (OS disk)
+        with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
+            futures = []
+            for host in linux_hosts:
+                cmd = f"mkdir -p {config.output_dir}"
+                futures.append(
+                    pool.submit(executor.execute_prep_command, host, cmd, "Creating results directory")
+                )
+            for host in windows_hosts:
+                output_dir_win = normalize_windows_path(config.windows_output_dir)
+                cmd = (
+                    f"powershell -Command \"New-Item -ItemType Directory -Force "
+                    f"-Path '{output_dir_win}'\""
+                )
+                futures.append(
+                    pool.submit(executor.execute_prep_command, host, cmd, "Creating results directory")
+                )
+            for future in as_completed(futures):
+                success, output = future.result()
+                if not success:
+                    logger.error(f"Failed to create results directory: {output}")
+                    sys.exit(1)
+
+        logger.info("Storage preparation completed on all hosts (raw disk mode)!")
+        return
+
     # Step 1: Validate devices (Linux only - Windows uses PowerShell script)
     logger.info("Step 1/7: Validating test devices on all hosts...")
     with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
@@ -398,6 +518,33 @@ def cleanup_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
                     f"-Recurse -Force -ErrorAction SilentlyContinue; "
                     f"Remove-Item -Path '{mount_point_win}/*' -Recurse -Force "
                     f"-ErrorAction SilentlyContinue; Write-Host 'Test results cleanup completed'\""
+                )
+                futures.append(
+                    pool.submit(executor.execute_command, host, cmd, "Cleaning up test results")
+                )
+            for future in as_completed(futures):
+                future.result()
+        logger.info("Storage cleanup completed")
+        return
+
+    if config.use_raw_disk:
+        logger.info("RAW DISK MODE: Cleaning JSON results only (no umount / no wipe of block device)...")
+        with ThreadPoolExecutor(max_workers=min(len(config.vm_hosts), config.max_workers)) as pool:
+            futures = []
+            for host in linux_hosts:
+                cmd = (
+                    f"rm -rf {config.output_dir}/*.json 2>/dev/null || true && "
+                    f"echo 'Test results cleanup completed'"
+                )
+                futures.append(
+                    pool.submit(executor.execute_command, host, cmd, "Cleaning up test results")
+                )
+            for host in windows_hosts:
+                output_dir_win = normalize_windows_path(config.windows_output_dir)
+                cmd = (
+                    f"powershell -Command \"Remove-Item -Path '{output_dir_win}/*' "
+                    f"-Recurse -Force -ErrorAction SilentlyContinue; "
+                    f"Write-Host 'Test results cleanup completed'\""
                 )
                 futures.append(
                     pool.submit(executor.execute_command, host, cmd, "Cleaning up test results")

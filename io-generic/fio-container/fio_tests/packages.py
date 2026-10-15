@@ -119,9 +119,10 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
 
     # Install FIO on Windows hosts (copy from c:\tools\fio to root_dir)
     if windows_hosts:
-        if config.use_testdir:
+        if config.use_testdir or config.use_raw_disk:
+            mode = "TESTDIR" if config.use_testdir else "RAW DISK"
             logger.info(
-                f"TESTDIR MODE: Verifying FIO at c:\\tools\\fio on Windows hosts: {windows_hosts}"
+                f"{mode} MODE: Verifying FIO at c:\\tools\\fio on Windows hosts: {windows_hosts}"
             )
             with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
                 futures = []
@@ -147,7 +148,9 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
                         f"{failed}/{len(windows_hosts)} Windows hosts missing FIO at c:\\tools\\fio"
                     )
                     sys.exit(1)
-            logger.info("FIO verified on all Windows hosts (testdir mode, no copy to data disk)")
+            logger.info(
+                f"FIO verified on all Windows hosts ({mode.lower()} mode, no copy to data disk)"
+            )
         else:
             _ensure_windows_fio_copied_to_data_disk(config, executor, windows_hosts)
 

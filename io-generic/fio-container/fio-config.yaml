@@ -25,6 +25,9 @@ vm:
 # Default runs: format/mount the devices below for FIO test data.
 # OS-disk load instead: pass --testdir to fio-tests.py (Linux /root/testdir,
 # Windows c:/testdir; no format of these devices; Windows uses c:/tools/fio in place).
+# Raw block-device load: pass --raw-disk (FIO --filename=/dev/X or \\.\PhysicalDriveN;
+# no filesystem; DEVICES/WIN_DEVICES still required). Mutually exclusive with --testdir.
+# JSON results always forced to /root/fio-results (Linux) and c:/fio-results (Windows).
 storage:
   # Per-host device configuration (MANDATORY - no global fallback for safety)
   devices:
@@ -92,7 +95,7 @@ description: ""  # Optional: Short description for this test run
 
 # Output Configuration
 output:
-  # Directory to store results on remote hosts
+  # Remote JSON directory (always forced to /root/fio-results on the OS disk)
   directory: "/root/fio-results"
   
   # Output format (json+, normal, etc.)
@@ -198,8 +201,8 @@ windows:
   
   # Windows Output Configuration (required if Windows hosts are specified)
   output_win:
-    # Directory to store results on Windows hosts
-    directory: "d:/fio/results"
+    # Remote JSON directory (always forced to c:/fio-results on the OS disk)
+    directory: "c:/fio-results"
     # Output format (json+, json, normal, etc.)
     format: "json+"
 

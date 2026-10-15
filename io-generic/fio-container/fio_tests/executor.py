@@ -289,7 +289,13 @@ class CommandExecutor:
                 time.sleep(VM_RESTART_WAIT)
                 if wait_accessible and not self.wait_for_host_accessible(host):
                     return False
-                if remount and not self.is_windows_host(host) and host in self.config.storage_devices:
+                if (
+                    remount
+                    and not self.is_windows_host(host)
+                    and host in self.config.storage_devices
+                    and not getattr(self.config, "use_raw_disk", False)
+                    and not getattr(self.config, "use_testdir", False)
+                ):
                     self._remount_after_restart(host)
                 return True
             logger.error(f"{host}: virtctl restart failed: {restart_result.stderr}")
@@ -373,9 +379,10 @@ class CommandExecutor:
             # Flags (-c/--command, -i, --local-ssh-opts) MUST come BEFORE the target.
             # Putting -c after the target yields: "accepts 1 arg(s), received 2".
             user = "Administrator" if self.is_windows_host(host) else "root"
+            identity = getattr(self.config, "ssh_identity_file", None) or "/root/.ssh/id_rsa"
             return [
                 "virtctl", "-n", self.config.namespace, "ssh",
-                "-i", "/root/.ssh/id_rsa",
+                "-i", identity,
                 "--local-ssh-opts=-o StrictHostKeyChecking=no",
                 "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
                 "-c", command,
@@ -384,12 +391,14 @@ class CommandExecutor:
         else:
             # For non-VM hosts, use root for Linux, Administrator for Windows
             user = "Administrator" if self.is_windows_host(host) else "root"
+            identity = getattr(self.config, "ssh_identity_file", None) or "/root/.ssh/id_rsa"
             return [
                 "ssh", "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "ControlMaster=auto",
                 "-o", "ControlPersist=60",
                 "-o", "ControlPath=/tmp/fio-ssh-%r@%h:%p",
+                "-i", identity,
                 f"{user}@{host}", command
             ]
     
@@ -420,12 +429,15 @@ class CommandExecutor:
         
         host = host_match.group(1)
         
+        identity = getattr(self.config, "ssh_identity_file", None) or "/root/.ssh/id_rsa"
         if self.is_vm_host(host):
             if not self.config.namespace or self.config.namespace == "N/A":
                 raise ValueError(f"NAMESPACE is not set but host '{host}' is detected as a VM")
             return [
                 "virtctl", "-n", self.config.namespace, "scp",
+                "-i", identity,
                 "--local-ssh-opts=-o StrictHostKeyChecking=no",
+                "--local-ssh-opts=-o UserKnownHostsFile=/dev/null",
                 source, destination
             ]
         else:
@@ -435,6 +447,7 @@ class CommandExecutor:
             return [
                 "scp", "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
+                "-i", identity,
                 ssh_source, destination
             ]
     
@@ -610,9 +623,14 @@ class CommandExecutor:
             vm_restarted = True
 
             # Drive letter is often gone until the data disk is provisioned again
+            # (skip for raw-disk / testdir — no data-drive letter expected)
             if (
-                self._is_windows_drive_missing(stderr, stdout)
-                or "creating test directories" in description.lower()
+                not getattr(self.config, "use_raw_disk", False)
+                and not getattr(self.config, "use_testdir", False)
+                and (
+                    self._is_windows_drive_missing(stderr, stdout)
+                    or "creating test directories" in description.lower()
+                )
             ):
                 self._reprovision_windows_data_disk(host)
             return True

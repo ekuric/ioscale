@@ -1,0 +1,41 @@
+# Linux VirtualMachine template (clone from source DV + optional blank data disk).
+# Placeholders filled by fio_tests.provision. Optional data-disk blocks are
+# injected when attach_data_disk=true (not --testdir).
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ${vm_name}
+  namespace: ${namespace}
+  labels:
+    fio-container.ioscale/managed: "true"
+    fio-container.ioscale/os: linux
+    fio-container.ioscale/run: "${run_id}"
+spec:
+  runStrategy: RerunOnFailure
+  dataVolumeTemplates: []  # filled programmatically
+  template:
+    metadata:
+      labels:
+        fio-container.ioscale/managed: "true"
+        fio-container.ioscale/os: linux
+        fio-container.ioscale/run: "${run_id}"
+    spec:
+      architecture: amd64
+      domain:
+        cpu:
+          cores: ${vm_cpu}
+        resources:
+          requests:
+            memory: ${vm_memory}
+        devices:
+          disks: []  # filled programmatically
+          interfaces:
+          - name: default
+            masquerade: {}
+            bootOrder: 2
+        machine:
+          type: pc-q35-rhel9.4.0
+      networks:
+      - name: default
+        pod: {}
+      volumes: []  # filled programmatically

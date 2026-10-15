@@ -5,68 +5,109 @@ pipeline {
         disableConcurrentBuilds()
     }
 
+    // Parameter groups (Jenkins shows them in this order on "Build with Parameters"):
+    //   1. Test        2. Bastion/cluster   3. FIO harness image
+    //   4. Disk target 5. VM provision      6. Existing hosts (if not creating)
+    //   7. Workload    8. Resilience/migration
     parameters {
-        // ---------------------------------------------------------------------------
-        // Target selection
-        // CLUSTER=lab1/lab2 → uses profile map in "Resolve Target" (ignores fields below)
-        // CLUSTER=custom   → uses the editable string fields below (type any value)
-        // ---------------------------------------------------------------------------
-        choice(
-            name: 'CLUSTER',
-            choices: [
-                'custom',
-                'lab1',
-                'lab2'
-            ],
-            description: 'custom = type bastion/key/API below. lab1/lab2 = use built-in profile (edit profiles map in Jenkinsfile).'
-        )
-        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP (CLUSTER=custom)')
-        string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host (CLUSTER=custom)')
-        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for bastion SSH key (CLUSTER=custom)')
-        string(name: 'API_URL',           defaultValue: 'https://api.ocp.example.com:6443', description: 'OpenShift/Kubernetes API URL (CLUSTER=custom)')
-        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/fio-benchmark:latest', description: 'Container image to run (CLUSTER=custom; lab profiles may override)')
-        string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace for the VMs')
-
-        string(name: 'WIN_HOST_PATTERN',  defaultValue: 'win-vm-{1..10}',     description: 'Windows VM host pattern')
-        string(name: 'WIN_DEVICES',       defaultValue: '',                   description: 'Device mapping (pattern=diskid). Leave empty when USE_TESTDIR=true (OS disk / c:/testdir)')
-
-        string(name: 'WIN_TEST_SIZE',     defaultValue: '10GB',               description: 'FIO test file size')
-        string(name: 'WIN_RUNTIME',       defaultValue: '300',                 description: 'Test runtime in seconds (leave empty = size-based: write full WIN_TEST_SIZE then stop)')
-        string(name: 'WIN_BLOCK_SIZES',   defaultValue: '4k 8k 128k 1024k',  description: 'Block sizes (space-separated)')
-        string(name: 'WIN_IO_PATTERNS',   defaultValue: 'read write randread randwrite randrw', description: 'I/O patterns (space-separated)')
-        string(name: 'WIN_NUMJOBS',       defaultValue: '1',                  description: 'Number of parallel FIO jobs')
-        string(name: 'WIN_IODEPTH',       defaultValue: '16',                 description: 'I/O depth')
-        choice(
-            name: 'WIN_DIRECT_IO',
-            choices: ['1', '0'],
-            description: 'Direct I/O (1=yes, 0=no)'
+        // ----- 1. Test identity -----
+        string(
+            name: 'DESCRIPTION',
+            defaultValue: 'jenkins-fio-windows',
+            description: '[1. Test] Run name (results dir / logs)'
         )
         string(
-            name: 'WIN_FSYNC',
-            defaultValue: '',
-            description: 'FIO fsync interval (empty=disabled; e.g. 1 or 32 → --fsync=N after every N writes)'
+            name: 'NAMESPACE',
+            defaultValue: 'default',
+            description: '[1. Test] OpenShift namespace for VMs'
         )
-        string(name: 'WIN_RATE_IOPS',     defaultValue: '',                   description: 'IOPS rate limit (empty = unlimited)')
 
-        string(name: 'INTERVAL',           defaultValue: '30',                  description: 'Seconds between failed ssh command attempts')
-        string(name: 'MAX_RETRIES',       defaultValue: '10',                  description: 'Maximum number of failed ssh command attempts')
-        string(name: 'MONITOR_INTERVAL',  defaultValue: '60',                  description: 'Seconds between task monitor checks')
-        string(name: 'KUBEADMIN_PASSWORD', defaultValue: '',                   description: 'Kubernetes admin password')
-
-        string(name: 'MIGRATE_WORKLOADS', defaultValue: '',                    description: 'I/O patterns triggering VM migration (empty = no migration)')
-        string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
+        // ----- 2. Bastion / cluster -----
         choice(
-            name: 'MONITOR_VM',
-            choices: ['false', 'true'],
-            description: 'Monitor VM node placement during tests and log migrations'
+            name: 'CLUSTER',
+            choices: ['custom', 'lab1', 'lab2'],
+            description: '[2. Bastion] Profile: custom = fields below; lab1/lab2 = built-in map in Resolve Target'
         )
-        string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',               description: 'VM migration monitor polling interval in seconds')
-        string(name: 'DESCRIPTION',       defaultValue: 'jenkins-fio-windows', description: 'Test run description')
+        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: '[2. Bastion] Hostname/IP (CLUSTER=custom)')
+        string(name: 'BASTION_USER',      defaultValue: 'root',                description: '[2. Bastion] SSH user (CLUSTER=custom)')
+        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: '[2. Bastion] Jenkins SSH credential ID (CLUSTER=custom)')
+        string(name: 'API_URL',           defaultValue: 'https://api.ocp.example.com:6443', description: '[2. Bastion] Cluster API URL (CLUSTER=custom)')
+        string(name: 'KUBEADMIN_PASSWORD', defaultValue: '',                   description: '[2. Bastion] Optional oc login password')
+
+        // ----- 3. FIO harness (podman image that runs fio-tests) -----
+        string(
+            name: 'CONTAINER_IMAGE',
+            defaultValue: 'quay.io/ekuric/fio-benchmark:latest',
+            description: '[3. Harness] fio-container image (not the guest VM OS image)'
+        )
+
+        // ----- 4. Disk target mode -----
         choice(
             name: 'USE_TESTDIR',
             choices: ['false', 'true'],
-            description: 'OS-disk FIO on c:/testdir (no data-disk provision; FIO from c:/tools/fio; pass --testdir)'
+            description: '[4. Disk] OS-disk FIO (c:/testdir). Mutually exclusive with USE_RAW_DISK'
         )
+        choice(
+            name: 'USE_RAW_DISK',
+            choices: ['false', 'true'],
+            description: '[4. Disk] Raw PhysicalDrive FIO. Mutually exclusive with USE_TESTDIR'
+        )
+
+        // ----- 5. On-demand VM provision -----
+        choice(
+            name: 'CREATE_VMS',
+            choices: ['false', 'true'],
+            description: '[5. Create VMs] Provision guests before FIO (leave WIN_HOST_PATTERN empty; needs STORAGE_CLASS + WIN_VM_IMAGE)'
+        )
+        choice(
+            name: 'CLEANUP',
+            choices: ['false', 'true'],
+            description: '[5. Create VMs] Delete managed VMs after test (default keep; next create still wipes leftovers)'
+        )
+        string(name: 'WIN_VMS',              defaultValue: '3',               description: '[5. Create VMs] Number of Windows VMs')
+        string(name: 'WIN_VM_PREFIX',        defaultValue: 'fio-windows',     description: '[5. Create VMs] Name prefix → fio-windows-1..N')
+        string(name: 'WIN_VM_CPU',           defaultValue: '2',               description: '[5. Create VMs] vCPU cores')
+        string(name: 'WIN_VM_MEMORY',        defaultValue: '4Gi',             description: '[5. Create VMs] Memory')
+        string(
+            name: 'WIN_VM_IMAGE',
+            defaultValue: '',
+            description: '[5. Create VMs] Guest OS image HTTP URL (required if CREATE_VMS)'
+        )
+        string(name: 'STORAGE_CLASS',        defaultValue: '',               description: '[5. Create VMs] StorageClass (required if CREATE_VMS=true)')
+        string(name: 'WIN_ROOT_VOLUME_SIZE', defaultValue: '60Gi',           description: '[5. Create VMs] Root PVC size')
+        string(name: 'DATA_DISK_SIZE',       defaultValue: '40Gi',           description: '[5. Create VMs] Blank data disk (skipped if USE_TESTDIR)')
+
+        // ----- 6. Existing hosts (CREATE_VMS=false) -----
+        string(
+            name: 'WIN_HOST_PATTERN',
+            defaultValue: '',
+            description: '[6. Existing hosts] Pre-created VMs, e.g. win-vm-{1..10}. Empty when CREATE_VMS=true'
+        )
+        string(
+            name: 'WIN_DEVICES',
+            defaultValue: '',
+            description: '[6. Existing hosts] pattern=diskid. Empty for testdir/create-vms'
+        )
+
+        // ----- 7. FIO workload -----
+        string(name: 'WIN_TEST_SIZE',     defaultValue: '10GB',              description: '[7. Workload] Dataset / job --size')
+        string(name: 'WIN_RUNTIME',       defaultValue: '300',               description: '[7. Workload] Perf runtime seconds (empty = size-based)')
+        string(name: 'WIN_BLOCK_SIZES',   defaultValue: '4k 8k 128k 1024k', description: '[7. Workload] Block sizes')
+        string(name: 'WIN_IO_PATTERNS',   defaultValue: 'read write randread randwrite randrw', description: '[7. Workload] I/O patterns')
+        string(name: 'WIN_NUMJOBS',       defaultValue: '1',                 description: '[7. Workload] Parallel jobs')
+        string(name: 'WIN_IODEPTH',       defaultValue: '16',                description: '[7. Workload] Queue depth')
+        choice(name: 'WIN_DIRECT_IO',     choices: ['1', '0'],               description: '[7. Workload] Direct I/O')
+        string(name: 'WIN_FSYNC',         defaultValue: '',                  description: '[7. Workload] --fsync=N (empty=off)')
+        string(name: 'WIN_RATE_IOPS',     defaultValue: '',                  description: '[7. Workload] Optional IOPS cap')
+
+        // ----- 8. Resilience / migration -----
+        string(name: 'INTERVAL',            defaultValue: '30',               description: '[8. Resilience] SSH retry interval (s)')
+        string(name: 'MAX_RETRIES',         defaultValue: '10',               description: '[8. Resilience] SSH max retries')
+        string(name: 'MONITOR_INTERVAL',    defaultValue: '60',               description: '[8. Resilience] Task monitor interval (s)')
+        string(name: 'MIGRATE_WORKLOADS',   defaultValue: '',                description: '[8. Resilience] Patterns that trigger live migrate')
+        string(name: 'MIGRATE_INTERVAL',    defaultValue: '0',               description: '[8. Resilience] Seconds between migrations (0=parallel)')
+        choice(name: 'MONITOR_VM',          choices: ['false', 'true'],      description: '[8. Resilience] Log VM node placement')
+        string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',              description: '[8. Resilience] Placement poll interval (s)')
     }
 
     environment {
@@ -77,7 +118,6 @@ pipeline {
         stage('Resolve Target') {
             steps {
                 script {
-                    // Edit this map when you add/remove labs. CLUSTER=custom uses the string parameters as-is.
                     def profiles = [
                         lab1: [
                             bastionHost     : 'bastion.lab1.example.com',
@@ -102,14 +142,14 @@ pipeline {
                         env.RESOLVED_SSH_CREDENTIAL_ID = p.sshCredentialId
                         env.RESOLVED_API_URL           = p.apiUrl
                         env.RESOLVED_CONTAINER_IMAGE   = p.containerImage
-                        echo "CLUSTER=${params.CLUSTER} → bastion=${p.bastionHost}, key=${p.sshCredentialId}, api=${p.apiUrl}"
+                        echo "CLUSTER=${params.CLUSTER} → bastion=${p.bastionHost}, harness=${p.containerImage}"
                     } else {
                         env.RESOLVED_BASTION_HOST      = params.BASTION_HOST
                         env.RESOLVED_BASTION_USER      = params.BASTION_USER
                         env.RESOLVED_SSH_CREDENTIAL_ID = params.SSH_CREDENTIAL_ID
                         env.RESOLVED_API_URL           = params.API_URL
                         env.RESOLVED_CONTAINER_IMAGE   = params.CONTAINER_IMAGE
-                        echo "CLUSTER=custom → using parameters: bastion=${params.BASTION_HOST}, key=${params.SSH_CREDENTIAL_ID}, api=${params.API_URL}"
+                        echo "CLUSTER=custom → bastion=${params.BASTION_HOST}, harness=${params.CONTAINER_IMAGE}"
                     }
 
                     env.BASTION_CONN = "${env.RESOLVED_BASTION_USER}@${env.RESOLVED_BASTION_HOST}"
@@ -127,7 +167,6 @@ pipeline {
                             test -s /root/.kube/config || { echo "ERROR: /root/.kube/config missing on bastion"; exit 1; }
                             oc whoami || { echo "ERROR: oc whoami failed on bastion"; exit 1; }
                             podman pull ${RESOLVED_CONTAINER_IMAGE} || true
-                            # Verify kubeconfig is visible inside the container (SELinux-safe mount)
                             podman run --rm --privileged \
                               -v /root/.kube:/root/.kube:ro,Z \
                               -e KUBECONFIG=/root/.kube/config \
@@ -145,11 +184,24 @@ pipeline {
                 sshagent(credentials: [env.RESOLVED_SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            mkdir -p /tmp/fio-ssh
                             podman run --rm --pids-limit=-1 --privileged \
-                              -e WIN_HOST_PATTERN="${params.WIN_HOST_PATTERN}" \
-                              -e USE_TESTDIR="${params.USE_TESTDIR}" \
-                              -e WIN_DEVICES="${params.WIN_DEVICES}" \
+                              -e DESCRIPTION="${params.DESCRIPTION}" \
                               -e NAMESPACE="${params.NAMESPACE}" \
+                              -e USE_TESTDIR="${params.USE_TESTDIR}" \
+                              -e USE_RAW_DISK="${params.USE_RAW_DISK}" \
+                              -e CREATE_VMS="${params.CREATE_VMS}" \
+                              -e CLEANUP="${params.CLEANUP}" \
+                              -e WIN_VMS="${params.WIN_VMS}" \
+                              -e WIN_VM_PREFIX="${params.WIN_VM_PREFIX}" \
+                              -e WIN_VM_CPU="${params.WIN_VM_CPU}" \
+                              -e WIN_VM_MEMORY="${params.WIN_VM_MEMORY}" \
+                              -e WIN_VM_IMAGE="${params.WIN_VM_IMAGE}" \
+                              -e STORAGE_CLASS="${params.STORAGE_CLASS}" \
+                              -e WIN_ROOT_VOLUME_SIZE="${params.WIN_ROOT_VOLUME_SIZE}" \
+                              -e DATA_DISK_SIZE="${params.DATA_DISK_SIZE}" \
+                              -e WIN_HOST_PATTERN="${params.WIN_HOST_PATTERN}" \
+                              -e WIN_DEVICES="${params.WIN_DEVICES}" \
                               -e WIN_TEST_SIZE="${params.WIN_TEST_SIZE}" \
                               -e WIN_RUNTIME="${params.WIN_RUNTIME}" \
                               -e WIN_BLOCK_SIZES="${params.WIN_BLOCK_SIZES}" \
@@ -168,11 +220,11 @@ pipeline {
                               -e MONITOR_VM_INTERVAL=${params.MONITOR_VM_INTERVAL} \
                               -e KUBEADMIN_PASSWORD="${params.KUBEADMIN_PASSWORD}" \
                               -e API_URL="${RESOLVED_API_URL}" \
-                              -e DESCRIPTION="${params.DESCRIPTION}" \
                               -e KUBECONFIG=/root/.kube/config \
                               -v ${RESULTS_DIR}:/work/results:Z \
                               -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro,Z \
                               -v /root/.kube:/root/.kube:ro,Z \
+                              -v /tmp/fio-ssh:/host-tmp:Z \
                               ${RESOLVED_CONTAINER_IMAGE}
                         '
                     """
@@ -207,15 +259,13 @@ pipeline {
             echo "FIO Windows test failed. Check the console output for details."
         }
         always {
-            echo "Cluster: ${params.CLUSTER}"
-            echo "Bastion: ${env.BASTION_CONN ?: '(not resolved)'}"
-            echo "SSH credential: ${env.RESOLVED_SSH_CREDENTIAL_ID ?: params.SSH_CREDENTIAL_ID}"
-            echo "API URL: ${env.RESOLVED_API_URL ?: params.API_URL}"
-            echo "Test description: ${params.DESCRIPTION}"
-            echo "Hosts: ${params.WIN_HOST_PATTERN}"
-            echo "Block sizes: ${params.WIN_BLOCK_SIZES}"
-            echo "I/O patterns: ${params.WIN_IO_PATTERNS}"
-            echo "Numjobs: ${params.WIN_NUMJOBS}, Iodepth: ${params.WIN_IODEPTH}, Fsync: ${params.WIN_FSYNC ?: '(disabled)'}"
+            echo "Test: ${params.DESCRIPTION}  ns=${params.NAMESPACE}"
+            echo "Bastion: ${env.BASTION_CONN ?: '(not resolved)'}  cluster=${params.CLUSTER}"
+            echo "Harness: ${env.RESOLVED_CONTAINER_IMAGE ?: params.CONTAINER_IMAGE}"
+            echo "Create VMs: ${params.CREATE_VMS} count=${params.WIN_VMS} prefix=${params.WIN_VM_PREFIX} image=${params.WIN_VM_IMAGE}"
+            echo "Disk: testdir=${params.USE_TESTDIR} raw=${params.USE_RAW_DISK} cleanup=${params.CLEANUP}"
+            echo "Existing hosts: ${params.WIN_HOST_PATTERN ?: '(none)'}"
+            echo "Workload: bs=${params.WIN_BLOCK_SIZES} patterns=${params.WIN_IO_PATTERNS} jobs=${params.WIN_NUMJOBS}"
         }
     }
 }

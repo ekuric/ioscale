@@ -1,0 +1,26 @@
+# Source DataVolume for Windows VMs (HTTP image URL). Applied by fio_tests.provision.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ${dv_name}
+  namespace: ${namespace}
+  labels:
+    fio-container.ioscale/managed: "true"
+    fio-container.ioscale/os: windows
+    fio-container.ioscale/run: "${run_id}"
+    fio-container.ioscale/role: source-dv
+  annotations:
+    cdi.kubevirt.io/storage.deleteAfterCompletion: "false"
+    cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+spec:
+  source:
+    http:
+      url: "${vm_image}"
+  storage:
+    accessModes:
+    - ${access_mode}
+    volumeMode: Block
+    resources:
+      requests:
+        storage: ${storage_size}
+    storageClassName: ${storage_class}

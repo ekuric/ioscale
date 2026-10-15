@@ -14,6 +14,8 @@ from fio_tests.config import (
     ConfigLoader,
     FioConfigError,
     FioTestConfig,
+    apply_fixed_result_paths,
+    apply_raw_disk_overrides,
     apply_testdir_overrides,
 )
 from fio_tests.dataset import write_test_data
@@ -21,6 +23,7 @@ from fio_tests.executor import CommandExecutor
 from fio_tests.fio_run import run_fio_tests
 from fio_tests.migration import VMMigrationMonitor, run_migration_report
 from fio_tests.packages import ensure_packages_installed, prepare_machine
+from fio_tests.provision import cleanup_provisioned, provision_vms, remove_ssh_key_dir
 from fio_tests.results import collect_results, generate_combined_results
 from fio_tests.storage import cleanup_storage, prepare_storage
 
@@ -99,8 +102,12 @@ def main():
         description="FIO Remote Testing Script (Python version)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Example (OS-disk load on /root/testdir or c:/testdir, no data-disk format):\n"
-            "  python3 fio-tests.py -c fio-config.yaml --testdir --yes-i-mean-it"
+            "Examples:\n"
+            "  python3 fio-tests.py -c fio-config.yaml --testdir --yes-i-mean-it\n"
+            "  python3 fio-tests.py -c fio-config.yaml --raw-disk --yes-i-mean-it\n"
+            "  python3 fio-tests.py -c fio-config.yaml --create-vms --vms 5 "
+            "--storage-class ocs-storagecluster-ceph-rbd --cleanup\n"
+            "JSON results always go to /root/fio-results (Linux) and c:/fio-results (Windows)."
         ),
     )
     parser.add_argument('-c', '--config', default='fio-config.yaml',
@@ -142,10 +149,68 @@ def main():
         action='store_true',
         help=(
             'Run FIO on OS disk: Linux /root/testdir, Windows c:/testdir; '
-            'use c:/tools/fio in place (no copy to data disk); results on '
-            'c:/fio-results. Skips format/mount/provision of YAML storage devices.'
+            'use c:/tools/fio in place (no copy to data disk). '
+            'Skips format/mount/provision of YAML storage devices. '
+            'Mutually exclusive with --raw-disk. '
+            'JSON results always on /root/fio-results and c:/fio-results.'
         ),
     )
+    parser.add_argument(
+        '--raw-disk',
+        action='store_true',
+        help=(
+            'Run FIO against the attached data disk as a raw block device '
+            '(Linux --filename=/dev/X, Windows --filename=\\\\.\\PhysicalDriveN); '
+            'no filesystem format/mount/provision. Requires DEVICES/WIN_DEVICES. '
+            'Mutually exclusive with --testdir. '
+            'JSON results always on /root/fio-results and c:/fio-results.'
+        ),
+    )
+    # On-demand VM provision
+    parser.add_argument(
+        '--create-vms',
+        action='store_true',
+        help=(
+            'Create Linux/Windows VMs in the cluster before testing '
+            '(ephemeral SSH key in /tmp; wipes prior managed VMs first). '
+            'Requires --storage-class and --vms and/or --win-vms.'
+        ),
+    )
+    parser.add_argument(
+        '--cleanup',
+        action='store_true',
+        help='Delete managed VMs/DataVolumes after the test (default: keep)',
+    )
+    parser.add_argument('--vms', type=int, default=None, help='Number of Linux VMs to create')
+    parser.add_argument('--win-vms', type=int, default=None, help='Number of Windows VMs to create')
+    parser.add_argument('--vm-cpu', default=None, help='Linux VM CPU cores (default: 2)')
+    parser.add_argument('--vm-memory', default=None, help='Linux VM memory (default: 4Gi)')
+    parser.add_argument('--win-vm-cpu', default=None, help='Windows VM CPU cores (default: same as --vm-cpu)')
+    parser.add_argument('--win-vm-memory', default=None, help='Windows VM memory (default: same as --vm-memory)')
+    parser.add_argument(
+        '--vm-image',
+        default=None,
+        help='Linux containerdisk image (default: quay.io/containerdisks/fedora:41)',
+    )
+    parser.add_argument(
+        '--win-vm-image',
+        default=None,
+        help='Windows image HTTP URL (required when --win-vms > 0)',
+    )
+    parser.add_argument('--storage-class', default=None, help='StorageClass for root/data volumes')
+    parser.add_argument('--access-mode', default=None, help='PVC access mode (default: ReadWriteMany)')
+    parser.add_argument('--root-volume-size', default=None, help='Linux root volume size (default: 20Gi)')
+    parser.add_argument('--data-disk-size', default=None, help='Data disk size (default: 40Gi)')
+    parser.add_argument('--win-root-volume-size', default=None, help='Windows root volume size (default: 76Gi)')
+    parser.add_argument('--win-data-disk-size', default=None, help='Windows data disk size (default: 40Gi)')
+    parser.add_argument('--vm-prefix', default=None, help='Linux VM name prefix (default: fio-linux)')
+    parser.add_argument('--win-vm-prefix', default=None, help='Windows VM name prefix (default: fio-win)')
+    parser.add_argument(
+        '--ssh-key-path',
+        default=None,
+        help='Directory for ephemeral SSH keypair (default: /tmp/fio-ssh-<runid>)',
+    )
+    parser.add_argument('--namespace', default=None, help='Override OpenShift namespace for VMs')
 
     args = parser.parse_args()
     
@@ -154,6 +219,10 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
     
     logger.info("Starting FIO remote testing script (Python version)")
+
+    if args.testdir and args.raw_disk:
+        logger.error("CRITICAL: --testdir and --raw-disk are mutually exclusive")
+        return 1
     
     # Initialize configuration
     config = FioTestConfig()
@@ -170,12 +239,50 @@ def main():
     config.migration_report = args.migration_report
     config.max_workers_cli = args.max_workers
     config.use_testdir = args.testdir
+    config.use_raw_disk = args.raw_disk
+    config.create_vms = args.create_vms
+    config.cleanup_vms = args.cleanup
+    if args.vms is not None:
+        config.vms_count = args.vms
+    if args.win_vms is not None:
+        config.win_vms_count = args.win_vms
+    if args.vm_cpu is not None:
+        config.vm_cpu = args.vm_cpu
+    if args.vm_memory is not None:
+        config.vm_memory = args.vm_memory
+    if args.win_vm_cpu is not None:
+        config.win_vm_cpu = args.win_vm_cpu
+    if args.win_vm_memory is not None:
+        config.win_vm_memory = args.win_vm_memory
+    if args.vm_image is not None:
+        config.vm_image = args.vm_image
+    if args.win_vm_image is not None:
+        config.win_vm_image = args.win_vm_image
+    if args.storage_class is not None:
+        config.storage_class = args.storage_class
+    if args.access_mode is not None:
+        config.access_mode = args.access_mode
+    if args.root_volume_size is not None:
+        config.root_volume_size = args.root_volume_size
+    if args.data_disk_size is not None:
+        config.data_disk_size = args.data_disk_size
+    if args.win_root_volume_size is not None:
+        config.win_root_volume_size = args.win_root_volume_size
+    if args.win_data_disk_size is not None:
+        config.win_data_disk_size = args.win_data_disk_size
+    if args.vm_prefix is not None:
+        config.vm_prefix = args.vm_prefix
+    if args.win_vm_prefix is not None:
+        config.win_vm_prefix = args.win_vm_prefix
+    if args.ssh_key_path is not None:
+        config.ssh_key_path = args.ssh_key_path
 
     # Load configuration (YAML sets defaults)
     try:
         config_loader = ConfigLoader(config)
         config_loader.load_config()
-        apply_testdir_overrides(config)
+        if args.namespace:
+            config.namespace = args.namespace
 
         # Override config values with command-line arguments after loading YAML
         # (CLI args take precedence over YAML config)
@@ -191,36 +298,83 @@ def main():
         # Handle migration-report mode (early exit, no FIO testing needed)
         if config.migration_report:
             return run_migration_report(config)
-        
-        # Set up log file with description in filename
+
+        # Set up log file early so provision + wait appear in the same run log
         log_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
         sanitized_desc = re.sub(r'[^a-z0-9]', '_', config.description.lower()) if config.description else ""
         sanitized_desc = re.sub(r'_+', '_', sanitized_desc).strip('_')
-        
+
         if sanitized_desc:
             log_file = f"fio-test-{sanitized_desc}-{log_timestamp}.txt"
         else:
             log_file = f"fio-test-{log_timestamp}.txt"
-        
-        # Add file handler
+
         file_handler = logging.FileHandler(log_file)
         file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s',
                                                     datefmt='%Y-%m-%d %H:%M:%S'))
         logging.getLogger().addHandler(file_handler)
-        
+
         logger.info(f"Logging all output to: {log_file}")
-        
-        # Add description to log file header
         if config.description:
             logger.info("=" * 80)
             logger.info(f"TEST DESCRIPTION: {config.description}")
             logger.info("=" * 80)
+
+        # Phase 1: provision + wait Ready/SSH BEFORE any guest mkdir / FIO work
+        # (skip for copy-results — expects existing VMs)
+        if config.create_vms and not config.copy_results:
+            if config.use_virtctl is False:
+                logger.error("CRITICAL: --create-vms requires virtctl mode (not --ssh-only)")
+                return 1
+            logger.info("=" * 80)
+            logger.info(
+                "PHASE 1/5: Provision VMs "
+                f"(linux={config.vms_count}, windows={config.win_vms_count}) "
+                "— wait until Ready and SSH before continuing"
+            )
+            logger.info("=" * 80)
+            provision_vms(config)
+            logger.info(
+                f"PHASE 1 complete: hosts ready: {' '.join(config.vm_hosts)}"
+            )
+
+        apply_testdir_overrides(config)
+        apply_raw_disk_overrides(config)
+        apply_fixed_result_paths(config)
+
+        if not config.vm_hosts and not config.dry_run:
+            raise FioConfigError(
+                "CRITICAL: No hosts configured after load/provision"
+            )
         
+        # Ensure Windows FIO defaults when hosts were provisioned without YAML windows.fio_win
+        if config.get_windows_hosts():
+            if not config.windows_test_size:
+                config.windows_test_size = config.test_size or "10GB"
+            if not config.windows_block_sizes:
+                config.windows_block_sizes = list(config.block_sizes) if config.block_sizes else ["4k", "8k", "128k"]
+            if not config.windows_io_patterns:
+                config.windows_io_patterns = list(config.io_patterns) if config.io_patterns else [
+                    "randread", "randwrite", "read", "write"
+                ]
+            if not config.windows_output_format:
+                config.windows_output_format = "json+"
+            if not config.windows_fio_dir:
+                if config.use_testdir or config.use_raw_disk:
+                    config.windows_fio_dir = "c:/tools/fio/"
+                else:
+                    config.windows_fio_dir = "d:/fio/"
+
         # Check dependencies
         check_dependencies(config)
     except FioConfigError as e:
         logger.error(str(e))
+        # Keep bastion /tmp mirror if provision already created VMs (inspection)
+        remove_ssh_key_dir(getattr(config, "ssh_key_path", None), also_bastion_mirror=False)
         return 1
+    except Exception:
+        remove_ssh_key_dir(getattr(config, "ssh_key_path", None), also_bastion_mirror=False)
+        raise
     
     # Display configuration
     logger.info(f"Configuration loaded from: {config.config_file}")
@@ -229,19 +383,44 @@ def main():
         logger.info(f"Namespace: {config.namespace}")
     else:
         logger.info("Namespace: N/A (SSH-only mode)")
+    if config.create_vms:
+        logger.info(
+            f"Provision mode: create-vms "
+            f"(linux={config.vms_count}, windows={config.win_vms_count}, "
+            f"cleanup_after={'yes' if config.cleanup_vms else 'no/keep'})"
+        )
+        logger.info(f"SSH identity file: {config.ssh_identity_file}")
+        if getattr(config, "ssh_key_bastion_path", None):
+            logger.info(
+                f"Bastion SSH key (for virtctl from host): "
+                f"{config.ssh_key_bastion_path}/id_ed25519"
+            )
     
     linux_hosts = config.get_linux_hosts()
     windows_hosts = config.get_windows_hosts()
+
+    if linux_hosts:
+        logger.info(f"Linux FIO JSON directory: {config.output_dir}")
+    if windows_hosts:
+        logger.info(f"Windows FIO JSON directory: {config.windows_output_dir}")
 
     if config.use_testdir:
         logger.info("Storage: TESTDIR MODE (OS disk — YAML storage devices not used)")
         if linux_hosts:
             logger.info(f"  Linux FIO data directory: {config.mount_point}")
-            logger.info(f"  Linux results directory: {config.output_dir}")
         if windows_hosts:
             logger.info(f"  Windows FIO data directory: {config.windows_mount_point}")
             logger.info(f"  Windows FIO directory: {config.windows_fio_dir}")
-            logger.info(f"  Windows results directory: {config.windows_output_dir}")
+    elif config.use_raw_disk:
+        logger.info("Storage: RAW DISK MODE (no filesystem — FIO --filename= block device)")
+        for host in linux_hosts:
+            device = config.storage_devices.get(host, "N/A")
+            logger.info(f"  {host} (Linux): /dev/{device}")
+        for host in windows_hosts:
+            device = config.windows_storage_devices.get(host, "N/A")
+            logger.info(f"  {host} (Windows): PhysicalDrive{device}")
+        if windows_hosts:
+            logger.info(f"  Windows FIO directory: {config.windows_fio_dir}")
     else:
         logger.info(f"Storage device configuration:")
         for host in linux_hosts:
@@ -303,24 +482,43 @@ def main():
     
     if config.dry_run:
         logger.info("DRY RUN MODE: Configuration validated successfully")
+        if config.create_vms:
+            logger.info(
+                f"Would provision VMs: linux={config.vms_count}, windows={config.win_vms_count}, "
+                f"storage_class={config.storage_class}, cleanup_after={config.cleanup_vms}"
+            )
         if config.copy_results:
             logger.info("Would execute the following steps:")
             logger.info("  1. Collect test results from all VMs")
             logger.info("  2. Copy log file to results directory (if found)")
         else:
             logger.info("Would execute the following steps:")
+            step = 1
+            if config.create_vms:
+                logger.info(f"  {step}. Create managed VMs (wipe prior managed leftovers first)")
+                step += 1
             if config.fio_installed:
-                logger.info("  1. Skip FIO package check on Linux VMs (fio_installed=true)")
+                logger.info(f"  {step}. Skip FIO package check on Linux VMs (fio_installed=true)")
             else:
-                logger.info("  1. Install FIO and dependencies on VMs")
+                logger.info(f"  {step}. Install FIO and dependencies on VMs")
+            step += 1
             if config.use_testdir:
-                logger.info("  2. Create test directories on OS disk (testdir mode, no format)")
+                logger.info(f"  {step}. Create test directories on OS disk (testdir mode, no format)")
+            elif config.use_raw_disk:
+                logger.info(f"  {step}. Prepare raw disks (validate/unmount/clear FS, no mkfs)")
             else:
-                logger.info("  2. Prepare storage (format and mount devices)")
-            logger.info("  3. Write initial test dataset")
-            logger.info("  4. Run FIO performance tests")
-            logger.info("  5. Collect test results")
-            logger.info("  6. Clean up test environment")
+                logger.info(f"  {step}. Prepare storage (format and mount devices)")
+            step += 1
+            logger.info(f"  {step}. Write initial test dataset")
+            step += 1
+            logger.info(f"  {step}. Run FIO performance tests")
+            step += 1
+            logger.info(f"  {step}. Collect test results")
+            step += 1
+            logger.info(f"  {step}. Clean up test environment")
+            if config.create_vms and config.cleanup_vms:
+                step += 1
+                logger.info(f"  {step}. Delete managed VMs/DataVolumes (--cleanup)")
         return 0
     
     # Handle copy-results mode
@@ -416,6 +614,24 @@ def main():
                 "Test artifacts under those paths may be removed during cleanup. "
                 "YAML storage devices will NOT be formatted."
             )
+        elif config.use_raw_disk:
+            logger.warning(
+                "WARNING: RAW DISK MODE — FIO will overwrite the entire block device "
+                "(no filesystem). All data on the listed devices will be destroyed."
+            )
+            logger.warning(f"Hosts: {' '.join(config.vm_hosts)}")
+            logger.warning("Raw devices:")
+            for host in config.vm_hosts:
+                if executor.is_windows_host(host):
+                    device = config.windows_storage_devices.get(host, "N/A")
+                    logger.warning(f"  {host}: \\\\.\\PhysicalDrive{device}")
+                else:
+                    device = config.storage_devices.get(host, "N/A")
+                    logger.warning(f"  {host}: /dev/{device}")
+            if config.get_linux_hosts():
+                logger.warning(f"  Linux JSON results: {config.output_dir}")
+            if config.get_windows_hosts():
+                logger.warning(f"  Windows JSON results: {config.windows_output_dir}")
         else:
             logger.warning("WARNING: This script will format storage devices on all hosts!")
             logger.warning(f"Hosts: {' '.join(config.vm_hosts)}")
@@ -427,24 +643,38 @@ def main():
                 else:
                     device = config.storage_devices.get(host, "N/A")
                     logger.warning(f"  {host}: /dev/{device}")
+            if config.get_linux_hosts():
+                logger.warning(f"  Linux JSON results (OS disk): {config.output_dir}")
+            if config.get_windows_hosts():
+                logger.warning(f"  Windows JSON results (OS disk): {config.windows_output_dir}")
         print("\n")
         confirm = input("Are you sure you want to continue? (yes/no): ")
         if confirm != "yes":
             logger.info("Operation cancelled by user")
             return 0
     
-    # Prepare storage FIRST (this formats disks, which would wipe FIO if installed before)
-    # For Windows: prepare_storage formats the data disk (d:\), so FIO must be installed AFTER
-    # For Linux: FIO is installed to system directories (/usr/bin), so order doesn't matter, but we do it after for consistency
+    # Guest work only after VMs exist and SSH works (Phase 1 above when create_vms)
+    # Prepare storage FIRST (formats disks; would wipe FIO if installed before on Windows)
+    logger.info("=" * 80)
+    if config.use_testdir:
+        logger.info("PHASE 2/5: Create test directories on Ready VMs (testdir — no format)")
+    elif config.use_raw_disk:
+        logger.info("PHASE 2/5: Prepare raw disks on Ready VMs (validate / clear FS, no mkfs)")
+    else:
+        logger.info("PHASE 2/5: Prepare storage on Ready VMs (format and mount)")
+    logger.info("=" * 80)
     prepare_storage(config, executor)
-    
-    # Ensure required packages are installed AFTER storage is prepared
-    # This is critical for Windows where FIO is copied to d:\ which gets formatted
+
+    logger.info("=" * 80)
+    logger.info("PHASE 3/5: Install FIO packages on Ready VMs (if needed)")
+    logger.info("=" * 80)
     ensure_packages_installed(config, executor)
-    
-    # Write test data
+
+    logger.info("=" * 80)
+    logger.info("PHASE 4/5: Write initial test dataset")
+    logger.info("=" * 80)
     write_test_data(config, executor)
-    
+
     # Start VM migration monitor if enabled
     migration_monitor = None
     if config.monitor_vm:
@@ -454,8 +684,10 @@ def main():
             vm_hosts=config.vm_hosts
         )
         migration_monitor.start()
-    
-    # Run FIO tests
+
+    logger.info("=" * 80)
+    logger.info("PHASE 5/5: Run FIO performance tests")
+    logger.info("=" * 80)
     run_fio_tests(config, executor, migration_monitor=migration_monitor)
     
     # Stop VM migration monitor and save report
@@ -500,8 +732,20 @@ def main():
     else:
         logger.warning(f"Log file not found (pattern: {pattern}) - skipping log file copy")
     
-    # Cleanup
+    # Cleanup guest test artifacts (mounts / JSON)
     cleanup_storage(config, executor)
+
+    # Optional cluster VM cleanup (--cleanup); in-container keys always removed.
+    # Bastion /tmp mirror kept when VMs are kept (for inspection); removed with --cleanup.
+    try:
+        if config.create_vms and config.cleanup_vms:
+            cleanup_provisioned(config)
+    finally:
+        if config.create_vms:
+            remove_ssh_key_dir(
+                config.ssh_key_path,
+                also_bastion_mirror=bool(config.cleanup_vms),
+            )
     
     logger.info("FIO performance testing completed successfully")
     logger.info(f"Results have been copied to localhost: {results_dir}")

@@ -72,35 +72,27 @@ Before your first real run, you need to change one default value:
 ## Step 6: Run the Test
 
 1. Click **Build with Parameters**
-2. You'll see a form with all the parameters and their defaults:
+2. Parameters are grouped by description prefix (same order in all three Jenkinsfiles):
 
 ```
-BASTION_HOST:      your-bastion-host.example.com
-BASTION_USER:      root
-SSH_CREDENTIAL_ID: bastion-ssh-key
-CONTAINER_IMAGE:   quay.io/ekuric/fio-benchmark:latest
-HOST_PATTERN:      vml-{1..3}
-DEVICES:           vml-{1..3}=vdc
-WIN_HOST_PATTERN:  vm-{1..2}
-WIN_DEVICES:       vm-{1..2}=2
-NAMESPACE:         default
-TEST_SIZE:         5G
-RUNTIME:           300
-WIN_RUNTIME:       300
-BLOCK_SIZES:       4k 1024k
-WIN_BLOCK_SIZES:   4k 1024k
-IO_PATTERNS:       write
-WIN_IO_PATTERNS:   write
-MIGRATE_WORKLOADS: (empty)
-MIGRATE_INTERVAL:  0
-DESCRIPTION:       jenkins-fio-test
-USE_TESTDIR:       false
+[1. Test]           DESCRIPTION, NAMESPACE
+[2. Bastion]        CLUSTER (linux/windows jobs), BASTION_*, SSH_CREDENTIAL_ID, API_URL
+[3. Harness]        CONTAINER_IMAGE   ← fio-container (not guest OS)
+[4. Disk]           USE_TESTDIR / USE_RAW_DISK
+[5. Create VMs]     CREATE_VMS, CLEANUP, VMS/WIN_VMS, VM_PREFIX/WIN_VM_PREFIX,
+                    VM_CPU/MEMORY, VM_IMAGE/WIN_VM_IMAGE, STORAGE_CLASS, *_VOLUME_SIZE
+[6. Existing hosts] HOST_PATTERN / WIN_HOST_PATTERN, DEVICES / WIN_DEVICES
+[7–8. Workload]     TEST_SIZE, RUNTIME, BLOCK_SIZES, IO_PATTERNS, …
+[9. Resilience]     INTERVAL, MAX_RETRIES, MIGRATE_*, MONITOR_*
 ```
 
-Set **USE_TESTDIR** to `true` to run FIO on the OS disk (`/root/testdir` / `c:/testdir`)
-without formatting separate data disks. Leave **DEVICES** / **WIN_DEVICES** empty.
-YAML `storage` / `windows.storage_win` sections in a mounted config are ignored in
-this mode (see `README-container.md` → OS-disk load).
+**Disk modes:** `USE_TESTDIR=true` → OS disk (`/root/testdir` / `c:/testdir`).
+`USE_RAW_DISK=true` → raw block device. Mutually exclusive. JSON always on OS disk
+(`/root/fio-results` / `c:/fio-results`).
+
+**Create VMs:** `CREATE_VMS=true`, set count + prefix + guest image + `STORAGE_CLASS`,
+leave host patterns empty. `CLEANUP=true` deletes managed VMs after the run (default
+keep; next create still wipes leftovers first).
 
 3. Modify any values you want for this run
 4. Click **Build**

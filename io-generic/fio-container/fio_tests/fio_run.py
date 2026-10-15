@@ -15,9 +15,12 @@ from fio_tests.migration import migrate_vms_during_test
 from fio_tests.util import (
     build_fio_fsync_option,
     build_linux_fio_thread_option,
+    build_raw_offset_increment,
     fio_runtime_flags,
     normalize_windows_path,
     parse_optional_runtime,
+    raw_filename_linux,
+    raw_filename_windows,
     windows_fio_directory_arg,
 )
 
@@ -126,11 +129,17 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
                 f"{pattern} with block size {bs} on hosts: {linux_hosts}"
             )
             for host in linux_hosts:
+                if config.use_raw_disk:
+                    filename = raw_filename_linux(config.storage_devices[host])
+                    offset = build_raw_offset_increment(config.numjobs, config.test_size)
+                    target = f"--filename={filename} {offset}".rstrip()
+                else:
+                    target = f"--directory={config.mount_point}"
                 fio_cmd = (
                     f"cd {config.output_dir} && fio "
                     f"--ioengine={config.ioengine} "
                     f"--name=testfile "
-                    f"--directory={config.mount_point} "
+                    f"{target} "
                     f"--size={config.test_size} "
                     f"--rw={pattern} "
                     f"--bs={bs} "
@@ -168,13 +177,23 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
                 if not fio_dir.endswith('/'):
                     fio_dir += '/'
                 
-                # Native Windows path for fio --directory= (no c\:\… bash-style escape)
-                mount_point_fio = windows_fio_directory_arg(config.windows_mount_point)
+                if config.use_raw_disk:
+                    filename = raw_filename_windows(
+                        config.windows_storage_devices.get(host, "1")
+                    )
+                    offset = build_raw_offset_increment(
+                        config.windows_numjobs, config.windows_test_size
+                    )
+                    target = f"--filename={filename} {offset}".rstrip()
+                else:
+                    # Native Windows path for fio --directory= (no c\:\… bash-style escape)
+                    mount_point_fio = windows_fio_directory_arg(config.windows_mount_point)
+                    target = f"--directory={mount_point_fio}"
                 fio_cmd = (
                     f"powershell cd {fio_dir} ; {fio_dir}fio.exe "
                     f"--ioengine=windowsaio "
                     f"--name=fiodatafile "
-                    f"--directory={mount_point_fio} "
+                    f"{target} "
                     f"--size={config.windows_test_size} "
                     f"--rw={pattern} "
                     f"--bs={bs} "

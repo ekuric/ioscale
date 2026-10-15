@@ -1,0 +1,25 @@
+# Source DataVolume for Linux VMs (registry containerdisk). Applied by fio_tests.provision.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: ${dv_name}
+  namespace: ${namespace}
+  labels:
+    fio-container.ioscale/managed: "true"
+    fio-container.ioscale/os: linux
+    fio-container.ioscale/run: "${run_id}"
+    fio-container.ioscale/role: source-dv
+  annotations:
+    cdi.kubevirt.io/storage.deleteAfterCompletion: "false"
+    cdi.kubevirt.io/storage.bind.immediate.requested: "true"
+spec:
+  source:
+    registry:
+      url: "docker://${vm_image}"
+  storage:
+    accessModes:
+    - ${access_mode}
+    resources:
+      requests:
+        storage: ${storage_size}
+    storageClassName: ${storage_class}

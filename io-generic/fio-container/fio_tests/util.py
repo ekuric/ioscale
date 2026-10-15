@@ -6,6 +6,13 @@ from typing import Optional
 
 from fio_tests.constants import DEFAULT_LINUX_IOENGINE, LINUX_THREAD_IOENGINES
 
+# Whole-disk names that must never be used as --raw-disk targets (OS disk).
+_LINUX_OS_DISK_RE = re.compile(
+    r"^(sda|vda|xvda|hda|nvme0n1)(p?\d+)?$",
+    re.IGNORECASE,
+)
+
+
 def normalize_windows_path(path: str) -> str:
     """
     Normalize Windows path for PowerShell commands.
@@ -48,6 +55,46 @@ def windows_fio_directory_arg(path: str) -> str:
     return native
 
 
+def raw_filename_linux(device: str) -> str:
+    """Block-device path for Linux FIO --filename= (bare name or /dev/…)."""
+    name = (device or "").strip()
+    if name.startswith("/dev/"):
+        return name
+    return f"/dev/{name.lstrip('/')}"
+
+
+def raw_filename_windows(disk_id: str) -> str:
+    """PhysicalDrive path for Windows FIO --filename=."""
+    return f"\\\\.\\PhysicalDrive{str(disk_id).strip()}"
+
+
+def is_forbidden_linux_raw_device(device: str) -> bool:
+    """True if device looks like the Linux OS disk (or a partition of it)."""
+    name = (device or "").strip().lstrip("/")
+    if name.startswith("dev/"):
+        name = name[4:]
+    return bool(_LINUX_OS_DISK_RE.match(name))
+
+
+def is_forbidden_windows_raw_disk(disk_id: str) -> bool:
+    """True if Windows disk number is the typical OS disk (0)."""
+    try:
+        return int(str(disk_id).strip()) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def build_raw_offset_increment(numjobs, test_size: Optional[str]) -> str:
+    """When numjobs>1 on a raw device, space jobs with --offset_increment=size."""
+    try:
+        jobs = int(numjobs or 1)
+    except (TypeError, ValueError):
+        jobs = 1
+    if jobs <= 1 or not test_size:
+        return ""
+    return f"--offset_increment={test_size} "
+
+
 def parse_bool(value, default: bool = False) -> bool:
     """Parse YAML/config booleans from bool, int, or string values."""
     if value is None:
@@ -80,7 +127,7 @@ def normalize_optional_fsync(value) -> Optional[str]:
     try:
         n = int(s)
     except (TypeError, ValueError) as e:
-        raise FioConfigError(f"CRITICAL: fsync must be a positive integer (got {value!r})") from e
+        raise ValueError(f"CRITICAL: fsync must be a positive integer (got {value!r})") from e
     if n < 1:
         return None
     return str(n)

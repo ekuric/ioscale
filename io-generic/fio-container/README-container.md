@@ -4,18 +4,20 @@ Run FIO performance tests against remote VMs from a container.
 Configuration can be provided by mounting a YAML config file or by setting
 environment variables.
 
+Implementation is modular: `fio-tests.py` is a thin CLI shim; logic lives in
+`fio_tests/` (`cli`, `config`, `executor`, `fio_run`, `storage`, …).
+
 ## Building
 
+Build from this directory (`ioscale_files/io-generic/fio-container`):
+
 ```bash
-cd fio-container
+cd ioscale_files/io-generic/fio-container
 podman build -t quay.io/ekuric/fio-benchmark:latest .
 ```
 
-Override the virtctl version at build time:
-
-```bash
-podman build --build-arg VIRTCTL_VERSION=v1.8.0 -t quay.io/ekuric/fio-benchmark:latest .
-```
+`bpftrace`/cluster tools come from the base image (`quay.io/ekuric/benchmark-base:latest`).
+This Dockerfile only copies the FIO harness (`fio_tests/`, shim, examples, entrypoint).
 
 ## Three Usage Modes
 
@@ -123,9 +125,9 @@ Env vars are used when no config file is mounted (Modes 2 and 3).
 | `HOST_PATTERN` | -- | Brace-expansion pattern, e.g. `vm-{1..10}` |
 | `HOST_LABELS` | -- | OCP label selector for VMs |
 | `NAMESPACE` | `default` | OpenShift namespace |
-| `DEVICES` | **required** unless `USE_TESTDIR=true` | Device mapping: `"pattern=device"`, comma-separated for multiple (e.g. `"vm-{1..10}=vdc,host1=sdb"`). Omit when using OS-disk `--testdir` mode. |
-| `MOUNT_POINT` | `/root/tests/data` | Mount point for the test filesystem |
-| `FILESYSTEM` | `xfs` | Filesystem type to create |
+| `DEVICES` | **required** unless `USE_TESTDIR=true` | Device mapping: `"pattern=device"`, comma-separated for multiple (e.g. `"vm-{1..10}=vdc,host1=sdb"`). Omit when using OS-disk `--testdir` mode. Still required for `--raw-disk`. |
+| `MOUNT_POINT` | `/root/tests/data` | Mount point for the test filesystem (ignored for `--testdir` / `--raw-disk`) |
+| `FILESYSTEM` | `xfs` | Filesystem type to create (ignored for `--testdir` / `--raw-disk`) |
 | `PERSISTENT` | -- | Set to `true` for persistent mounts via /etc/fstab |
 | `TEST_SIZE` | `1G` | FIO test file size |
 | `RUNTIME` | `300` | Test runtime in seconds |
@@ -137,10 +139,28 @@ Env vars are used when no config file is mounted (Modes 2 and 3).
 | `FSYNC` | -- | Optional FIO `--fsync=N` (empty/unset = disabled; e.g. `1` or `32`) |
 | `FIO_INSTALLED` | `false` | Golden Linux image with FIO baked in (`true` = skip package check/install; `false` = install if missing) |
 | `RATE_IOPS` | -- | Optional IOPS rate limit |
-| `OUTPUT_DIR` | `/root/fio-results` | Result directory on remote hosts |
+| `OUTPUT_DIR` | `/root/fio-results` | Ignored for remote JSON — always forced to `/root/fio-results` on the OS disk |
 | `OUTPUT_FORMAT` | `json+` | FIO output format |
 | `DESCRIPTION` | -- | Test run description (included in results dir name) |
-| `USE_TESTDIR` | `false` | Set to `true` to add `--testdir` (FIO on OS disk: Linux `/root/testdir`, Windows `c:/testdir`). YAML/env data-disk settings are ignored — see [OS-disk load](#os-disk-load---testdir). |
+| `USE_TESTDIR` | `false` | Set to `true` to add `--testdir` (FIO on OS disk: Linux `/root/testdir`, Windows `c:/testdir`). YAML/env data-disk settings are ignored — see [OS-disk load](#os-disk-load---testdir). Mutually exclusive with `USE_RAW_DISK`. |
+| `USE_RAW_DISK` | `false` | Set to `true` to add `--raw-disk` (FIO against the block device with no filesystem). Requires `DEVICES` / `WIN_DEVICES` (unless `CREATE_VMS`). See [Raw-disk load](#raw-disk-load---raw-disk). Mutually exclusive with `USE_TESTDIR`. |
+| `CREATE_VMS` | `false` | Provision Linux/Windows VMs before the test (see [On-demand VM provision](#on-demand-vm-provision---create-vms)). When `true`, leave `HOST_PATTERN` / `WIN_HOST_PATTERN` empty — they are ignored. |
+| `CLEANUP` | `false` | Delete managed VMs after the test (default: keep). Next `CREATE_VMS` run always wipes prior managed leftovers first. |
+| `VMS` | `0` | Number of Linux VMs to create when `CREATE_VMS=true` |
+| `WIN_VMS` | `0` | Number of Windows VMs to create when `CREATE_VMS=true` |
+| `VM_PREFIX` | `fio-linux` | Linux VM name prefix → `fio-linux-1..N` |
+| `WIN_VM_PREFIX` | `fio-win` | Windows VM name prefix → `fio-win-1..M` |
+| `VM_CPU` / `VM_MEMORY` | `2` / `4Gi` | Linux VM size |
+| `WIN_VM_CPU` / `WIN_VM_MEMORY` | same as Linux | Windows VM size |
+| `VM_IMAGE` | `quay.io/containerdisks/fedora:41` | Linux containerdisk (registry) |
+| `WIN_VM_IMAGE` | -- | Windows image HTTP URL (required if `WIN_VMS>0`) |
+| `STORAGE_CLASS` | -- | **Required** when `CREATE_VMS=true` |
+| `ACCESS_MODE` | `ReadWriteMany` | PVC access mode for provisioned volumes |
+| `ROOT_VOLUME_SIZE` | `20Gi` | Linux root PVC size |
+| `WIN_ROOT_VOLUME_SIZE` | `76Gi` | Windows root PVC size |
+| `DATA_DISK_SIZE` | `40Gi` | Blank data disk size on provisioned VMs (skipped for `--testdir`) |
+| `WIN_DATA_DISK_SIZE` | same as `DATA_DISK_SIZE` | Windows blank data disk size |
+| `SSH_KEY_PATH` | `/tmp/fio-ssh-<runid>` | In-container directory for ephemeral keypair |
 | `MIGRATE_WORKLOADS` | -- | Space-separated workloads to trigger VM migration (e.g. `"write randwrite"`) |
 | `MIGRATE_INTERVAL` | `0` | Seconds between migrations (0 = parallel) |
 | `RETRY_INTERVAL` | `30` | Retry interval in seconds |
@@ -157,9 +177,9 @@ Set `WIN_HOSTS` or `WIN_HOST_PATTERN` to activate the Windows section.
 |---|---|---|
 | `WIN_HOSTS` | -- | Space-separated Windows VM names |
 | `WIN_HOST_PATTERN` | -- | Brace-expansion pattern, e.g. `win-vm-{1..10}` |
-| `WIN_DEVICES` | required unless `USE_TESTDIR=true` | Device mapping with Disk IDs: `"win-vm-{1..10}=1"`. Omit when using OS-disk `--testdir` mode. |
-| `WIN_MOUNT_POINT` | `d\:/fio/data` | Windows mount point for test data (ignored when `USE_TESTDIR=true`) |
-| `WIN_RUN_DIR` | `d:/fio` | Directory containing fio.exe (ignored when `USE_TESTDIR=true`; uses `c:/tools/fio`) |
+| `WIN_DEVICES` | required unless `USE_TESTDIR=true` | Device mapping with Disk IDs: `"win-vm-{1..10}=1"`. Omit when using OS-disk `--testdir` mode. Still required for `--raw-disk`. |
+| `WIN_MOUNT_POINT` | `d\:/fio/data` | Windows mount point for test data (ignored when `USE_TESTDIR=true` or `USE_RAW_DISK=true`) |
+| `WIN_RUN_DIR` | `d:/fio` | Directory containing fio.exe (ignored for `--testdir` / `--raw-disk`; uses `c:/tools/fio`) |
 | `WIN_TEST_SIZE` | `10GB` | FIO test file size |
 | `WIN_RUNTIME` | `600` | Test runtime in seconds |
 | `WIN_BLOCK_SIZES` | `4k 8k 128k 1024k` | Space-separated block sizes |
@@ -169,7 +189,7 @@ Set `WIN_HOSTS` or `WIN_HOST_PATTERN` to activate the Windows section.
 | `WIN_DIRECT_IO` | `1` | Direct I/O (1=yes) |
 | `WIN_FSYNC` | -- | Optional FIO `--fsync=N` (empty/unset = disabled; e.g. `1` or `32`) |
 | `WIN_RATE_IOPS` | -- | Optional IOPS rate limit |
-| `WIN_OUTPUT_DIR` | `d:/fio/results` | Result directory on Windows hosts |
+| `WIN_OUTPUT_DIR` | `c:/fio-results` | Ignored for remote JSON — always forced to `c:/fio-results` on the OS disk |
 | `WIN_OUTPUT_FORMAT` | `json+` | FIO output format |
 
 ### Linux golden image (`fio_installed`)
@@ -204,6 +224,277 @@ Env var example (with golden-image VMs):
 Jenkins: set the `FIO_INSTALLED` build parameter to `true` when deploying VMs
 from the fio golden image (`Jenkinsfile`, `Jenkinsfile-linux`).
 
+## On-demand VM provision (`--create-vms`)
+
+Create Linux and/or Windows VMs **in the same run** as the FIO test (no
+`multivm.sh` / pre-created hosts). Set `CREATE_VMS=true` (or `--create-vms`),
+`VMS` / `WIN_VMS`, and `STORAGE_CLASS`. Leave `HOST_PATTERN` / `WIN_HOST_PATTERN`
+empty — they are ignored when create is on.
+
+### Prerequisites
+
+- Namespace **must already exist** (`oc create namespace <ns>` / `oc new-project`).
+  The harness does not create it.
+- Bastion kubeconfig mounted into the container (`-v /root/.kube:/root/.kube:ro,Z`).
+- `STORAGE_CLASS` set to a StorageClass that supports the volume mode you need.
+- **Windows image**: OpenSSH + FIO at `c:\tools\fio` (Cloudbase-Init capable).
+  SSH keys are injected via `#ps1_sysnative` userdata in a Secret
+  (`fio-win-cloudinit-<runid>`), overwriting any golden-image `authorized_keys`.
+
+### Phase order (strict)
+
+Guest work never starts until VMs are Ready and SSH works:
+
+| Phase | What |
+|---|---|
+| **1** | Generate ephemeral SSH key → wipe prior **managed** leftovers → create source DV + VMs → wait Ready + SSH |
+| **2** | Create dirs / prepare storage (testdir \| raw \| FS format+mount) |
+| **3** | Install FIO packages if needed |
+| **4** | Write dataset |
+| **5** | Run FIO performance tests → collect results → optional `--cleanup` |
+
+### SSH keys (container + bastion)
+
+| Location | Path | Lifetime |
+|---|---|---|
+| In-container (used by virtctl in the run) | `/tmp/fio-ssh-<runid>/id_ed25519` | Removed when the container exits |
+| Bastion mirror (for inspection) | `/tmp/fio-ssh/fio-ssh-<runid>/id_ed25519` | Kept if VMs are kept; removed with `--cleanup` |
+
+Mount **only** the subdirectory (SELinux forbids relabeling `/tmp`):
+
+```bash
+mkdir -p /tmp/fio-ssh
+# ...
+-v /tmp/fio-ssh:/host-tmp:Z \
+```
+
+```bash
+# After create (VMs kept) — from bastion
+ls /tmp/fio-ssh/
+virtctl ssh fedora@vmi/fio-linux-1 -n <ns> -i /tmp/fio-ssh/fio-ssh-<runid>/id_ed25519
+virtctl ssh Administrator@vmi/fio-win-1 -n <ns> -i /tmp/fio-ssh/fio-ssh-<runid>/id_ed25519
+```
+
+### Naming, disks, generated YAML
+
+| Item | Default / behavior |
+|---|---|
+| Linux names | `{VM_PREFIX}-1..N` (default `fio-linux-1..N`) |
+| Windows names | `{WIN_VM_PREFIX}-1..M` (default `fio-win-1..M`) |
+| Device maps | Auto-filled after provision: Linux `vdb`, Windows Disk `1` |
+| Data disk | Attached unless `USE_TESTDIR=true` |
+| Labels | `fio-container.ioscale/managed=true` (wiped on next create) |
+
+Env-generated `storage` / `storage_win` only include fields the disk mode uses:
+
+| Mode | Generated storage block |
+|---|---|
+| **testdir** | omitted (no mount/fs/devices in YAML) |
+| **raw-disk** | `devices` only (`{}` until provision fills them) |
+| **FS disk** | `devices` + `mount_point` + `filesystem` (+ Windows `mount_point`) |
+
+### Cleanup
+
+| Moment | Behavior |
+|---|---|
+| Start of create | Always wipe prior **managed** VMs/DVs/Secrets |
+| End without `--cleanup` | Keep VMs + bastion SSH key mirror |
+| End with `--cleanup` | Delete managed VMs/DVs/Secrets + bastion key dir |
+| In-container SSH key | Always removed |
+
+Templates live under `/work/templates/` (adapted from `fio-vmlinux` / `fio-vmwindows`).
+
+### Create-VM + test recipes
+
+Common mounts for all recipes below (adjust paths as needed):
+
+```bash
+COMMON_MOUNTS=(
+  -v /root/fio-results:/work/results:Z
+  -v /root/.kube:/root/.kube:ro,Z
+  -v /tmp/fio-ssh:/host-tmp:Z
+)
+mkdir -p /tmp/fio-ssh /root/fio-results
+```
+
+#### 1) Linux — create 3 VMs + OS-disk testdir
+
+No data disk. FIO under `/root/testdir`; JSON under `/root/fio-results`.
+
+```bash
+podman run --rm --init --pids-limit=-1 --privileged \
+  -e CREATE_VMS=true \
+  -e VMS=3 \
+  -e VM_PREFIX=fio-linux \
+  -e VM_CPU=2 \
+  -e VM_MEMORY=4Gi \
+  -e VM_IMAGE=quay.io/containerdisks/fedora:41 \
+  -e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization \
+  -e ROOT_VOLUME_SIZE=20Gi \
+  -e USE_TESTDIR=true \
+  -e NAMESPACE=fio-test \
+  -e DESCRIPTION=create-testdir \
+  -e TEST_SIZE=4G \
+  -e RUNTIME=120 \
+  -e BLOCK_SIZES="1024k" \
+  -e IO_PATTERNS=write \
+  -e NUMJOBS=1 \
+  -e IODEPTH=16 \
+  "${COMMON_MOUNTS[@]}" \
+  quay.io/ekuric/fio-benchmark:latest
+```
+
+#### 2) Linux — create VMs + raw-disk FIO
+
+Blank data disk attached; FIO `--filename=/dev/vdb` (no mkfs). Leave `DEVICES` empty.
+
+```bash
+podman run --rm --init --pids-limit=-1 --privileged \
+  -e CREATE_VMS=true \
+  -e VMS=5 \
+  -e VM_PREFIX=fio-linux \
+  -e VM_CPU=4 \
+  -e VM_MEMORY=8Gi \
+  -e VM_IMAGE=quay.io/containerdisks/fedora:41 \
+  -e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization \
+  -e DATA_DISK_SIZE=40Gi \
+  -e USE_RAW_DISK=true \
+  -e NAMESPACE=fio-test \
+  -e DESCRIPTION=create-raw \
+  -e TEST_SIZE=10G \
+  -e RUNTIME=300 \
+  -e BLOCK_SIZES="4k 1024k" \
+  -e IO_PATTERNS="write randwrite" \
+  "${COMMON_MOUNTS[@]}" \
+  quay.io/ekuric/fio-benchmark:latest
+```
+
+#### 3) Linux — create VMs + filesystem data disk
+
+Format/mount `vdb` (default XFS at `/root/tests/data`), then FIO on the filesystem.
+
+```bash
+podman run --rm --init --pids-limit=-1 --privileged \
+  -e CREATE_VMS=true \
+  -e VMS=3 \
+  -e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization \
+  -e DATA_DISK_SIZE=40Gi \
+  -e USE_TESTDIR=false \
+  -e USE_RAW_DISK=false \
+  -e NAMESPACE=fio-test \
+  -e DESCRIPTION=create-fsdisk \
+  -e TEST_SIZE=5G \
+  -e RUNTIME=300 \
+  -e BLOCK_SIZES="4k 8k 128k" \
+  -e IO_PATTERNS="read write randread randwrite" \
+  "${COMMON_MOUNTS[@]}" \
+  quay.io/ekuric/fio-benchmark:latest
+```
+
+#### 4) Windows — create VMs + OS-disk testdir
+
+Requires `WIN_VM_IMAGE` (HTTP URL). FIO on `c:/testdir`; binary at `c:/tools/fio`.
+
+```bash
+podman run --rm --init --pids-limit=-1 --privileged \
+  -e CREATE_VMS=true \
+  -e WIN_VMS=2 \
+  -e WIN_VM_PREFIX=fio-win \
+  -e WIN_VM_CPU=4 \
+  -e WIN_VM_MEMORY=8Gi \
+  -e WIN_VM_IMAGE="https://example.com/windows.qcow2" \
+  -e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization \
+  -e WIN_ROOT_VOLUME_SIZE=60Gi \
+  -e USE_TESTDIR=true \
+  -e NAMESPACE=fio-test \
+  -e DESCRIPTION=create-win-testdir \
+  -e WIN_TEST_SIZE=10GB \
+  -e WIN_RUNTIME=300 \
+  -e WIN_BLOCK_SIZES="1024k" \
+  -e WIN_IO_PATTERNS=write \
+  "${COMMON_MOUNTS[@]}" \
+  quay.io/ekuric/fio-benchmark:latest
+```
+
+#### 5) Windows — create VMs + raw PhysicalDrive
+
+```bash
+podman run --rm --init --pids-limit=-1 --privileged \
+  -e CREATE_VMS=true \
+  -e WIN_VMS=2 \
+  -e WIN_VM_IMAGE="https://example.com/windows.qcow2" \
+  -e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization \
+  -e DATA_DISK_SIZE=40Gi \
+  -e USE_RAW_DISK=true \
+  -e NAMESPACE=fio-test \
+  -e DESCRIPTION=create-win-raw \
+  -e WIN_TEST_SIZE=10GB \
+  -e WIN_RUNTIME=300 \
+  "${COMMON_MOUNTS[@]}" \
+  quay.io/ekuric/fio-benchmark:latest
+```
+
+#### 6) Mixed Linux + Windows create (keep VMs, inspect later)
+
+```bash
+podman run --rm --init --pids-limit=-1 --privileged \
+  -e CREATE_VMS=true \
+  -e VMS=3 \
+  -e WIN_VMS=2 \
+  -e VM_IMAGE=quay.io/containerdisks/fedora:41 \
+  -e WIN_VM_IMAGE="https://example.com/windows.qcow2" \
+  -e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization \
+  -e USE_TESTDIR=true \
+  -e CLEANUP=false \
+  -e NAMESPACE=fio-test \
+  -e DESCRIPTION=create-mixed-keep \
+  "${COMMON_MOUNTS[@]}" \
+  quay.io/ekuric/fio-benchmark:latest
+# Then: virtctl ssh ... -i /tmp/fio-ssh/fio-ssh-<runid>/id_ed25519
+```
+
+#### 7) Create, run, delete VMs (`CLEANUP=true`)
+
+Same as any recipe above, plus:
+
+```bash
+  -e CLEANUP=true \
+```
+
+#### 8) Existing hosts (no create) — for comparison
+
+```bash
+# Linux raw on pre-created VMs
+podman run --rm --init --pids-limit=-1 --privileged \
+  -e CREATE_VMS=false \
+  -e HOST_PATTERN="fio-linux-{1..3}" \
+  -e DEVICES="fio-linux-{1..3}=vdb" \
+  -e USE_RAW_DISK=true \
+  -e NAMESPACE=fio-test \
+  -v /root/fio-results:/work/results:Z \
+  -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro,Z \
+  -v /root/.kube:/root/.kube:ro,Z \
+  quay.io/ekuric/fio-benchmark:latest
+```
+
+**Jenkins:** use `Jenkinsfile-linux` / `Jenkinsfile-windows` — set `CREATE_VMS=true`,
+counts / prefix / images / `STORAGE_CLASS`, leave host patterns empty, choose
+`USE_TESTDIR` or `USE_RAW_DISK`. The pipelines mount `/tmp/fio-ssh:/host-tmp:Z`
+and create `/tmp/fio-ssh` on the bastion before `podman run`.
+
+## Fixed JSON result paths (all modes)
+
+FIO JSON (`write_dataset.json`, per-test `*.json`) is **always** written on the OS disk
+so test-disk failures cannot lose results. Collection/scp uses the same paths:
+
+| OS | Remote JSON directory |
+|---|---|
+| Linux | `/root/fio-results` |
+| Windows | `c:/fio-results` |
+
+YAML `output.directory` / `windows.output_win.directory` and env `OUTPUT_DIR` /
+`WIN_OUTPUT_DIR` are ignored for remote JSON (forced to the paths above).
+
 ## OS-disk load (`--testdir`)
 
 By default, FIO uses a **separate data disk** from YAML/env (`DEVICES`, `WIN_DEVICES` /
@@ -215,8 +506,35 @@ formatting of a separate data disk):
 
 | OS | FIO test data | FIO binary (Windows) | JSON results |
 |---|---|---|---|
-| Linux | `/root/testdir` | n/a (system `fio`) | `OUTPUT_DIR` from config (default `/root/fio-results`) |
-| Windows | `c:/testdir` | `c:/tools/fio` (in place, no copy to `d:`) | `c:/fio-results` |
+| Linux | `/root/testdir` | n/a (system `fio`) | `/root/fio-results` (fixed) |
+| Windows | `c:/testdir` | `c:/tools/fio` (in place, no copy to `d:`) | `c:/fio-results` (fixed) |
+
+## Raw-disk load (`--raw-disk`)
+
+**`--raw-disk`** / **`USE_RAW_DISK=true`** runs FIO against the attached data disk as a
+**raw block device** (no filesystem). Mutually exclusive with `--testdir`.
+`DEVICES` / `WIN_DEVICES` remain required. OS disks (`vda`/`sda`/…, Windows Disk `0`)
+are refused.
+
+| OS | FIO I/O target | Prep | FIO binary (Windows) | JSON results |
+|---|---|---|---|---|
+| Linux | `--filename=/dev/{device}` | validate + unmount; no mkfs | n/a | `/root/fio-results` |
+| Windows | `--filename=\\.\PhysicalDrive{N}` | clear partitions; no provision script | `c:/tools/fio` in place | `c:/fio-results` |
+
+Dataset pre-write still runs (size-based fill of `--size` against the raw device).
+When `numjobs > 1`, `--offset_increment={test_size}` is added so jobs do not overlap.
+
+```bash
+podman run --rm --init --pids-limit=-1 \
+  -e HOST_PATTERN="vm-{1..10}" \
+  -e DEVICES="vm-{1..10}=vdb" \
+  -e USE_RAW_DISK=true \
+  -v /root/fio-results:/work/results \
+  -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/fio-benchmark:latest
+```
 
 ### What is ignored in `--testdir` mode
 
@@ -235,10 +553,11 @@ ignored:
 
 Still used from YAML/env in testdir mode: host lists, `fio` / `fio_win` job parameters
 (`test_size`, `runtime`, `block_sizes`, `io_patterns`, `numjobs`, `iodepth`, etc.),
-retry/monitoring, and Linux `output.directory` for results collection.
+and retry/monitoring. JSON results always use the fixed OS-disk paths above.
 
-**Env mode:** omit `DEVICES` / `WIN_DEVICES` when `USE_TESTDIR=true` (entrypoint emits
-`devices: {}`).
+**Env mode:** omit `DEVICES` / `WIN_DEVICES` when `USE_TESTDIR=true` (entrypoint
+omits the `storage` / `storage_win` sections entirely). For `USE_RAW_DISK=true`,
+only `devices` is emitted (no mount/fs fields).
 
 **YAML mode:** a config that still contains `storage_win.devices: …` is fine; with
 `--testdir` those entries are not validated as active disks and are not formatted.
@@ -342,6 +661,24 @@ data-disk format/mount/provision and Windows copy of FIO to `d:`. YAML
 podman run --rm --init --pids-limit=-1 \
   -e HOST_PATTERN="vm-{1..10}" \
   -e USE_TESTDIR=true \
+  -v /root/fio-results:/work/results \
+  -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/fio-benchmark:latest
+```
+
+### `--raw-disk`
+
+Run FIO against the attached data disk as a raw block device (no filesystem).
+Requires `DEVICES` / `WIN_DEVICES`. Mutually exclusive with `--testdir`
+(see [Raw-disk load (`--raw-disk`)](#raw-disk-load---raw-disk)).
+
+```bash
+podman run --rm --init --pids-limit=-1 \
+  -e HOST_PATTERN="vm-{1..10}" \
+  -e DEVICES="vm-{1..10}=vdb" \
+  -e USE_RAW_DISK=true \
   -v /root/fio-results:/work/results \
   -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
   -v /root/.kube/config:/root/.kube/config \
@@ -584,8 +921,8 @@ podman run --rm --init --pids-limit=-1 \
 
 ## SSH Key
 
-`virtctl ssh` uses `/root/.ssh/id_rsa` inside the container by default. Mount
-your private key:
+**Existing VMs** (`CREATE_VMS=false`): `virtctl ssh` uses `/root/.ssh/id_rsa`
+inside the container. Mount your private key:
 
 ```bash
 -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro
@@ -597,18 +934,30 @@ If your key is at a non-standard path, mount it to the expected location:
 -v /home/user/.ssh/my-key:/root/.ssh/id_rsa:ro
 ```
 
-Or mount the entire `.ssh` directory:
-
-```bash
--v /root/.ssh:/root/.ssh:ro
-```
+**On-demand VMs** (`CREATE_VMS=true`): an ephemeral ed25519 keypair is generated
+under `/tmp/fio-ssh-<runid>/` and injected into the guests (Linux cloud-init /
+Windows `#ps1_sysnative`). Mount `/tmp/fio-ssh:/host-tmp:Z` to also keep a copy
+on the bastion for inspection — see [On-demand VM provision](#on-demand-vm-provision---create-vms).
 
 ## Container Layout
 
 ```
 /work/
-  fio-tests.py
-  entrypoint.sh
+  fio-tests.py            (CLI shim — entrypoint runs this)
+  fio_tests/              (implementation package)
+    cli.py                (argparse + orchestration)
+    config.py             (YAML load, FioTestConfig, --testdir overrides)
+    executor.py           (SSH / virtctl remote commands)
+    packages.py           (FIO install / Windows FIO provision)
+    storage.py            (format / mount / guest disk prep)
+    provision.py          (on-demand VM create / SSH keys / cleanup)
+  templates/              (Linux/Windows DV+VM manifest shapes)
+    dataset.py            (pre-write test data)
+    fio_run.py            (performance FIO jobs + mid-test migrate)
+    migration.py          (virtctl migrate / monitor)
+    results.py            (collect + combine JSON)
+    util.py / constants.py
+  entrypoint.sh           (kubeconfig check, env→YAML, exec shim)
   fio-config.yaml         (mounted by user, or generated from env vars)
   examples/
     example-simple.yaml
@@ -746,7 +1095,9 @@ When using env vars (no config file), set:
 
 - Any yum/dnf-based distribution (Fedora or CentOS recommended)
 - **Default mode:** a separate data disk for testing, added to the VM at creation time
-- **`--testdir` mode:** OS disk only; writable `/root/testdir` (and results path, typically `/root/fio-results`)
+- **`--testdir` mode:** OS disk only; writable `/root/testdir`
+- **`--raw-disk` mode:** separate data disk used as a raw block device (no filesystem)
+- JSON results always under `/root/fio-results` on the OS disk
 - Passwordless SSH access enabled -- the public SSH key must be baked into the VM image at creation time
 - FIO dependencies (`fio`, `xfsprogs`, `util-linux`):
   - **Default (`fio_installed: false`)**: installed automatically via dnf if missing
@@ -756,7 +1107,9 @@ When using env vars (no config file), set:
 
 - FIO must be pre-installed at `C:\tools\fio`
 - **Default mode:** a separate data disk; the script copies FIO to the data drive and provisions it if needed
-- **`--testdir` mode:** OS disk only; `c:\testdir` for data, `c:\fio-results` for JSON; uses `c:\tools\fio\fio.exe` in place
+- **`--testdir` mode:** OS disk only; `c:\testdir` for data; uses `c:\tools\fio\fio.exe` in place
+- **`--raw-disk` mode:** separate Disk ID as `\\.\PhysicalDriveN` (no filesystem); FIO from `c:\tools\fio`
+- JSON results always under `c:\fio-results` on the OS disk
 - Passwordless SSH access enabled (OpenSSH server with public key authentication) -- the public SSH key must be baked into the VM image at creation time
 
 ### All VMs
@@ -767,16 +1120,27 @@ When using env vars (no config file), set:
 
 ## Notes
 
+- Implementation lives in the `fio_tests/` package; `fio-tests.py` is a thin CLI shim
+  (`python3 fio-tests.py` and `python3 -m fio_tests` both work). Entrypoint unchanged.
 - If a config file is mounted, it is used as-is. If not, env vars generate one. No merging.
 - Env-var mode supports Linux-only, Windows-only, or mixed Linux+Windows testing.
 - Use `WIN_*` prefixed env vars for Windows hosts (set `WIN_HOSTS` or `WIN_HOST_PATTERN` to activate).
 - `--privileged` is needed for the virtctl SSH proxy to work.
 - `/root/.kube/config` mount gives the container access to the OCP cluster.
-- Mount your SSH private key to `/root/.ssh/id_rsa` so `virtctl ssh` can authenticate.
+- Existing hosts: mount SSH private key to `/root/.ssh/id_rsa`. Create-vms: ephemeral
+  key under `/tmp/fio-ssh-<runid>/` (+ bastion mirror via `/tmp/fio-ssh:/host-tmp:Z`).
 - `--yes-i-mean-it` is passed automatically to skip the device formatting confirmation prompt.
 - Use `--testdir` or `USE_TESTDIR=true` for OS-disk load. YAML `storage` /
-  `windows.storage_win` devices and mount points (and Windows `fio_win.run_dir` /
-  `output_win.directory`) are ignored; leave Jenkins `DEVICES` / `WIN_DEVICES` empty.
+  `windows.storage_win` devices and mount points (and Windows `fio_win.run_dir`)
+  are ignored; leave Jenkins `DEVICES` / `WIN_DEVICES` empty.
+- Use `--raw-disk` or `USE_RAW_DISK=true` for raw block-device load (keep
+  `DEVICES` / `WIN_DEVICES` unless `CREATE_VMS`). Mutually exclusive with `--testdir`.
+- Use `--create-vms` / `CREATE_VMS=true` to provision + test in one step
+  (`VMS`/`WIN_VMS`, `STORAGE_CLASS`, prefixes/images; leave host patterns empty;
+  namespace must already exist; optional `CLEANUP`). Recipes:
+  [On-demand VM provision](#on-demand-vm-provision---create-vms).
+- Remote FIO JSON is always on the OS disk: `/root/fio-results` (Linux) and
+  `c:/fio-results` (Windows), for every storage mode.
 - Set `fio_installed: true` (or `FIO_INSTALLED=true`) when using golden Linux images with FIO pre-baked; leave `false` for stock cloud images.
 - Optional `FSYNC` / `WIN_FSYNC` (or YAML `fio.fsync` / `windows.fio_win.fsync`) adds FIO `--fsync=N`. Empty/unset disables it (default). Values like `1` or `32` call `fsync` after every N writes — this measures durable-write cost and typically lowers write IOPS/BW sharply. Applied to dataset pre-write and performance jobs when set.
 - The entrypoint always prints the config before running, so you can see exactly what values are used.

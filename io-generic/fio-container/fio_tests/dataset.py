@@ -21,7 +21,10 @@ from fio_tests.executor import CommandExecutor
 from fio_tests.util import (
     build_fio_fsync_option,
     build_linux_fio_thread_option,
+    build_raw_offset_increment,
     normalize_windows_path,
+    raw_filename_linux,
+    raw_filename_windows,
     windows_fio_directory_arg,
 )
 
@@ -86,9 +89,31 @@ def _dataset_files_full_size(nbytes: int, expected_bytes: Optional[int]) -> bool
     return nbytes >= int(expected_bytes * 0.99)
 
 
-def _linux_dataset_fio_cmd(config: FioTestConfig) -> str:
+def _linux_dataset_fio_cmd(config: FioTestConfig, host: Optional[str] = None) -> str:
     # Dataset pre-write is always size-based: full sequential write of --size (fast fill).
     # Configured --runtime applies only to the later FIO performance tests.
+    if config.use_raw_disk:
+        device = config.storage_devices.get(host or "", "")
+        filename = raw_filename_linux(device)
+        offset = build_raw_offset_increment(config.numjobs, config.test_size)
+        return (
+            f"cd {config.output_dir} && fio "
+            f"--ioengine={config.ioengine} "
+            f"--name=testfile "
+            f"--filename={filename} "
+            f"--size={config.test_size} "
+            f"{offset}"
+            f"--rw=write "
+            f"--bs=1M "
+            f"--direct={config.direct_io} "
+            f"{build_fio_fsync_option(config.fsync)}"
+            f"--numjobs={config.numjobs} "
+            f"--iodepth=32 "
+            f"{build_linux_fio_thread_option(config.ioengine)}"
+            f"--output-format={config.output_format} "
+            f"--overwrite=1 "
+            f"--output=write_dataset.json"
+        )
     return (
         f"cd {config.output_dir} && fio "
         f"--ioengine={config.ioengine} "
@@ -108,13 +133,36 @@ def _linux_dataset_fio_cmd(config: FioTestConfig) -> str:
     )
 
 
-def _windows_dataset_fio_cmd(config: FioTestConfig) -> str:
+def _windows_dataset_fio_cmd(config: FioTestConfig, host: Optional[str] = None) -> str:
     # Windows: one full sequential write of --size (not randwrite/time-based) so NTFS
     # allocates the test file before perf runs — see linux-win-differences.md.
+    # Raw-disk mode writes the PhysicalDrive instead of a file under a mount.
     fio_dir = normalize_windows_path(config.windows_fio_dir)
     output_dir_win = normalize_windows_path(config.windows_output_dir)
     if not fio_dir.endswith('/'):
         fio_dir += '/'
+    if config.use_raw_disk:
+        disk_id = config.windows_storage_devices.get(host or "", "1")
+        filename = raw_filename_windows(disk_id)
+        offset = build_raw_offset_increment(config.windows_numjobs, config.windows_test_size)
+        return (
+            f"powershell cd {fio_dir} ; {fio_dir}fio.exe "
+            f"--ioengine=windowsaio "
+            f"--name=fiodatafile "
+            f"--filename={filename} "
+            f"--size={config.windows_test_size} "
+            f"{offset}"
+            f"--rw=write "
+            f"--bs=1M "
+            f"--direct={config.windows_direct_io} "
+            f"{build_fio_fsync_option(config.windows_fsync)}"
+            f"--numjobs={config.windows_numjobs} "
+            f"--iodepth=32 "
+            f"--output-format={config.windows_output_format} "
+            f"--thread "
+            f"--overwrite=1 "
+            f"--output={output_dir_win}/write_dataset.json"
+        )
     mount_point_fio = windows_fio_directory_arg(config.windows_mount_point)
     return (
         f"powershell cd {fio_dir} ; {fio_dir}fio.exe "
@@ -245,7 +293,19 @@ def _kill_dataset_fio_on_host(executor: CommandExecutor, host: str, job: Optiona
 
 def _dataset_progress_bytes(executor: CommandExecutor, host: str, config: FioTestConfig) -> int:
     """Return approximate written dataset bytes (testfile* + json size)."""
-    if executor.is_windows_host(host):
+    if config.use_raw_disk:
+        # No data files on a mount; track JSON size only (stall disabled while RUNNING).
+        if executor.is_windows_host(host):
+            output_dir_win = normalize_windows_path(config.windows_output_dir)
+            cmd = (
+                f"powershell -Command \""
+                f"if (Test-Path '{output_dir_win}/write_dataset.json') {{ "
+                f"  Write-Host (Get-Item '{output_dir_win}/write_dataset.json').Length "
+                f"}} else {{ Write-Host 0 }}\""
+            )
+        else:
+            cmd = f"stat -c %s {config.output_dir}/write_dataset.json 2>/dev/null || echo 0"
+    elif executor.is_windows_host(host):
         mount_point_win = normalize_windows_path(config.windows_mount_point)
         output_dir_win = normalize_windows_path(config.windows_output_dir)
         cmd = (
@@ -306,9 +366,6 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
         f"(1 start + {config.dataset_write_retries} restart)"
     )
 
-    linux_cmd = _linux_dataset_fio_cmd(config) if linux_hosts else None
-    windows_cmd = _windows_dataset_fio_cmd(config) if windows_hosts else None
-
     jobs: Dict[str, Dict] = {}
     jobs_lock = threading.Lock()
 
@@ -325,6 +382,7 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
 
     def _start_host(host: str, attempt: int) -> None:
         if executor.is_windows_host(host):
+            windows_cmd = _windows_dataset_fio_cmd(config, host)
             logger.info(f"Starting Windows dataset write on {host} (attempt {attempt}/{max_attempts})")
             thread = executor.execute_background(host, windows_cmd, "Writing test dataset")
             meta = _init_progress_fields({
@@ -337,6 +395,7 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
                 "retried": attempt > 1,
             })
         else:
+            linux_cmd = _linux_dataset_fio_cmd(config, host)
             logger.info(f"Starting Linux dataset write on {host} (attempt {attempt}/{max_attempts})")
             meta = _launch_linux_dataset_nohup(executor, host, linux_cmd)
             meta["attempt"] = attempt
@@ -345,7 +404,7 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
         with jobs_lock:
             jobs[host] = meta
 
-    if windows_hosts:
+    if windows_hosts and not config.use_raw_disk:
         mount_point_win = normalize_windows_path(config.windows_mount_point)
         logger.info(f"Ensuring mount point directories exist on {len(windows_hosts)} Windows hosts...")
         with ThreadPoolExecutor(max_workers=min(len(windows_hosts), config.max_workers)) as pool:
@@ -400,15 +459,77 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
             checks.append(f"pgrep -f -- '{script_file}' >/dev/null 2>&1")
         return " || ".join(checks)
 
+    def _linux_raw_dataset_running_check(_job: Optional[Dict] = None) -> str:
+        """
+        Detect a live raw-disk dataset FIO without pgrep -f self-matches.
+
+        The status SSH command itself contains strings like write_dataset.json /
+        script paths; pgrep -f on those patterns matches the monitor shell and
+        stuck RUNNING forever even after fio exited and JSON was written.
+        Use process-name match only (pgrep -x fio).
+        """
+        return "pgrep -x fio >/dev/null 2>&1"
+
     def _dataset_status_cmd(host: str) -> str:
         """
         DONE only when dataset files are full-size and write_dataset.json is a
         successful completion — not an aborted SIGTERM dump with zero I/O.
+
+        Raw-disk mode: DONE = non-aborted write_dataset.json and FIO not running
+        (no filesystem files to measure).
         """
         job = jobs.get(host)
         expected = _expected_dataset_data_bytes(config, host) or 0
         # Require real data on disk; never treat aborted/empty JSON alone as DONE.
         min_bytes = int(expected * 0.99) if expected > 0 else 1
+
+        if config.use_raw_disk:
+            if executor.is_windows_host(host):
+                output_dir_win = normalize_windows_path(config.windows_output_dir)
+                output_file = f"{output_dir_win}/write_dataset.json"
+                return (
+                    f"powershell -NoProfile -Command \""
+                    f"$out = '{output_file}'; "
+                    f"$fioRunning = [bool](Get-Process fio -ErrorAction SilentlyContinue); "
+                    f"$jsonOk = $false; "
+                    f"if (Test-Path -LiteralPath $out) {{ "
+                    f"  $len = [int64](Get-Item -LiteralPath $out).Length; "
+                    f"  if ($len -ge 32) {{ "
+                    f"    $jsonOk = $true; "
+                    f"    try {{ "
+                    f"      $hit = Select-String -LiteralPath $out -Pattern 'terminating on signal' "
+                    f"        -SimpleMatch -Quiet -ErrorAction Stop; "
+                    f"      if ($hit) {{ $jsonOk = $false }} "
+                    f"    }} catch {{ }} "
+                    f"  }} "
+                    f"}}; "
+                    f"if ($jsonOk -and -not $fioRunning) {{ Write-Host 'DONE' }} "
+                    f"elseif ($fioRunning) {{ Write-Host 'RUNNING' }} "
+                    f"else {{ Write-Host 'FAILED' }}\""
+                )
+            output_file = f"{config.output_dir.rstrip('/')}/write_dataset.json"
+            # Prefer JSON-first: once a good write_dataset.json exists and no fio
+            # process remains, declare DONE. Do not use pgrep -f patterns that
+            # appear in this status command (self-match → perpetual RUNNING).
+            running = _linux_raw_dataset_running_check(job)
+            return (
+                f"output_file='{output_file}'; "
+                f"json_aborted=0; json_present=0; "
+                f"if test -s \"$output_file\"; then "
+                f"  json_present=1; "
+                f"  if grep -q 'terminating on signal' \"$output_file\" 2>/dev/null; then json_aborted=1; fi; "
+                f"fi; "
+                f"fio_running=0; "
+                f"if {running}; then fio_running=1; fi; "
+                f"if [ \"$json_present\" -eq 1 ] && [ \"$json_aborted\" -eq 0 ] && "
+                f"[ \"$fio_running\" -eq 0 ]; then "
+                f"  echo 'DONE'; "
+                f"elif [ \"$fio_running\" -eq 1 ]; then "
+                f"  echo 'RUNNING'; "
+                f"else "
+                f"  echo 'FAILED'; "
+                f"fi"
+            )
 
         if executor.is_windows_host(host):
             output_dir_win = normalize_windows_path(config.windows_output_dir)
@@ -625,6 +746,15 @@ def write_test_data(config: FioTestConfig, executor: CommandExecutor) -> None:
 
             if status == "RUNNING":
                 failed_streak.pop(host, None)
+                # Raw disk: cannot measure fill via files; wait for FIO exit + JSON.
+                if config.use_raw_disk:
+                    job["last_progress_at"] = now
+                    if int(attempt_age) % 60 < check_interval:
+                        logger.info(
+                            f"{host}: raw-disk dataset FIO still running — "
+                            f"waiting for write_dataset.json (not stall-killing)"
+                        )
+                    continue
                 # Dataset write is always size-based: FIO should exit once --size
                 # is written. Wait for JSON when data is full; stall-recover only
                 # when incomplete and no progress.
