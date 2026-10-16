@@ -1,7 +1,0 @@
-# Example host file for FIO testing
-# One hostname per line
-# Lines starting with # are comments and ignored
-
-# Production storage VMs
-vm-{1..10}
-prod-storage-vm-001
