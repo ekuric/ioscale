@@ -145,7 +145,7 @@ Env vars are used when no config file is mounted (Modes 2 and 3).
 | `USE_TESTDIR` | `false` | Set to `true` to add `--testdir` (FIO on OS disk: Linux `/root/testdir`, Windows `c:/testdir`). YAML/env data-disk settings are ignored — see [OS-disk load](#os-disk-load---testdir). Mutually exclusive with `USE_RAW_DISK`. |
 | `USE_RAW_DISK` | `false` | Set to `true` to add `--raw-disk` (FIO against the block device with no filesystem). Requires `DEVICES` / `WIN_DEVICES` (unless `CREATE_VMS`). See [Raw-disk load](#raw-disk-load---raw-disk). Mutually exclusive with `USE_TESTDIR`. |
 | `CREATE_VMS` | `false` | Provision Linux/Windows VMs before the test (see [On-demand VM provision](#on-demand-vm-provision---create-vms)). When `true`, leave `HOST_PATTERN` / `WIN_HOST_PATTERN` empty — they are ignored. |
-| `CLEANUP` | `false` | Delete managed VMs after the test (default: keep). Next `CREATE_VMS` run always wipes prior managed leftovers first. |
+| `CLEANUP` | `false` | Delete managed VMs after the test (default: keep). Next `CREATE_VMS` run wipes prior leftovers for **the same OS only** (`fio-container.ioscale/os=linux` or `windows`) so fio-linux and fio-windows can share a namespace. |
 | `VMS` | `0` | Number of Linux VMs to create when `CREATE_VMS=true` |
 | `WIN_VMS` | `0` | Number of Windows VMs to create when `CREATE_VMS=true` |
 | `VM_PREFIX` | `fio-linux` | Linux VM name prefix → `fio-linux-1..N` |
@@ -283,7 +283,7 @@ virtctl ssh Administrator@vmi/fio-win-1 -n <ns> -i /tmp/fio-ssh/fio-ssh-<runid>/
 | Windows names | `{WIN_VM_PREFIX}-1..M` (default `fio-win-1..M`) |
 | Device maps | Auto-filled after provision: Linux `vdb`, Windows Disk `1` |
 | Data disk | Attached unless `USE_TESTDIR=true` |
-| Labels | `fio-container.ioscale/managed=true` (wiped on next create) |
+| Labels | `fio-container.ioscale/managed=true` + `fio-container.ioscale/os=linux\|windows` (wipe/cleanup scoped by OS) |
 
 Env-generated `storage` / `storage_win` only include fields the disk mode uses:
 

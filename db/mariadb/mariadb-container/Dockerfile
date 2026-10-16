@@ -10,6 +10,8 @@ RUN dnf install -y git \
  && dnf clean all
 
 COPY mariadb.py .
+COPY mariadb_tests/ mariadb_tests/
+COPY templates/ templates/
 COPY mariadb-config.yaml examples/
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh

@@ -5,45 +5,157 @@ pipeline {
         disableConcurrentBuilds()
     }
 
+    // Parameter groups (Jenkins shows them in this order on "Build with Parameters"):
+    //   1. Test        2. Bastion/cluster   3. Harness image
+    //   4. Create VMs  5. Existing hosts    6. HammerDB workload
+    //   7. Resilience / migration
     parameters {
-        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: 'Bastion hostname or IP. Each user/team sets their own bastion here.')
-        string(name: 'BASTION_USER',      defaultValue: 'root',                description: 'SSH user on the bastion host (e.g. root, admin)')
-        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for this bastion SSH key. Each bastion needs its own key registered in Jenkins (Manage Credentials > Add > SSH Username with private key). Use a unique ID per bastion, e.g. team-a-bastion, lab2-bastion.')
-        string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/mariadb-benchmark:latest', description: 'Container image to run')
+        // ----- 1. Test identity -----
+        string(
+            name: 'DESCRIPTION',
+            defaultValue: 'jenkins-mariadb-test',
+            description: '[1. Test] Run name (results dir / logs)'
+        )
+        string(
+            name: 'NAMESPACE',
+            defaultValue: 'default',
+            description: '[1. Test] OpenShift namespace (must already exist; not auto-created)'
+        )
 
-        string(name: 'HOST_PATTERN',      defaultValue: 'vm-{1..10}',         description: 'VM host pattern')
-        string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
-        string(name: 'DISK_LIST',         defaultValue: '/dev/vdc',            description: 'Block device for MariaDB data')
-        string(name: 'MOUNT_POINT',       defaultValue: '',                    description: 'Mount point (if set, DISK_LIST is ignored)')
+        // ----- 2. Bastion / cluster -----
+        choice(
+            name: 'CLUSTER',
+            choices: ['custom', 'lab1', 'lab2'],
+            description: '[2. Bastion] Profile: custom = fields below; lab1/lab2 = built-in map in Resolve Target'
+        )
+        string(name: 'BASTION_HOST',      defaultValue: 'bastion.example.com', description: '[2. Bastion] Hostname/IP (CLUSTER=custom)')
+        string(name: 'BASTION_USER',      defaultValue: 'root',                description: '[2. Bastion] SSH user (CLUSTER=custom)')
+        string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: '[2. Bastion] Jenkins SSH credential ID (CLUSTER=custom)')
+        string(name: 'API_URL',           defaultValue: 'https://api.ocp.example.com:6443', description: '[2. Bastion] Cluster API URL (CLUSTER=custom)')
+        string(name: 'KUBEADMIN_PASSWORD', defaultValue: '',                   description: '[2. Bastion] Optional oc login password')
 
-        string(name: 'WAREHOUSE_COUNT',   defaultValue: '50',                  description: 'TPCC warehouse count')
-        string(name: 'TEST_DURATION',     defaultValue: '15',                  description: 'Test duration in minutes')
-        string(name: 'USER_COUNT',        defaultValue: '1 10 20 50',          description: 'Space-separated user counts to test')
+        // ----- 3. Harness image -----
+        string(
+            name: 'CONTAINER_IMAGE',
+            defaultValue: 'quay.io/ekuric/mariadb-benchmark:latest',
+            description: '[3. Harness] mariadb-container image (not the guest VM OS image)'
+        )
 
-        string(name: 'HAMMERDB_PATH',     defaultValue: '/root/hammerdb-tpcc-wrapper-scripts', description: 'Deploy path for HammerDB scripts on remote hosts')
-        string(name: 'HAMMERDB_SOURCE',   defaultValue: 'bundled',           description: 'Script source: bundled (default) or remote_git')
-        string(name: 'HAMMERDB_REPO',     defaultValue: 'https://github.com/ekuric/ioscale.git', description: 'Only used when HAMMERDB_SOURCE=remote_git')
-        string(name: 'HAMMERDB_INSTALL_DIR', defaultValue: '/usr/local/HammerDB',                       description: 'HammerDB installation directory')
+        // ----- 4. On-demand VM provision -----
+        choice(
+            name: 'CREATE_VMS',
+            choices: ['false', 'true'],
+            description: '[4. Create VMs] Provision guests before HammerDB (leave HOST_PATTERN empty; needs STORAGE_CLASS)'
+        )
+        choice(
+            name: 'CLEANUP',
+            choices: ['false', 'true'],
+            description: '[4. Create VMs] Delete managed VMs after test (default keep; next create still wipes leftovers)'
+        )
+        string(name: 'VMS',               defaultValue: '3',                  description: '[4. Create VMs] Number of Linux VMs')
+        string(name: 'VM_PREFIX',         defaultValue: 'mariadb',            description: '[4. Create VMs] Name prefix → mariadb-1..N')
+        string(name: 'VM_CPU',            defaultValue: '2',                  description: '[4. Create VMs] vCPU cores')
+        string(name: 'VM_MEMORY',         defaultValue: '4Gi',                description: '[4. Create VMs] Memory')
+        string(
+            name: 'VM_IMAGE',
+            defaultValue: 'quay.io/containerdisks/fedora:41',
+            description: '[4. Create VMs] Guest OS containerdisk (registry)'
+        )
+        string(name: 'STORAGE_CLASS',     defaultValue: '',                   description: '[4. Create VMs] StorageClass (required if CREATE_VMS=true)')
+        string(name: 'ROOT_VOLUME_SIZE',  defaultValue: '20Gi',               description: '[4. Create VMs] Root PVC size')
+        string(name: 'DATA_DISK_SIZE',    defaultValue: '40Gi',               description: '[4. Create VMs] Blank data disk for MariaDB datadir')
 
-        string(name: 'RAMPUP_TIME',        defaultValue: '',                    description: 'Ramp-up time in minutes (empty = default 2 min)')
-        string(name: 'MIGRATE_USER_COUNTS', defaultValue: '',                  description: 'User counts triggering VM migration (space-separated, empty = no migration)')
-        string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
-        string(name: 'DESCRIPTION',       defaultValue: 'jenkins-mariadb-test', description: 'Test run description')
+        // ----- 5. Existing hosts (CREATE_VMS=false) -----
+        string(
+            name: 'HOST_PATTERN',
+            defaultValue: '',
+            description: '[5. Existing hosts] Pre-created VMs, e.g. vm-{1..10}. Empty when CREATE_VMS=true'
+        )
+        string(
+            name: 'DISK_LIST',
+            defaultValue: '/dev/vdc',
+            description: '[5. Existing hosts] Block device for MariaDB data (ignored / auto vdb when CREATE_VMS)'
+        )
+        string(
+            name: 'MOUNT_POINT',
+            defaultValue: '',
+            description: '[5. Existing hosts] Mount point (if set, DISK_LIST is ignored)'
+        )
+
+        // ----- 6. HammerDB workload -----
+        string(name: 'WAREHOUSE_COUNT',     defaultValue: '50',               description: '[6. Workload] TPCC warehouse count')
+        string(name: 'TEST_DURATION',       defaultValue: '15',               description: '[6. Workload] Test duration in minutes')
+        string(name: 'USER_COUNT',          defaultValue: '1 10 20 50',       description: '[6. Workload] Space-separated user counts')
+        string(name: 'RAMPUP_TIME',         defaultValue: '',                 description: '[6. Workload] Ramp-up minutes (empty = default 2)')
+        string(name: 'HAMMERDB_SOURCE',     defaultValue: 'bundled',          description: '[6. Workload] bundled (image) or remote_git')
+        string(name: 'HAMMERDB_PATH',       defaultValue: '/root/hammerdb-tpcc-wrapper-scripts', description: '[6. Workload] Deploy path on guests')
+        string(name: 'HAMMERDB_REPO',       defaultValue: 'https://github.com/ekuric/ioscale.git', description: '[6. Workload] Only when HAMMERDB_SOURCE=remote_git')
+        string(name: 'HAMMERDB_INSTALL_DIR', defaultValue: '/usr/local/HammerDB', description: '[6. Workload] HammerDB install dir on guests')
+
+        // ----- 7. Resilience / migration -----
+        string(name: 'RETRY_INTERVAL',      defaultValue: '30',               description: '[7. Resilience] SSH retry interval (s)')
+        string(name: 'MAX_RETRIES',         defaultValue: '10',               description: '[7. Resilience] SSH max retries')
+        string(name: 'MONITOR_INTERVAL',    defaultValue: '60',               description: '[7. Resilience] Task monitor interval (s)')
+        string(name: 'MIGRATE_USER_COUNTS', defaultValue: '',                description: '[7. Resilience] User counts that trigger live migrate')
+        string(name: 'MIGRATE_INTERVAL',    defaultValue: '0',               description: '[7. Resilience] Seconds between migrations (0=parallel)')
+        choice(name: 'MONITOR_VM',          choices: ['false', 'true'],      description: '[7. Resilience] Log VM node placement')
+        string(name: 'MONITOR_VM_INTERVAL', defaultValue: '10',              description: '[7. Resilience] Placement poll interval (s)')
     }
 
     environment {
-        RESULTS_DIR  = '/root/mariadb-results'
-        BASTION_CONN = "${params.BASTION_USER}@${params.BASTION_HOST}"
+        RESULTS_DIR = '/root/mariadb-results'
     }
 
     stages {
+        stage('Resolve Target') {
+            steps {
+                script {
+                    def profiles = [
+                        lab1: [
+                            bastionHost     : 'bastion.lab1.example.com',
+                            bastionUser     : 'root',
+                            sshCredentialId : 'lab1-bastion-key',
+                            apiUrl          : 'https://api.lab1.example.com:6443',
+                            containerImage  : 'quay.io/ekuric/mariadb-benchmark:latest',
+                        ],
+                        lab2: [
+                            bastionHost     : 'bastion.lab2.example.com',
+                            bastionUser     : 'root',
+                            sshCredentialId : 'lab2-bastion-key',
+                            apiUrl          : 'https://api.lab2.example.com:6443',
+                            containerImage  : 'quay.io/ekuric/mariadb-benchmark:latest',
+                        ],
+                    ]
+
+                    if (params.CLUSTER != 'custom' && profiles.containsKey(params.CLUSTER)) {
+                        def p = profiles[params.CLUSTER]
+                        env.RESOLVED_BASTION_HOST      = p.bastionHost
+                        env.RESOLVED_BASTION_USER      = p.bastionUser
+                        env.RESOLVED_SSH_CREDENTIAL_ID = p.sshCredentialId
+                        env.RESOLVED_API_URL           = p.apiUrl
+                        env.RESOLVED_CONTAINER_IMAGE   = p.containerImage
+                        echo "CLUSTER=${params.CLUSTER} → bastion=${p.bastionHost}, harness=${p.containerImage}"
+                    } else {
+                        env.RESOLVED_BASTION_HOST      = params.BASTION_HOST
+                        env.RESOLVED_BASTION_USER      = params.BASTION_USER
+                        env.RESOLVED_SSH_CREDENTIAL_ID = params.SSH_CREDENTIAL_ID
+                        env.RESOLVED_API_URL           = params.API_URL
+                        env.RESOLVED_CONTAINER_IMAGE   = params.CONTAINER_IMAGE
+                        echo "CLUSTER=custom → bastion=${params.BASTION_HOST}, harness=${params.CONTAINER_IMAGE}"
+                    }
+
+                    env.BASTION_CONN = "${env.RESOLVED_BASTION_USER}@${env.RESOLVED_BASTION_HOST}"
+                }
+            }
+        }
+
         stage('Prepare') {
             steps {
-                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                sshagent(credentials: [env.RESOLVED_SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
-                            mkdir -p ${RESULTS_DIR}
-                            podman pull ${params.CONTAINER_IMAGE} || true
+                            mkdir -p ${RESULTS_DIR} /tmp/mariadb-ssh
+                            podman pull ${RESOLVED_CONTAINER_IMAGE} || true
                         '
                     """
                 }
@@ -52,30 +164,50 @@ pipeline {
 
         stage('Run MariaDB Test') {
             steps {
-                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                sshagent(credentials: [env.RESOLVED_SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            mkdir -p /tmp/mariadb-ssh
                             podman run --rm --init --pids-limit=-1 \
-                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
+                              -e DESCRIPTION="${params.DESCRIPTION}" \
                               -e NAMESPACE="${params.NAMESPACE}" \
+                              -e CREATE_VMS="${params.CREATE_VMS}" \
+                              -e CLEANUP="${params.CLEANUP}" \
+                              -e VMS="${params.VMS}" \
+                              -e VM_PREFIX="${params.VM_PREFIX}" \
+                              -e VM_CPU="${params.VM_CPU}" \
+                              -e VM_MEMORY="${params.VM_MEMORY}" \
+                              -e VM_IMAGE="${params.VM_IMAGE}" \
+                              -e STORAGE_CLASS="${params.STORAGE_CLASS}" \
+                              -e ROOT_VOLUME_SIZE="${params.ROOT_VOLUME_SIZE}" \
+                              -e DATA_DISK_SIZE="${params.DATA_DISK_SIZE}" \
+                              -e HOST_PATTERN="${params.HOST_PATTERN}" \
                               -e DISK_LIST="${params.DISK_LIST}" \
                               -e MOUNT_POINT="${params.MOUNT_POINT}" \
                               -e WAREHOUSE_COUNT=${params.WAREHOUSE_COUNT} \
                               -e TEST_DURATION=${params.TEST_DURATION} \
                               -e USER_COUNT="${params.USER_COUNT}" \
+                              -e RAMPUP_TIME="${params.RAMPUP_TIME}" \
                               -e HAMMERDB_SOURCE="${params.HAMMERDB_SOURCE}" \
                               -e HAMMERDB_PATH="${params.HAMMERDB_PATH}" \
                               -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
                               -e HAMMERDB_INSTALL_DIR="${params.HAMMERDB_INSTALL_DIR}" \
-                              -e RAMPUP_TIME="${params.RAMPUP_TIME}" \
+                              -e RETRY_INTERVAL=${params.RETRY_INTERVAL} \
+                              -e MAX_RETRIES=${params.MAX_RETRIES} \
+                              -e MONITOR_INTERVAL=${params.MONITOR_INTERVAL} \
                               -e MIGRATE_USER_COUNTS="${params.MIGRATE_USER_COUNTS}" \
                               -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
-                              -e DESCRIPTION="${params.DESCRIPTION}" \
-                              -v ${RESULTS_DIR}:/work/results \
-                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
-                              -v /root/.kube/config:/root/.kube/config \
+                              -e MONITOR_VM="${params.MONITOR_VM}" \
+                              -e MONITOR_VM_INTERVAL=${params.MONITOR_VM_INTERVAL} \
+                              -e KUBEADMIN_PASSWORD="${params.KUBEADMIN_PASSWORD}" \
+                              -e API_URL="${RESOLVED_API_URL}" \
+                              -e KUBECONFIG=/root/.kube/config \
+                              -v ${RESULTS_DIR}:/work/results:Z \
+                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro,Z \
+                              -v /root/.kube:/root/.kube:ro,Z \
+                              -v /tmp/mariadb-ssh:/host-tmp:Z \
                               --privileged \
-                              ${params.CONTAINER_IMAGE}
+                              ${RESOLVED_CONTAINER_IMAGE}
                         '
                     """
                 }
@@ -84,7 +216,7 @@ pipeline {
 
         stage('Collect Results') {
             steps {
-                sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
+                sshagent(credentials: [env.RESOLVED_SSH_CREDENTIAL_ID]) {
                     sh """
                         mkdir -p mariadb-results
                         scp -o StrictHostKeyChecking=no -r \
@@ -110,7 +242,9 @@ pipeline {
         }
         always {
             echo "Test description: ${params.DESCRIPTION}"
+            echo "Create VMs: ${params.CREATE_VMS} count=${params.VMS} prefix=${params.VM_PREFIX} cleanup=${params.CLEANUP}"
             echo "Hosts: ${params.HOST_PATTERN}"
+            echo "StorageClass: ${params.STORAGE_CLASS}"
             echo "Warehouses: ${params.WAREHOUSE_COUNT}, Duration: ${params.TEST_DURATION}m"
             echo "User counts: ${params.USER_COUNT}"
         }

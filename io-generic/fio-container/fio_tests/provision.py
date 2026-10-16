@@ -198,30 +198,60 @@ def remove_ssh_key_dir(key_dir: Optional[str], *, also_bastion_mirror: bool = Fa
             )
 
 
-def delete_managed_resources(namespace: str) -> None:
-    """Delete all fio-container managed VMs, DVs, PVCs, and Secrets in the namespace."""
-    logger.info(
-        f"Deleting managed VMs/DataVolumes/Secrets in namespace {namespace} "
-        f"(label {MANAGED_LABEL})..."
-    )
-    # VMs first so DV templates / owner refs unwind cleanly; secrets last
-    for kind in ("vm", "dv", "pvc", "secret"):
-        result = _run_oc(
-            ["delete", kind, "-n", namespace, "-l", MANAGED_LABEL, "--wait=true", "--timeout=600s"],
-            check=False,
-            timeout=700,
+def _os_names_for_run(config: FioTestConfig) -> List[str]:
+    """OS labels this run owns (linux / windows). Used to scope wipe/cleanup."""
+    names: List[str] = []
+    if getattr(config, "vms_count", 0) and config.vms_count > 0:
+        names.append("linux")
+    if getattr(config, "win_vms_count", 0) and config.win_vms_count > 0:
+        names.append("windows")
+    return names
+
+
+def delete_managed_resources(
+    namespace: str,
+    *,
+    os_names: Optional[Sequence[str]] = None,
+) -> None:
+    """Delete fio-container managed VMs/DVs/PVCs/Secrets.
+
+    When os_names is set (e.g. [\"linux\"]), only resources with
+    fio-container.ioscale/os=<name> are deleted — so fio-linux and fio-windows
+    can share a namespace without wiping each other.
+    """
+    if not os_names:
+        logger.warning(
+            "delete_managed_resources called without os_names — refusing to wipe "
+            "all managed VMs (would cross linux/windows). Pass os_names explicitly."
         )
-        out = (result.stdout or "").strip()
-        err = (result.stderr or "").strip()
-        if result.returncode == 0:
-            logger.info(f"  {kind}: {out or 'deleted (or none)'}")
-        else:
-            # Not found / no resources is fine
-            combined = f"{out}\n{err}".lower()
-            if "not found" in combined or "no resources found" in combined:
-                logger.info(f"  {kind}: none to delete")
+        return
+
+    for os_name in os_names:
+        selector = f"{MANAGED_LABEL},{LABEL_OS}={os_name}"
+        logger.info(
+            f"Deleting managed {os_name} VMs/DataVolumes/Secrets in namespace {namespace} "
+            f"(label selector {selector})..."
+        )
+        # VMs first so DV templates / owner refs unwind cleanly; secrets last
+        for kind in ("vm", "dv", "pvc", "secret"):
+            result = _run_oc(
+                [
+                    "delete", kind, "-n", namespace, "-l", selector,
+                    "--wait=true", "--timeout=600s",
+                ],
+                check=False,
+                timeout=700,
+            )
+            out = (result.stdout or "").strip()
+            err = (result.stderr or "").strip()
+            if result.returncode == 0:
+                logger.info(f"  [{os_name}] {kind}: {out or 'deleted (or none)'}")
             else:
-                logger.warning(f"  {kind} delete warning: {err or out}")
+                combined = f"{out}\n{err}".lower()
+                if "not found" in combined or "no resources found" in combined:
+                    logger.info(f"  [{os_name}] {kind}: none to delete")
+                else:
+                    logger.warning(f"  [{os_name}] {kind} delete warning: {err or out}")
 
 
 def _build_linux_source_dv(
@@ -834,9 +864,14 @@ def provision_vms(config: FioTestConfig) -> Tuple[List[str], List[str], str]:
     config.ssh_identity_file = private_key
     config.ssh_key_bastion_path = mirror_ssh_keypair_to_bastion(key_dir, run_id)
 
-    # Always wipe prior managed leftovers before create
-    logger.info("Wiping prior managed VMs/DataVolumes (fio.managed=true) before create...")
-    delete_managed_resources(config.namespace)
+    # Wipe only this run's OS leftovers (linux and/or windows) — never the other OS
+    # in the same namespace (fio-linux must not delete fio-windows VMs and vice versa).
+    os_to_wipe = _os_names_for_run(config)
+    logger.info(
+        f"Wiping prior managed VMs/DataVolumes before create "
+        f"(os={os_to_wipe}, label {MANAGED_LABEL}+{LABEL_OS})..."
+    )
+    delete_managed_resources(config.namespace, os_names=os_to_wipe)
 
     attach_data = not config.use_testdir
     linux_hosts: List[str] = []
@@ -960,11 +995,14 @@ def provision_vms(config: FioTestConfig) -> Tuple[List[str], List[str], str]:
 
 
 def cleanup_provisioned(config: FioTestConfig) -> None:
-    """Delete managed VMs/DVs when --cleanup is set."""
+    """Delete managed VMs/DVs when --cleanup is set (scoped to this run's OS)."""
     if config.dry_run:
         logger.info("DRY-RUN: would cleanup managed VMs (skipped)")
         return
     if not config.namespace or config.namespace == "N/A":
         return
-    logger.info("CLEANUP: removing managed VMs/DataVolumes after test...")
-    delete_managed_resources(config.namespace)
+    os_to_wipe = _os_names_for_run(config)
+    logger.info(
+        f"CLEANUP: removing managed VMs/DataVolumes after test (os={os_to_wipe})..."
+    )
+    delete_managed_resources(config.namespace, os_names=os_to_wipe)

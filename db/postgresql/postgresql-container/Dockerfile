@@ -10,6 +10,8 @@ RUN dnf install -y git \
  && dnf clean all
 
 COPY postgresql.py .
+COPY postgresql_tests/ postgresql_tests/
+COPY templates/ templates/
 COPY postgresql-config.yaml examples/
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
