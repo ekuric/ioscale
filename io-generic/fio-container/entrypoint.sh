@@ -3,37 +3,7 @@ set -euo pipefail
 
 CONFIG="${CONFIG:-/work/fio-config.yaml}"
 
-# --- Kubeconfig check (required for --virtctl-only) ---
-KUBECONFIG="${KUBECONFIG:-/root/.kube/config}"
-export KUBECONFIG
-if [[ ! -s "${KUBECONFIG}" ]]; then
-    echo "ERROR: kubeconfig missing or empty at ${KUBECONFIG}" >&2
-    echo "Mount the bastion kubeconfig, e.g.:" >&2
-    echo "  -v /root/.kube:/root/.kube:ro,Z -e KUBECONFIG=/root/.kube/config" >&2
-    ls -la /root/.kube 2>/dev/null || echo "( /root/.kube not present )" >&2
-    exit 1
-fi
-echo "Using kubeconfig: ${KUBECONFIG}"
-if ! oc whoami 2>/dev/null; then
-    echo "ERROR: oc cannot authenticate with ${KUBECONFIG}" >&2
-    echo "On the bastion verify: ls -la /root/.kube/config && oc whoami" >&2
-    echo "If SELinux is enforcing, remount with :Z (e.g. -v /root/.kube:/root/.kube:ro,Z)" >&2
-    oc whoami 2>&1 || true
-    exit 1
-fi
-echo "Cluster identity: $(oc whoami 2>/dev/null)  server=$(oc whoami --show-server 2>/dev/null || true)"
-
-# --- OC login (optional) ---
-if [[ -n "${KUBEADMIN_PASSWORD:-}" ]]; then
-    API_URL="${API_URL:-https://api.ocp.example.com:6443}"
-    echo "Logging in to ${API_URL} ..."
-    oc login "${API_URL}" \
-        --username=kubeadmin \
-        --password="${KUBEADMIN_PASSWORD}" \
-        --insecure-skip-tls-verify=true
-fi
-
-# --- Mode detection ---
+# --- Mode detection (before kubeconfig: SSH-only needs no cluster) ---
 # Normalize OS-disk / raw-disk modes early: env or CLI flags (args are passed
 # through to fio-tests.py after config generation, so detect them here too).
 _testdir_raw="${USE_TESTDIR:-false}"
@@ -56,6 +26,11 @@ case "${_cleanup_raw,,}" in
     true|1|yes|on) CLEANUP=true ;;
     *) CLEANUP=false ;;
 esac
+_ssh_only_raw="${SSH_ONLY:-false}"
+case "${_ssh_only_raw,,}" in
+    true|1|yes|on) SSH_ONLY=true ;;
+    *) SSH_ONLY=false ;;
+esac
 for _arg in "$@"; do
     if [[ "${_arg}" == "--testdir" ]]; then
         USE_TESTDIR=true
@@ -69,11 +44,60 @@ for _arg in "$@"; do
     if [[ "${_arg}" == "--cleanup" ]]; then
         CLEANUP=true
     fi
+    if [[ "${_arg}" == "--ssh-only" ]]; then
+        SSH_ONLY=true
+    fi
 done
 export USE_TESTDIR
 export USE_RAW_DISK
 export CREATE_VMS
 export CLEANUP
+export SSH_ONLY
+
+if [[ "${CREATE_VMS}" == "true" && "${SSH_ONLY}" == "true" ]]; then
+    echo "ERROR: CREATE_VMS/--create-vms requires virtctl mode (not --ssh-only / SSH_ONLY)" >&2
+    exit 1
+fi
+
+if [[ "${SSH_ONLY}" == "true" ]]; then
+    CONNECTION_FLAG="--ssh-only"
+    echo "SSH-only mode: plain SSH to hosts (no kubeconfig / virtctl required)"
+else
+    CONNECTION_FLAG="--virtctl-only"
+fi
+
+# --- Kubeconfig check (required for --virtctl-only; skipped for --ssh-only) ---
+if [[ "${SSH_ONLY}" != "true" ]]; then
+    KUBECONFIG="${KUBECONFIG:-/root/.kube/config}"
+    export KUBECONFIG
+    if [[ ! -s "${KUBECONFIG}" ]]; then
+        echo "ERROR: kubeconfig missing or empty at ${KUBECONFIG}" >&2
+        echo "Mount the bastion kubeconfig, e.g.:" >&2
+        echo "  -v /root/.kube:/root/.kube:ro,Z -e KUBECONFIG=/root/.kube/config" >&2
+        echo "Or use plain SSH hosts: -e SSH_ONLY=true / --ssh-only (no kubeconfig needed)" >&2
+        ls -la /root/.kube 2>/dev/null || echo "( /root/.kube not present )" >&2
+        exit 1
+    fi
+    echo "Using kubeconfig: ${KUBECONFIG}"
+    if ! oc whoami 2>/dev/null; then
+        echo "ERROR: oc cannot authenticate with ${KUBECONFIG}" >&2
+        echo "On the bastion verify: ls -la /root/.kube/config && oc whoami" >&2
+        echo "If SELinux is enforcing, remount with :Z (e.g. -v /root/.kube:/root/.kube:ro,Z)" >&2
+        oc whoami 2>&1 || true
+        exit 1
+    fi
+    echo "Cluster identity: $(oc whoami 2>/dev/null)  server=$(oc whoami --show-server 2>/dev/null || true)"
+
+    # --- OC login (optional) ---
+    if [[ -n "${KUBEADMIN_PASSWORD:-}" ]]; then
+        API_URL="${API_URL:-https://api.ocp.example.com:6443}"
+        echo "Logging in to ${API_URL} ..."
+        oc login "${API_URL}" \
+            --username=kubeadmin \
+            --password="${KUBEADMIN_PASSWORD}" \
+            --insecure-skip-tls-verify=true
+    fi
+fi
 
 if [[ "${USE_TESTDIR}" == "true" && "${USE_RAW_DISK}" == "true" ]]; then
     echo "ERROR: USE_TESTDIR/--testdir and USE_RAW_DISK/--raw-disk are mutually exclusive" >&2
@@ -519,7 +543,7 @@ fi
 
 exec python3 /work/fio-tests.py \
     -c "${CONFIG}" \
-    --virtctl-only \
+    ${CONNECTION_FLAG} \
     --yes-i-mean-it \
     ${EXTRA_ARGS} \
     "$@"

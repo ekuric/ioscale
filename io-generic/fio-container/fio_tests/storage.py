@@ -124,23 +124,21 @@ def prepare_storage(config: FioTestConfig, executor: CommandExecutor) -> None:
                 futures = {}
                 for host in windows_hosts:
                     device = config.windows_storage_devices.get(host, "1")
+                    # Keep -Command "..." free of nested double-quotes. AccessPath
+                    # like "$($v.DriveLetter):\" previously terminated the string early
+                    # (PowerShell: "The string is missing the terminator").
+                    # Clear-Disk alone is enough for raw PhysicalDrive FIO.
                     cmd = (
-                        f"powershell -Command \""
-                        f"$ErrorActionPreference='Stop'; "
-                        f"$d = Get-Disk -Number {device}; "
-                        f"if ($d.IsOffline) {{ Set-Disk -Number {device} -IsOffline $false }}; "
-                        f"if ($d.IsReadOnly) {{ Set-Disk -Number {device} -IsReadOnly $false }}; "
-                        f"Get-Disk -Number {device} | Get-Partition -ErrorAction SilentlyContinue | "
-                        f"  ForEach-Object {{ "
-                        f"    $v = $_ | Get-Volume -ErrorAction SilentlyContinue; "
-                        f"    if ($v -and $v.DriveLetter) {{ "
-                        f"      Get-Volume -DriveLetter $v.DriveLetter | "
-                        f"        Get-Partition | Remove-PartitionAccessPath "
-                        f"        -AccessPath \"$($v.DriveLetter):\\\" -ErrorAction SilentlyContinue "
-                        f"    }} "
-                        f"  }}; "
-                        f"Clear-Disk -Number {device} -RemoveData -Confirm:$false -ErrorAction SilentlyContinue; "
+                        f"powershell -NoProfile -Command \""
+                        f"$ErrorActionPreference='Continue'; "
                         f"Set-Disk -Number {device} -IsOffline $false -ErrorAction SilentlyContinue; "
+                        f"Set-Disk -Number {device} -IsReadOnly $false -ErrorAction SilentlyContinue; "
+                        f"Clear-Disk -Number {device} -RemoveData -RemoveOEM -Confirm:$false "
+                        f"-ErrorAction SilentlyContinue; "
+                        f"Set-Disk -Number {device} -IsOffline $false -ErrorAction SilentlyContinue; "
+                        f"if (-not (Get-Disk -Number {device} -ErrorAction SilentlyContinue)) {{ "
+                        f"Write-Host 'RAW_DISK_MISSING'; exit 1 "
+                        f"}}; "
                         f"Write-Host 'RAW_DISK_READY'\""
                     )
                     futures[

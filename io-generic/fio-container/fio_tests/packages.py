@@ -102,8 +102,9 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
     """
     Ensure FIO and required packages are installed on all hosts.
 
-    For Linux hosts: installs fio, xfsprogs, and util-linux via dnf unless
+    For Linux hosts: installs fio, xfsprogs, util-linux, and tar via dnf unless
     config.fio_installed is True (golden image — Linux check/install skipped).
+    tar is required to package/collect results on the test hosts.
     For Windows hosts: copies FIO executable from c:\tools\fio to the
     configured FIO directory on each host.
 
@@ -174,10 +175,15 @@ def ensure_packages_installed(config: FioTestConfig, executor: CommandExecutor) 
                 "fio --version; "
                 "else "
                 "echo \"Installing FIO and dependencies...\"; "
-                "dnf install -y fio xfsprogs util-linux; "
+                "dnf install -y fio xfsprogs util-linux tar; "
                 "echo \"FIO installation completed\"; "
                 "fio --version; "
-                "fi"
+                "fi; "
+                "if ! command -v tar &> /dev/null; then "
+                "echo \"Installing tar (needed to package results)...\"; "
+                "dnf install -y tar; "
+                "fi; "
+                "tar --version | head -1"
                 "'"
             )
             future = pool.submit(

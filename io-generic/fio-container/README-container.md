@@ -638,17 +638,23 @@ podman run --rm --init --pids-limit=-1 \
   --dry-run
 ```
 
-### `--ssh-only`
+### `--ssh-only` / `SSH_ONLY=true`
 
-Force plain SSH for all hosts (overrides the default `--virtctl-only`).
+Force plain SSH for all hosts (no kubeconfig, `oc`, or `virtctl`). Use for
+bare-metal / KVM / any Linux VM reachable by SSH hostname or IP. Mutually
+exclusive with `CREATE_VMS` (provisioning is OpenShift/CNV only).
 
 ```bash
 podman run --rm --init --pids-limit=-1 \
+  -e SSH_ONLY=true \
   -v ./fio-config.yaml:/work/fio-config.yaml \
-  -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro \
-  quay.io/ekuric/fio-benchmark:latest \
-  --ssh-only
+  -v /root/fio-results:/work/results:Z \
+  -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro,Z \
+  --privileged \
+  quay.io/ekuric/fio-benchmark:latest
 ```
+
+Or pass `--ssh-only` as a container argument (same effect; kubeconfig mount not required).
 
 ### `--testdir`
 
