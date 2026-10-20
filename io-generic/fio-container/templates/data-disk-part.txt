@@ -1,0 +1,7 @@
+select disk 1
+online disk
+clean
+convert gpt
+create partition primary
+format quick fs=ntfs label=DataDisk
+assign letter=D
