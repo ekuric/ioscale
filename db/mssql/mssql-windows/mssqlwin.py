@@ -65,6 +65,15 @@ class MSSQLWinConfig:
         self.build_users = None
         self.mssql_total_iterations = None
         self.user_count: List[str] = []
+        # How many times to repeat the full user_count sweep (1 = single pass).
+        # Distinct from mssql_total_iterations (HammerDB per-VU transaction cap).
+        self.test_iterations = 1
+        # Seconds to sleep after a full user_count iteration before the next one.
+        # Skipped after the final iteration. 0 disables.
+        self.iteration_sleep_sec = 60
+        # Seconds to sleep between VU levels within an iteration (e.g. 10→20).
+        # Skipped after the last VU in the list. 0 disables.
+        self.vu_sleep_sec = 30
         self.test_duration = None
         self.rampup_time = None
         self.log_level = "INFO"
@@ -882,6 +891,46 @@ class ConfigLoader:
         if build_users not in (None, "", "null"):
             self.config.build_users = str(build_users)
         self.config.mssql_total_iterations = database.get("mssql_total_iterations")
+        # Sweep iterations (repeat full user_count list). Not mssql_total_iterations.
+        raw_iters = database.get("iterations", database.get("test_iterations"))
+        if raw_iters is not None and raw_iters != "null":
+            try:
+                self.config.test_iterations = max(1, int(raw_iters))
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Invalid database.iterations={raw_iters!r}; using 1"
+                )
+                self.config.test_iterations = 1
+        raw_sleep = database.get(
+            "iteration_sleep_sec",
+            database.get(
+                "iteration_sleep",
+                database.get(
+                    "sweep_sleep_sec",  # backward-compatible alias
+                    database.get("sweep_sleep", database.get("inter_sweep_sleep")),
+                ),
+            ),
+        )
+        if raw_sleep is not None and raw_sleep != "null":
+            try:
+                self.config.iteration_sleep_sec = max(0, int(raw_sleep))
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Invalid database.iteration_sleep_sec={raw_sleep!r}; using "
+                    f"{self.config.iteration_sleep_sec}"
+                )
+        raw_vu_sleep = database.get(
+            "vu_sleep_sec",
+            database.get("vu_sleep", database.get("user_count_sleep_sec")),
+        )
+        if raw_vu_sleep is not None and raw_vu_sleep != "null":
+            try:
+                self.config.vu_sleep_sec = max(0, int(raw_vu_sleep))
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Invalid database.vu_sleep_sec={raw_vu_sleep!r}; using "
+                    f"{self.config.vu_sleep_sec}"
+                )
         self.config.test_duration = database.get("test_duration")
         self.config.rampup_time = database.get("rampup_time")
         db_mssql_pass = database.get("mssql_pass")
@@ -1122,6 +1171,11 @@ def display_config(config: MSSQLWinConfig) -> None:
     if config.build_users:
         logger.info(f"Build users: {config.build_users}")
     logger.info(f"User counts: {' '.join(config.user_count)}")
+    logger.info(f"Sweep iterations: {config.test_iterations}")
+    logger.info(
+        f"Sleeps: vu_sleep={config.vu_sleep_sec}s between VU levels, "
+        f"iteration_sleep={config.iteration_sleep_sec}s between iterations"
+    )
     logger.info(f"Test duration: {config.test_duration} minutes")
     if config.windows_hammerdb_path:
         logger.info(f"Windows HammerDB path: {config.windows_hammerdb_path}")
@@ -1769,9 +1823,10 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor, migrati
         ps_content = re.sub(r"mssqls_tprocc_run\d+\.tcl", tcl_name, ps_content)
         ps_content = ps_content.replace("$user_count", str(user_count))
         vu_label = f"{int(user_count):03d}vu"
+        # Substitute VU label only; leave run$run / env HAMMERDB_RUN for sweep iterations.
         ps_content = re.sub(
-            r"mssqls_tprocc_\d+vu_run1",
-            f"mssqls_tprocc_{vu_label}_run1",
+            r"mssqls_tprocc_\d+vu",
+            f"mssqls_tprocc_{vu_label}",
             ps_content,
         )
         if "$env:HAMMERDB_RESULT_DIR" not in ps_content and "$results" not in ps_content:
@@ -1817,248 +1872,283 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor, migrati
             logger.error("rebuild_always requires windows.rebuilddb to be enabled")
             return
 
-    for user_count in user_counts:
-        if migration_monitor:
-            migration_monitor.current_operation = f"tpcc {user_count} users"
+    sweep_iterations = max(1, int(config.test_iterations or 1))
+    for run_id in range(1, sweep_iterations + 1):
+        if sweep_iterations > 1:
+            logger.info(
+                f"=== Sweep iteration {run_id}/{sweep_iterations} "
+                f"(results -> *_run{run_id}.*) ==="
+            )
+        for vu_idx, user_count in enumerate(user_counts):
+            if migration_monitor:
+                migration_monitor.current_operation = f"tpcc {user_count} users run{run_id}"
 
-        if config.windows_rebuild_always is True:
-            logger.info(f"Rebuilding database before {user_count} user test...")
-            if not config.dry_run:
-                build_database_windows(config, executor)
-        logger.info(
-            f"Starting Windows test run for {user_count} users on hosts: "
-            f"{', '.join(config.db_hosts)}"
-        )
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
-            # Phase 1: pre-warm connections to reduce first-connection overhead
-            if not config.dry_run and not config.generate_only:
-                warm_cmd = build_powershell_command('Write-Output "warm"')
-                warm_futures = [
-                    pool.submit(
-                        executor.execute_command,
-                        host,
-                        warm_cmd,
-                        "Pre-warming connection",
-                        30
-                    )
-                    for host in config.db_hosts
-                ]
-                for future in as_completed(warm_futures):
-                    success, output = future.result()
-                    if not success:
-                        logger.warning(f"Pre-warm failed: {output}")
-
-            # Phase 2: stage scripts and ensure result directory exists (parallel)
-            def stage_host(host: str) -> None:
+            if config.windows_rebuild_always is True:
+                logger.info(f"Rebuilding database before {user_count} user test (sweep run {run_id}/{sweep_iterations})...")
+                if not config.dry_run:
+                    build_database_windows(config, executor)
+            logger.info(
+                f"Starting Windows test run for {user_count} users (sweep run {run_id}/{sweep_iterations}) on hosts: "
+                f"{', '.join(config.db_hosts)}"
+            )
+            with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+                # Phase 1: pre-warm connections to reduce first-connection overhead
                 if not config.dry_run and not config.generate_only:
-                    mkdir_cmd = build_powershell_command(
-                        f'New-Item -Path "{result_dir}" -ItemType Directory -Force | Out-Null'
+                    warm_cmd = build_powershell_command('Write-Output "warm"')
+                    warm_futures = [
+                        pool.submit(
+                            executor.execute_command,
+                            host,
+                            warm_cmd,
+                            "Pre-warming connection",
+                            30
+                        )
+                        for host in config.db_hosts
+                    ]
+                    for future in as_completed(warm_futures):
+                        success, output = future.result()
+                        if not success:
+                            logger.warning(f"Pre-warm failed: {output}")
+
+                # Phase 2: stage scripts and ensure result directory exists (parallel)
+                def stage_host(host: str) -> None:
+                    if not config.dry_run and not config.generate_only:
+                        mkdir_cmd = build_powershell_command(
+                            f'New-Item -Path "{result_dir}" -ItemType Directory -Force | Out-Null'
+                        )
+                        mkdir_success, mkdir_output = executor.execute_command(
+                            host,
+                            mkdir_cmd,
+                            "Ensuring result directory exists",
+                            timeout=60
+                        )
+                        if not mkdir_success:
+                            raise RuntimeError(f"Failed to create result directory on {host}: {mkdir_output}")
+                    remote_ps1 = config.windows_test_script or f"{windows_path}\\{ntpath.basename(local_ps1_files[user_count])}"
+                    remote_tcl = f"{windows_path}\\{ntpath.basename(local_tcl_files[user_count])}"
+                    if not config.dry_run:
+                        if not executor.copy_file_to_host(local_ps1_files[user_count], host, remote_ps1, "test script"):
+                            raise RuntimeError(f"Failed to copy test script to {host}")
+                        if not executor.copy_file_to_host(local_tcl_files[user_count], host, remote_tcl, "hammerdb test script"):
+                            raise RuntimeError(f"Failed to copy hammerdb test script to {host}")
+
+                stage_futures = [pool.submit(stage_host, host) for host in config.db_hosts]
+                for future in as_completed(stage_futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.error(f"Failed to stage test files: {e}")
+                        sys.exit(1)
+
+                def ensure_mssql_running(host: str) -> None:
+                    service_name = config.windows_mssql_service_name
+                    ps_lines = [
+                        "$ErrorActionPreference = 'Stop'",
+                    ]
+                    if service_name:
+                        ps_lines.append(f'$serviceName = "{service_name}"')
+                        ps_lines.append("$svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue")
+                    else:
+                        ps_lines.append(
+                            "$svc = Get-Service -Name MSSQLSERVER -ErrorAction SilentlyContinue"
+                        )
+                        ps_lines.append(
+                            "if (-not $svc) { "
+                            "$svc = Get-Service -Name 'MSSQL$*' -ErrorAction SilentlyContinue | "
+                            "Select-Object -First 1 }"
+                        )
+                        ps_lines.append("$serviceName = $svc.Name")
+                    ps_lines.append(
+                        "if (-not $svc) { Write-Error 'SQL Server service not found'; exit 1 }"
                     )
-                    mkdir_success, mkdir_output = executor.execute_command(
+                    ps_lines.append('Write-Host "Using SQL Server service: $serviceName"')
+                    ps_lines.append(
+                        "if ($svc.Status -ne 'Running') { "
+                        "Write-Host \"Starting SQL Server service $serviceName...\"; "
+                        "Start-Service -Name $serviceName; "
+                        "(Get-Service -Name $serviceName).WaitForStatus('Running','00:02:00') }"
+                    )
+                    ps_lines.extend([
+                        "$attempts = 24",
+                        "$sleep = 5",
+                        "for ($i = 0; $i -lt $attempts; $i++) {",
+                        "  sqlcmd -S localhost -E -Q \"SELECT 1\" -b -l 5 -t 5 *> $null",
+                        "  if ($LASTEXITCODE -eq 0) { Write-Host 'SQL Server is ready.'; exit 0 }",
+                        "  Start-Sleep -Seconds $sleep",
+                        "}",
+                        "Write-Error 'SQL Server did not become ready in time.'",
+                        "exit 1",
+                    ])
+                    ps_cmd = build_powershell_command("; ".join(ps_lines))
+                    success, output = executor.execute_command(
                         host,
-                        mkdir_cmd,
-                        "Ensuring result directory exists",
+                        ps_cmd,
+                        "Ensuring SQL Server service is running",
+                        timeout=config.timeout_default
+                    )
+                    if not success:
+                        raise RuntimeError(output)
+
+                def get_mssql_service_status(host: str) -> Optional[str]:
+                    service_name = config.windows_mssql_service_name
+                    ps_lines = [
+                        "$ErrorActionPreference = 'Stop'",
+                    ]
+                    if service_name:
+                        ps_lines.append(f'$serviceName = "{service_name}"')
+                        ps_lines.append("$svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue")
+                    else:
+                        ps_lines.append(
+                            "$svc = Get-Service -Name MSSQLSERVER -ErrorAction SilentlyContinue"
+                        )
+                        ps_lines.append(
+                            "if (-not $svc) { "
+                            "$svc = Get-Service -Name 'MSSQL$*' -ErrorAction SilentlyContinue | "
+                            "Select-Object -First 1 }"
+                        )
+                        ps_lines.append("$serviceName = $svc.Name")
+                    ps_lines.append(
+                        "if (-not $svc) { Write-Output 'UNKNOWN'; exit 0 }"
+                    )
+                    ps_lines.append('Write-Output "$serviceName|$($svc.Status)"')
+                    ps_cmd = build_powershell_command("; ".join(ps_lines))
+                    success, output = executor.execute_command(
+                        host,
+                        ps_cmd,
+                        "Checking SQL Server service status",
                         timeout=60
                     )
-                    if not mkdir_success:
-                        raise RuntimeError(f"Failed to create result directory on {host}: {mkdir_output}")
-                remote_ps1 = config.windows_test_script or f"{windows_path}\\{ntpath.basename(local_ps1_files[user_count])}"
-                remote_tcl = f"{windows_path}\\{ntpath.basename(local_tcl_files[user_count])}"
-                if not config.dry_run:
-                    if not executor.copy_file_to_host(local_ps1_files[user_count], host, remote_ps1, "test script"):
-                        raise RuntimeError(f"Failed to copy test script to {host}")
-                    if not executor.copy_file_to_host(local_tcl_files[user_count], host, remote_tcl, "hammerdb test script"):
-                        raise RuntimeError(f"Failed to copy hammerdb test script to {host}")
-
-            stage_futures = [pool.submit(stage_host, host) for host in config.db_hosts]
-            for future in as_completed(stage_futures):
-                try:
-                    future.result()
-                except Exception as e:
-                    logger.error(f"Failed to stage test files: {e}")
-                    sys.exit(1)
-
-            def ensure_mssql_running(host: str) -> None:
-                service_name = config.windows_mssql_service_name
-                ps_lines = [
-                    "$ErrorActionPreference = 'Stop'",
-                ]
-                if service_name:
-                    ps_lines.append(f'$serviceName = "{service_name}"')
-                    ps_lines.append("$svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue")
-                else:
-                    ps_lines.append(
-                        "$svc = Get-Service -Name MSSQLSERVER -ErrorAction SilentlyContinue"
-                    )
-                    ps_lines.append(
-                        "if (-not $svc) { "
-                        "$svc = Get-Service -Name 'MSSQL$*' -ErrorAction SilentlyContinue | "
-                        "Select-Object -First 1 }"
-                    )
-                    ps_lines.append("$serviceName = $svc.Name")
-                ps_lines.append(
-                    "if (-not $svc) { Write-Error 'SQL Server service not found'; exit 1 }"
-                )
-                ps_lines.append('Write-Host "Using SQL Server service: $serviceName"')
-                ps_lines.append(
-                    "if ($svc.Status -ne 'Running') { "
-                    "Write-Host \"Starting SQL Server service $serviceName...\"; "
-                    "Start-Service -Name $serviceName; "
-                    "(Get-Service -Name $serviceName).WaitForStatus('Running','00:02:00') }"
-                )
-                ps_lines.extend([
-                    "$attempts = 24",
-                    "$sleep = 5",
-                    "for ($i = 0; $i -lt $attempts; $i++) {",
-                    "  sqlcmd -S localhost -E -Q \"SELECT 1\" -b -l 5 -t 5 *> $null",
-                    "  if ($LASTEXITCODE -eq 0) { Write-Host 'SQL Server is ready.'; exit 0 }",
-                    "  Start-Sleep -Seconds $sleep",
-                    "}",
-                    "Write-Error 'SQL Server did not become ready in time.'",
-                    "exit 1",
-                ])
-                ps_cmd = build_powershell_command("; ".join(ps_lines))
-                success, output = executor.execute_command(
-                    host,
-                    ps_cmd,
-                    "Ensuring SQL Server service is running",
-                    timeout=config.timeout_default
-                )
-                if not success:
-                    raise RuntimeError(output)
-
-            def get_mssql_service_status(host: str) -> Optional[str]:
-                service_name = config.windows_mssql_service_name
-                ps_lines = [
-                    "$ErrorActionPreference = 'Stop'",
-                ]
-                if service_name:
-                    ps_lines.append(f'$serviceName = "{service_name}"')
-                    ps_lines.append("$svc = Get-Service -Name $serviceName -ErrorAction SilentlyContinue")
-                else:
-                    ps_lines.append(
-                        "$svc = Get-Service -Name MSSQLSERVER -ErrorAction SilentlyContinue"
-                    )
-                    ps_lines.append(
-                        "if (-not $svc) { "
-                        "$svc = Get-Service -Name 'MSSQL$*' -ErrorAction SilentlyContinue | "
-                        "Select-Object -First 1 }"
-                    )
-                    ps_lines.append("$serviceName = $svc.Name")
-                ps_lines.append(
-                    "if (-not $svc) { Write-Output 'UNKNOWN'; exit 0 }"
-                )
-                ps_lines.append('Write-Output "$serviceName|$($svc.Status)"')
-                ps_cmd = build_powershell_command("; ".join(ps_lines))
-                success, output = executor.execute_command(
-                    host,
-                    ps_cmd,
-                    "Checking SQL Server service status",
-                    timeout=60
-                )
-                if not success:
-                    return None
-                status_line = output.strip().splitlines()[-1] if output else ""
-                if "|" in status_line:
-                    _, status = status_line.split("|", 1)
-                    return status.strip()
-                match = re.search(r"^(\S+)\|(Running|Stopped|StopPending|StartPending|Paused)\s*$",
-                                  output or "", flags=re.MULTILINE)
-                if match:
-                    return match.group(2).strip()
-                return None
-
-            def run_test_on_host(host: str, user_count: str, cmd: str) -> Tuple[bool, str]:
-                try:
-                    ensure_mssql_running(host)
-                except Exception as exc:
-                    return False, str(exc)
-                duration_label = f"{config.test_duration}m" if config.test_duration else "unspecified"
-                logger.info(
-                    f"Starting test on host {host} (users={user_count}), "
-                    f"test duration: {duration_label}"
-                )
-                success, output = executor.execute_command(
-                    host,
-                    cmd,
-                    f"Running Windows test for {user_count} users",
-                    config.timeout_test
-                )
-                if success:
-                    return True, output
-                logger.warning(
-                    f"Test failed on {host} (users={user_count}); attempting SQL Server restart and retry."
-                )
-                try:
-                    ensure_mssql_running(host)
-                except Exception as exc:
-                    return False, str(exc)
-                return executor.execute_command(
-                    host,
-                    cmd,
-                    f"Retrying Windows test for {user_count} users",
-                    config.timeout_test
-                )
-
-            def run_test_with_watchdog(host: str, user_count: str, cmd: str) -> Tuple[bool, str]:
-                with ThreadPoolExecutor(max_workers=1) as monitor_pool:
-                    future = monitor_pool.submit(run_test_on_host, host, user_count, cmd)
-                    while True:
-                        done, _ = wait([future], timeout=WATCHDOG_CHECK_INTERVAL, return_when=FIRST_COMPLETED)
-                        if done:
-                            return future.result()
-                        status = get_mssql_service_status(host)
-                        if status and status.lower() != "running":
-                            logger.warning(
-                                f"SQL Server service state on {host} is {status}; restarting."
-                            )
-                            try:
-                                ensure_mssql_running(host)
-                            except Exception as exc:
-                                logger.warning(
-                                    f"Failed to restart SQL Server on {host} during test: {exc}"
-                                )
-
-            # Phase 3: start tests in parallel after staging
-            start_futures = {}
-            for host in config.db_hosts:
-                duration_label = f"{config.test_duration}m" if config.test_duration else "unspecified"
-                logger.info(
-                    f"Preparing test on host {host} (users={user_count}), "
-                    f"test duration: {duration_label}"
-                )
-                remote_ps1 = config.windows_test_script or f"{windows_path}\\{ntpath.basename(local_ps1_files[user_count])}"
-                remote_tcl = f"{windows_path}\\{ntpath.basename(local_tcl_files[user_count])}"
-                hammerdb_test = remote_tcl
-                ps_cmd = "; ".join([
-                    f'cd "{windows_path}"',
-                    f'$env:HAMMERDB_PATH = "{windows_path}"',
-                    f'$env:HAMMERDB_TEST_SCRIPT = "{hammerdb_test}"',
-                    f'$env:HAMMERDB_WAREHOUSE_COUNT = "{config.warehouse_count or ""}"',
-                    f'$env:HAMMERDB_TEST_DURATION = "{config.test_duration or ""}"',
-                    f'$env:HAMMERDB_USER_COUNT = "{user_count}"',
-                    f'$env:HAMMERDB_RESULT_DIR = "{result_dir}"',
-                    f'$env:RESULT_DIR = "{result_dir}"',
-                    f'& "{remote_ps1}"'
-                ])
-                cmd = build_powershell_command(ps_cmd)
-                future = pool.submit(run_test_with_watchdog, host, user_count, cmd)
-                start_futures[future] = host
-            pending = set(start_futures.keys())
-            while pending:
-                done, pending = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
-                for future in done:
-                    host = start_futures[future]
-                    success, output = future.result()
-                    logger.info(f"Finished test on host {host} (users={user_count})")
                     if not success:
-                        logger.error(f"Windows test failed: {output}")
-                        sys.exit(1)
-                if pending and not done:
-                    pending_hosts = ", ".join(sorted(start_futures[future] for future in pending))
+                        return None
+                    status_line = output.strip().splitlines()[-1] if output else ""
+                    if "|" in status_line:
+                        _, status = status_line.split("|", 1)
+                        return status.strip()
+                    match = re.search(r"^(\S+)\|(Running|Stopped|StopPending|StartPending|Paused)\s*$",
+                                      output or "", flags=re.MULTILINE)
+                    if match:
+                        return match.group(2).strip()
+                    return None
+
+                def run_test_on_host(host: str, user_count: str, cmd: str) -> Tuple[bool, str]:
+                    try:
+                        ensure_mssql_running(host)
+                    except Exception as exc:
+                        return False, str(exc)
+                    duration_label = f"{config.test_duration}m" if config.test_duration else "unspecified"
                     logger.info(
-                        f"Waiting on test to finish on hosts: {pending_hosts} (users={user_count})"
+                        f"Starting test on host {host} (users={user_count}), "
+                        f"test duration: {duration_label}"
                     )
+                    success, output = executor.execute_command(
+                        host,
+                        cmd,
+                        f"Running Windows test for {user_count} users",
+                        config.timeout_test
+                    )
+                    if success:
+                        return True, output
+                    logger.warning(
+                        f"Test failed on {host} (users={user_count}); attempting SQL Server restart and retry."
+                    )
+                    try:
+                        ensure_mssql_running(host)
+                    except Exception as exc:
+                        return False, str(exc)
+                    return executor.execute_command(
+                        host,
+                        cmd,
+                        f"Retrying Windows test for {user_count} users",
+                        config.timeout_test
+                    )
+
+                def run_test_with_watchdog(host: str, user_count: str, cmd: str) -> Tuple[bool, str]:
+                    with ThreadPoolExecutor(max_workers=1) as monitor_pool:
+                        future = monitor_pool.submit(run_test_on_host, host, user_count, cmd)
+                        while True:
+                            done, _ = wait([future], timeout=WATCHDOG_CHECK_INTERVAL, return_when=FIRST_COMPLETED)
+                            if done:
+                                return future.result()
+                            status = get_mssql_service_status(host)
+                            if status and status.lower() != "running":
+                                logger.warning(
+                                    f"SQL Server service state on {host} is {status}; restarting."
+                                )
+                                try:
+                                    ensure_mssql_running(host)
+                                except Exception as exc:
+                                    logger.warning(
+                                        f"Failed to restart SQL Server on {host} during test: {exc}"
+                                    )
+
+                # Phase 3: start tests in parallel after staging
+                start_futures = {}
+                for host in config.db_hosts:
+                    duration_label = f"{config.test_duration}m" if config.test_duration else "unspecified"
+                    logger.info(
+                        f"Preparing test on host {host} (users={user_count}), "
+                        f"test duration: {duration_label}"
+                    )
+                    remote_ps1 = config.windows_test_script or f"{windows_path}\\{ntpath.basename(local_ps1_files[user_count])}"
+                    remote_tcl = f"{windows_path}\\{ntpath.basename(local_tcl_files[user_count])}"
+                    hammerdb_test = remote_tcl
+                    ps_cmd = "; ".join([
+                        f'cd "{windows_path}"',
+                        f'$env:HAMMERDB_PATH = "{windows_path}"',
+                        f'$env:HAMMERDB_TEST_SCRIPT = "{hammerdb_test}"',
+                        f'$env:HAMMERDB_WAREHOUSE_COUNT = "{config.warehouse_count or ""}"',
+                        f'$env:HAMMERDB_TEST_DURATION = "{config.test_duration or ""}"',
+                        f'$env:HAMMERDB_USER_COUNT = "{user_count}"',
+                        f'$env:HAMMERDB_RUN = "{run_id}"',
+                        f'$env:HAMMERDB_RESULT_DIR = "{result_dir}"',
+                        f'$env:RESULT_DIR = "{result_dir}"',
+                        f'& "{remote_ps1}"'
+                    ])
+                    cmd = build_powershell_command(ps_cmd)
+                    future = pool.submit(run_test_with_watchdog, host, user_count, cmd)
+                    start_futures[future] = host
+                pending = set(start_futures.keys())
+                while pending:
+                    done, pending = wait(pending, timeout=30, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        host = start_futures[future]
+                        success, output = future.result()
+                        logger.info(f"Finished test on host {host} (users={user_count})")
+                        if not success:
+                            logger.error(f"Windows test failed: {output}")
+                            sys.exit(1)
+                    if pending and not done:
+                        pending_hosts = ", ".join(sorted(start_futures[future] for future in pending))
+                        logger.info(
+                            f"Waiting on test to finish on hosts: {pending_hosts} (users={user_count})"
+                        )
+
+            # Pause between VU levels within this iteration (not after the last VU)
+            vu_sleep = int(config.vu_sleep_sec or 0)
+            if vu_sleep > 0 and vu_idx < len(user_counts) - 1:
+                next_vu = user_counts[vu_idx + 1]
+                logger.info(
+                    f"VU {user_count} complete (iteration {run_id}/{sweep_iterations}); "
+                    f"sleeping {vu_sleep}s before VU {next_vu}..."
+                )
+                if not config.dry_run:
+                    time.sleep(vu_sleep)
+
+        # Pause between iterations (not after the last one)
+        sleep_sec = int(config.iteration_sleep_sec or 0)
+        if sleep_sec > 0 and run_id < sweep_iterations:
+            logger.info(
+                f"Iteration {run_id}/{sweep_iterations} complete; "
+                f"sleeping {sleep_sec}s before next iteration..."
+            )
+            if not config.dry_run:
+                time.sleep(sleep_sec)
+
+    logger.info(
+        f"Completed {sweep_iterations} sweep iteration(s) over user counts: "
+        f"{', '.join(user_counts)}"
+    )
+
 
 
 def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_dir: str) -> None:
@@ -2411,6 +2501,16 @@ EXAMPLES:
                         help="Rebuild database before each user-count test run")
     parser.add_argument("--prepare-machine", action="store_true",
                         help="Prepare Windows machines by formatting the data disk and exit")
+    parser.add_argument("--iterations", type=int, default=None, dest="iterations",
+                        help="Repeat full user_count sweep N times (database.iterations)")
+    parser.add_argument("--iteration-sleep", type=int, default=None,
+                        dest="iteration_sleep",
+                        help="Seconds to sleep between sweep iterations (0=off). "
+                             "Alias: --sweep-sleep")
+    parser.add_argument("--sweep-sleep", type=int, default=None, dest="sweep_sleep",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--vu-sleep", type=int, default=None, dest="vu_sleep",
+                        help="Seconds to sleep between VU levels within an iteration (0=off)")
     parser.add_argument('--monitor-vm', action='store_true',
                         help='Monitor VM node placement during tests and log migrations')
     parser.add_argument('--monitor-vm-interval', type=int, default=10,
@@ -2435,6 +2535,10 @@ EXAMPLES:
     if args.rebuild_always:
         config.windows_rebuild_always = True
     prepare_machine = args.prepare_machine
+    cli_iterations = args.iterations
+    cli_iteration_sleep = args.iteration_sleep
+    cli_sweep_sleep = args.sweep_sleep
+    cli_vu_sleep = args.vu_sleep
     if args.test_script:
         if not os.path.exists(args.test_script):
             logger.error(f"Test script not found: {args.test_script}")
@@ -2463,6 +2567,25 @@ EXAMPLES:
 
     loader = ConfigLoader(config)
     loader.load_config()
+
+    if cli_iterations is not None:
+        if cli_iterations < 1:
+            logger.error("--iterations must be >= 1")
+            sys.exit(1)
+        config.test_iterations = cli_iterations
+    cli_iter_sleep = cli_iteration_sleep
+    if cli_iter_sleep is None:
+        cli_iter_sleep = cli_sweep_sleep
+    if cli_iter_sleep is not None:
+        if cli_iter_sleep < 0:
+            logger.error("--iteration-sleep must be >= 0")
+            sys.exit(1)
+        config.iteration_sleep_sec = cli_iter_sleep
+    if cli_vu_sleep is not None:
+        if cli_vu_sleep < 0:
+            logger.error("--vu-sleep must be >= 0")
+            sys.exit(1)
+        config.vu_sleep_sec = cli_vu_sleep
 
     log_date = datetime.now().strftime("%Y%m%d")
     sanitized_desc = re.sub(r"[^a-z0-9]", "_", config.description.lower()) if config.description else ""
