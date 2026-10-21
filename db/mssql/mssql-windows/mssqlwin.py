@@ -103,12 +103,16 @@ class MSSQLWinConfig:
         self.retry_interval = 30
         self.monitor_vm = False
         self.monitor_vm_interval = 10
-        # None or 0 = no cap (all db_hosts in parallel). Positive int limits pool size.
+        # None or 0 = all db_hosts (no hard 50 ceiling). Positive int limits pool size.
         self.max_parallel_workers = None
 
 
 def pool_max_workers(config: MSSQLWinConfig) -> int:
-    """Worker count for per-host pools (rebuild, test, collect)."""
+    """Worker count for per-host pools (rebuild, test, collect).
+
+    Unset/0 → len(db_hosts) with no historical min(..., 50) cap.
+    Positive max_parallel_workers → min(hosts, cap).
+    """
     n = len(config.db_hosts)
     if n <= 0:
         return 1
@@ -2444,7 +2448,8 @@ EXAMPLES:
                         help="Rebuild database before each user-count test run")
     parser.add_argument("--max-parallel", type=int, default=None, dest="max_parallel",
                         help="Max concurrent hosts for rebuild/test/collect "
-                             "(default: all hosts; 0 = all hosts)")
+                             "(default/0: all hosts, no hard 50 cap; "
+                             "positive N: min(hosts, N))")
     parser.add_argument("--prepare-machine", action="store_true",
                         help="Prepare Windows machines by formatting the data disk and exit")
     parser.add_argument('--monitor-vm', action='store_true',
