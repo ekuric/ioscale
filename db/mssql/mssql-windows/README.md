@@ -137,6 +137,8 @@ image at `/work/examples/mssql-configwin.yaml`. Key sections:
 ```yaml
 description: "mssqlwin-example"
 
+# max_parallel_workers: 8        # cap concurrent hosts (0/omit = all hosts)
+
 database:
   host_pattern: "winm-{1..10}"   # or hosts, host_labels, host_file
   namespace: "default"
@@ -160,6 +162,20 @@ windows:
 
 See the full example for all available fields including timeouts and
 `mssql_service_name`.
+
+### Max parallel workers (`max_parallel_workers`)
+
+Optional cap on how many hosts run rebuild / test / collect work at once.
+Unset or `0` means all hosts (no cap). CLI overrides YAML.
+
+| Setting / flag | Meaning |
+|----------------|---------|
+| `max_parallel_workers` / `--max-parallel` | Max concurrent hosts (default: all; `0` = all) |
+
+```bash
+# Direct (non-container) example:
+python3 mssqlwin.py -c mssql-configwin.yaml --max-parallel 8
+```
 
 ## mssqlwin.py CLI Parameters
 
@@ -233,6 +249,10 @@ podman run --rm --pids-limit=-1 \
   quay.io/ekuric/mssqlwin-benchmark:latest \
   --generate-only
 ```
+
+### `--max-parallel N`
+
+Cap concurrent hosts for rebuild, test, and collect (`0` = all hosts).
 
 ### `--rebuild-always`
 

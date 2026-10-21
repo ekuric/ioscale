@@ -5,6 +5,9 @@
 
 description: "mssqlwin-example"
 
+# Max concurrent hosts for rebuild / test / collect (default: all hosts).
+# max_parallel_workers: 0
+
 database:
   # Choose ONE of: hosts, host_pattern, host_labels, host_file
   # hosts: "winm-1 winm-2"
