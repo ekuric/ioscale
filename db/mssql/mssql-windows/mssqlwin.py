@@ -2498,8 +2498,6 @@ EXAMPLES:
         logger.info("Prepare-machine mode complete; skipping tests and result collection")
         return
 
-    prepare_windows_machines(config, executor)
-
     if not config.windows_hammerdb_path:
         logger.error("windows.hammerdb_path is required for Windows testing")
         sys.exit(1)
@@ -2511,18 +2509,35 @@ EXAMPLES:
     else:
         results_dir = f"mssql-results-{results_date}"
 
-    # Always generate customized test files (create_db.sql, build schema)
-    # before any build or test step
-    generate_test_files(config)
+    # Collect-only: never format/prepare disks.
+    if config.copy_results:
+        collect_results(config, executor, results_dir)
+        _move_log_to_results(log_file, results_dir)
+        return
 
+    # Generate local scripts only: never format/prepare remote disks.
     if config.generate_only:
         if config.windows_rebuild_only or config.windows_test_only or config.copy_results:
             logger.warning(
                 "Generate-only mode ignores rebuild_only, test_only, and copy_results flags."
             )
+        logger.info(
+            "generate-only enabled: skipping prepare/format; writing local test files only"
+        )
+        generate_test_files(config)
         run_tests_windows(config, executor)
         logger.info("Generate-only mode complete; skipping remote execution")
         return
+
+    # test_only: skip prepare/format so an existing TPCC DB can be reused.
+    if config.windows_test_only:
+        logger.info(
+            "windows.test_only enabled: skipping prepare and build file generation"
+        )
+    else:
+        prepare_windows_machines(config, executor)
+        # Generate customized create_db.sql and build schema before rebuild
+        generate_test_files(config)
 
     if config.windows_rebuild_only and config.windows_test_only:
         logger.error("windows.rebuild_only and windows.test_only cannot both be enabled")
@@ -2534,11 +2549,6 @@ EXAMPLES:
             sys.exit(1)
         build_database_windows(config, executor)
         logger.info("Rebuild-only mode complete; skipping tests and result collection")
-        return
-
-    if config.copy_results:
-        collect_results(config, executor, results_dir)
-        _move_log_to_results(log_file, results_dir)
         return
 
     if not config.windows_test_only:
