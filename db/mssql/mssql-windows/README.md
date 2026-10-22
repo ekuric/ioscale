@@ -137,6 +137,8 @@ image at `/work/examples/mssql-configwin.yaml`. Key sections:
 ```yaml
 description: "mssqlwin-example"
 
+# max_parallel_workers: 8        # optional cap; omit/0 = all hosts (no hard 50)
+
 database:
   host_pattern: "winm-{1..10}"   # or hosts, host_labels, host_file
   namespace: "default"
@@ -160,6 +162,27 @@ windows:
 
 See the full example for all available fields including timeouts and
 `mssql_service_name`.
+
+### Max parallel workers (`max_parallel_workers`)
+
+Optional cap on how many hosts run rebuild / test / collect work at once.
+CLI overrides YAML.
+
+| Setting / flag | Meaning |
+|----------------|---------|
+| unset / omitted | **All hosts** in parallel (`workers = number of hosts`) |
+| `0` | Same as unset — **all hosts** (no cap) |
+| positive `N` | Cap at `min(hosts, N)` |
+
+There is **no hard default of 50**. Older `mssqlwin.py` used
+`min(hosts, 50)`; that ceiling is removed. With 10 hosts you get 10 workers;
+with 80 hosts you get 80 unless you set a cap (for example
+`max_parallel_workers: 50` or `--max-parallel 50`).
+
+```bash
+# Direct (non-container) example — throttle a large fleet:
+python3 mssqlwin.py -c mssql-configwin.yaml --max-parallel 8
+```
 
 ## mssqlwin.py CLI Parameters
 
@@ -233,6 +256,11 @@ podman run --rm --pids-limit=-1 \
   quay.io/ekuric/mssqlwin-benchmark:latest \
   --generate-only
 ```
+
+### `--max-parallel N`
+
+Cap concurrent hosts for rebuild, test, and collect. Omit or `0` = all hosts
+(no hard 50 ceiling). Positive `N` = at most `N` concurrent hosts.
 
 ### `--rebuild-always`
 
