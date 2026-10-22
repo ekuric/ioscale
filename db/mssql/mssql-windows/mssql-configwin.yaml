@@ -23,6 +23,9 @@ database:
   test_duration: 15                    # Minutes
   rampup_time: 1                       # Minutes
   user_count: "1 10"                   # Space-separated run-user counts (NOT commas)
+  # iterations: 3                      # Repeat full user_count list N times (*_run1..*_runN)
+  # vu_sleep_sec: 30                   # Pause between VU levels within an iteration (0=off)
+  # iteration_sleep_sec: 60            # Pause after each full iteration before next (0=off)
   # mssql_pass: "YourSaPassword"       # SA password; omit for Windows auth if configured
 
 windows:

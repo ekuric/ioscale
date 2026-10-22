@@ -145,6 +145,9 @@ database:
   warehouse_count: 100
   build_users: 10
   user_count: "1 10"             # space-separated, NOT comma-separated
+  # iterations: 3                # repeat full user_count list N times (*_run1..*_runN)
+  # vu_sleep_sec: 30             # pause between VU levels (0=off)
+  # iteration_sleep_sec: 60      # pause between full iterations (0=off)
   test_duration: 15
   rampup_time: 1
   mssql_total_iterations: 10000000
@@ -172,6 +175,24 @@ windows:
 See the full example for all available fields including timeouts and
 `mssql_service_name`.
 
+### Sweep iterations (`database.iterations`)
+
+`mssql_total_iterations` is the HammerDB **per-VU transaction cap**.  
+`database.iterations` (CLI: `--iterations`) is different: it repeats the **full**
+`user_count` list N times.
+
+| Setting | Meaning |
+|---------|---------|
+| `database.iterations` / `--iterations` | Repeat full `user_count` sweep N times → results `*_run1` … `*_runN` |
+| `database.vu_sleep_sec` / `--vu-sleep` | Seconds between VU levels within an iteration (default 30; `0` off) |
+| `database.iteration_sleep_sec` / `--iteration-sleep` | Seconds after each full iteration before the next (default 60; `0` off). Alias: `--sweep-sleep` |
+
+`mssqlwin.py` sets `$env:HAMMERDB_RUN` per sweep iteration. `hammerdb-sa-test.ps1`
+names outputs using `_run$run` (for example `mssqls_tprocc_010vu_run2.out`).
+
+```bash
+# Direct (non-container) example:
+python3 mssqlwin.py -c mssql-configwin.yaml --iterations 3 --vu-sleep 30 --iteration-sleep 60
 ### Windows PerfMon (`perfmon:`)
 
 Optional collectors on all guests. Default counter list is
@@ -285,6 +306,18 @@ podman run --rm --pids-limit=-1 \
   --generate-only
 ```
 
+### `--iterations N`
+
+Repeat the full `user_count` list N times. Result files are named `*_run1` … `*_runN`
+via `HAMMERDB_RUN`.
+
+### `--vu-sleep SECONDS`
+
+Pause between VU levels within one iteration (`0` disables).
+
+### `--iteration-sleep SECONDS`
+
+Pause between full sweep iterations (`0` disables). Alias: `--sweep-sleep`.
 ### `--perfmon`
 
 Enable Windows PerfMon collectors for the test phase.
