@@ -46,6 +46,16 @@ windows:
   rebuild_only: false                  # Only rebuild, then exit
   test_only: false                     # Skip rebuild; run tests only
 
+# Optional Windows Performance Monitor collectors (BLG under result_dir; relog → CSV post-test).
+# until_iteration early-stop is most useful with database.iterations (separate PR).
+# perfmon:
+#   enabled: true
+#   sample_interval: 5
+#   counters_file: perfmon-counters-default.txt
+#   until_iteration: 1
+#   export_csv: true
+#   collector_name: mssqlwin-perfmon
+
 # Timeouts (seconds). Uncomment/adjust as needed.
 timeouts:
   default: 300                         # Default remote command timeout

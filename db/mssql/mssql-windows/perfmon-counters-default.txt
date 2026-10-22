@@ -1,0 +1,17 @@
+# Default PerfMon counters extracted from perfmon-template.xml
+# One counter path per line. Lines starting with # are ignored.
+# Override with perfmon.counters_file or --perfmon-counters-file.
+\Processor(*)\*
+\NUMA Node Memory(_Total)\*
+\Paging File(_Total)\*
+\PhysicalDisk(_Total)\*
+\Process(_Total)\*
+\System\*
+\LogicalDisk(_Total)\*
+\Memory\*
+\SQLServer:Buffer Manager\*
+\SQLServer:Buffer Node(*)\*
+\SQLServer:Locks(_Total)\*
+\SQLServer:Memory Manager\*
+\SQLServer:SQL Statistics\*
+\SQLServer:Wait Statistics(*)\*
