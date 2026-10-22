@@ -5,6 +5,10 @@
 
 description: "mssqlwin-example"
 
+# Max concurrent hosts for rebuild / test / collect.
+# Omit or 0 = all hosts (no hard 50 cap). Positive N = min(hosts, N).
+# max_parallel_workers: 50
+
 database:
   # Choose ONE of: hosts, host_pattern, host_labels, host_file
   # hosts: "winm-1 winm-2"

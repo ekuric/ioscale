@@ -115,6 +115,23 @@ class MSSQLWinConfig:
         self.perfmon_export_csv = True
         # True while collectors are expected to be running (avoids double-stop noise).
         self.perfmon_running = False
+        # None or 0 = all db_hosts (no hard 50 ceiling). Positive int limits pool size.
+        self.max_parallel_workers = None
+
+
+def pool_max_workers(config: MSSQLWinConfig) -> int:
+    """Worker count for per-host pools (rebuild, test, collect).
+
+    Unset/0 → len(db_hosts) with no historical min(..., 50) cap.
+    Positive max_parallel_workers → min(hosts, cap).
+    """
+    n = len(config.db_hosts)
+    if n <= 0:
+        return 1
+    cap = config.max_parallel_workers
+    if cap is None or cap <= 0:
+        return n
+    return min(n, cap)
 
 
 def get_vm_number(hostname: str) -> str:
@@ -928,6 +945,19 @@ class ConfigLoader:
         if self.config.description == "null" or not self.config.description:
             self.config.description = ""
 
+        raw_max_parallel = yaml_data.get(
+            "max_parallel_workers",
+            database.get("max_parallel_workers"),
+        )
+        if raw_max_parallel not in (None, "", "null"):
+            try:
+                self.config.max_parallel_workers = int(raw_max_parallel)
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Invalid max_parallel_workers={raw_max_parallel!r}; using all hosts"
+                )
+                self.config.max_parallel_workers = None
+
         windows_cfg = yaml_data.get("windows", {})
         windows_hammerdb_path = windows_cfg.get("hammerdb_path")
         if windows_hammerdb_path in ("null", ""):
@@ -1158,6 +1188,13 @@ def display_config(config: MSSQLWinConfig) -> None:
     if config.description:
         logger.info(f"Test description: {config.description}")
     logger.info(f"Hosts: {' '.join(config.db_hosts)}")
+    mpw = pool_max_workers(config)
+    if config.max_parallel_workers is None or config.max_parallel_workers <= 0:
+        logger.info(f"Max parallel workers: {mpw} (all hosts, no cap)")
+    else:
+        logger.info(
+            f"Max parallel workers: {mpw} (cap={config.max_parallel_workers})"
+        )
     if config.use_virtctl is not False:
         logger.info(f"Namespace: {config.namespace}")
     else:
@@ -1341,7 +1378,7 @@ def build_database_windows(config: MSSQLWinConfig, executor: CommandExecutor) ->
     ps_cmd = "; ".join(ps_parts)
     cmd = build_powershell_command(ps_cmd)
 
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=pool_max_workers(config)) as pool:
         futures = []
         for host in config.db_hosts:
             if config.windows_create_db_sql_local and os.path.exists(config.windows_create_db_sql_local):
@@ -1383,7 +1420,7 @@ def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) 
     disk_id = config.windows_disk_id
     ps_cmd = f'& "C:\\tools\\setup\\provision-data-disk.ps1" -DiskID {disk_id}'
     cmd = build_powershell_command(ps_cmd)
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=pool_max_workers(config)) as pool:
         futures = []
         for host in config.db_hosts:
             futures.append(pool.submit(
@@ -1406,7 +1443,7 @@ def prepare_windows_machines(config: MSSQLWinConfig, executor: CommandExecutor) 
         'Copy-Item -Path "C:\\tools\\hammerdb-4.12" -Destination "D:\\" -Recurse -Force }',
         'New-Item -Path "D:\\mssql\\data" -ItemType Directory -Force | Out-Null'
     ]))
-    with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+    with ThreadPoolExecutor(max_workers=pool_max_workers(config)) as pool:
         futures = []
         for host in config.db_hosts:
             futures.append(pool.submit(
@@ -2252,7 +2289,7 @@ def run_tests_windows(config: MSSQLWinConfig, executor: CommandExecutor, migrati
             f"Starting Windows test run for {user_count} users on hosts: "
             f"{', '.join(config.db_hosts)}"
         )
-        with ThreadPoolExecutor(max_workers=min(len(config.db_hosts), 50)) as pool:
+        with ThreadPoolExecutor(max_workers=pool_max_workers(config)) as pool:
             # Phase 1: pre-warm connections to reduce first-connection overhead
             if not config.dry_run and not config.generate_only:
                 warm_cmd = build_powershell_command('Write-Output "warm"')
@@ -2629,7 +2666,7 @@ def collect_results(config: MSSQLWinConfig, executor: CommandExecutor, results_d
             logger.error(f"{host}: Error copying results: {e}")
             return host, False
 
-    max_workers = min(len(config.db_hosts), 50)
+    max_workers = pool_max_workers(config)
     logger.info(f"Collecting results from {len(config.db_hosts)} hosts (max {max_workers} parallel)...")
 
     succeeded = []
@@ -2832,6 +2869,10 @@ EXAMPLES:
                         help="Only generate per-user files locally and exit")
     parser.add_argument("--rebuild-always", action="store_true",
                         help="Rebuild database before each user-count test run")
+    parser.add_argument("--max-parallel", type=int, default=None, dest="max_parallel",
+                        help="Max concurrent hosts for rebuild/test/collect "
+                             "(default/0: all hosts, no hard 50 cap; "
+                             "positive N: min(hosts, N))")
     parser.add_argument("--prepare-machine", action="store_true",
                         help="Prepare Windows machines by formatting the data disk and exit")
     parser.add_argument("--perfmon", action="store_true",
@@ -2918,6 +2959,11 @@ EXAMPLES:
         config.perfmon_sample_interval = args.perfmon_sample_interval
     if args.perfmon_no_export_csv:
         config.perfmon_export_csv = False
+    if args.max_parallel is not None:
+        if args.max_parallel < 0:
+            logger.error("--max-parallel must be >= 0")
+            sys.exit(1)
+        config.max_parallel_workers = args.max_parallel
 
     log_date = datetime.now().strftime("%Y%m%d")
     sanitized_desc = re.sub(r"[^a-z0-9]", "_", config.description.lower()) if config.description else ""
