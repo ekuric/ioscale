@@ -137,6 +137,8 @@ image at `/work/examples/mssql-configwin.yaml`. Key sections:
 ```yaml
 description: "mssqlwin-example"
 
+# max_parallel_workers: 8        # optional cap; omit/0 = all hosts (no hard 50)
+
 database:
   host_pattern: "winm-{1..10}"   # or hosts, host_labels, host_file
   namespace: "default"
@@ -159,6 +161,15 @@ windows:
   rebuild_always: false
   rebuild_only: false
   test_only: false
+
+# Optional Windows PerfMon (BLG under result_dir; relog → CSV after stop)
+# perfmon:
+#   enabled: true
+#   sample_interval: 5
+#   counters_file: perfmon-counters-default.txt   # or a logman .xml template
+#   until_iteration: 1                            # stop after sweep iteration N
+#   export_csv: true
+#   collector_name: mssqlwin-perfmon
 ```
 
 See the full example for all available fields including timeouts and
@@ -182,6 +193,44 @@ names outputs using `_run$run` (for example `mssqls_tprocc_010vu_run2.out`).
 ```bash
 # Direct (non-container) example:
 python3 mssqlwin.py -c mssql-configwin.yaml --iterations 3 --vu-sleep 30 --iteration-sleep 60
+### Windows PerfMon (`perfmon:`)
+
+Optional collectors on all guests. Default counter list is
+`perfmon-counters-default.txt` (override with `counters_file`).
+
+| Setting / flag | Meaning |
+|----------------|---------|
+| `perfmon.enabled` / `--perfmon` | Enable collectors during the test |
+| `perfmon.sample_interval` / `--perfmon-sample-interval` | Seconds (default 5) |
+| `perfmon.counters_file` / `--perfmon-counters-file` | `.txt` counter list or `.xml` logman template |
+| `perfmon.until_iteration` / `--perfmon-until-iteration` | Stop collectors after sweep iteration N (most useful with `database.iterations`) |
+| `perfmon.export_csv` / `--perfmon-no-export-csv` | After stop, `relog` BLG → `perfmon.csv` (default on) |
+| `perfmon.collector_name` | logman name (default `mssqlwin-perfmon`) |
+
+`.txt` mode writes **BLG/binary** during the run (lower overhead); CSV export is
+post-test only.
+
+```bash
+python3 mssqlwin.py -c mssql-configwin.yaml --perfmon --perfmon-until-iteration 1
+### Max parallel workers (`max_parallel_workers`)
+
+Optional cap on how many hosts run rebuild / test / collect work at once.
+CLI overrides YAML.
+
+| Setting / flag | Meaning |
+|----------------|---------|
+| unset / omitted | **All hosts** in parallel (`workers = number of hosts`) |
+| `0` | Same as unset — **all hosts** (no cap) |
+| positive `N` | Cap at `min(hosts, N)` |
+
+There is **no hard default of 50**. Older `mssqlwin.py` used
+`min(hosts, 50)`; that ceiling is removed. With 10 hosts you get 10 workers;
+with 80 hosts you get 80 unless you set a cap (for example
+`max_parallel_workers: 50` or `--max-parallel 50`).
+
+```bash
+# Direct (non-container) example — throttle a large fleet:
+python3 mssqlwin.py -c mssql-configwin.yaml --max-parallel 8
 ```
 
 ## mssqlwin.py CLI Parameters
@@ -269,6 +318,29 @@ Pause between VU levels within one iteration (`0` disables).
 ### `--iteration-sleep SECONDS`
 
 Pause between full sweep iterations (`0` disables). Alias: `--sweep-sleep`.
+### `--perfmon`
+
+Enable Windows PerfMon collectors for the test phase.
+
+### `--perfmon-counters-file PATH`
+
+Path to a `.txt` counter list or `.xml` logman template.
+
+### `--perfmon-until-iteration N`
+
+Stop collectors after completing sweep iteration N (inclusive).
+
+### `--perfmon-sample-interval SECONDS`
+
+PerfMon sample interval (default 5).
+
+### `--perfmon-no-export-csv`
+
+Skip post-test `relog` BLG → CSV export.
+### `--max-parallel N`
+
+Cap concurrent hosts for rebuild, test, and collect. Omit or `0` = all hosts
+(no hard 50 ceiling). Positive `N` = at most `N` concurrent hosts.
 
 ### `--rebuild-always`
 

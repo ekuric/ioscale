@@ -5,6 +5,10 @@
 
 description: "mssqlwin-example"
 
+# Max concurrent hosts for rebuild / test / collect.
+# Omit or 0 = all hosts (no hard 50 cap). Positive N = min(hosts, N).
+# max_parallel_workers: 50
+
 database:
   # Choose ONE of: hosts, host_pattern, host_labels, host_file
   # hosts: "winm-1 winm-2"
@@ -44,6 +48,16 @@ windows:
   rebuild_always: false                # Rebuild before every user_count iteration
   rebuild_only: false                  # Only rebuild, then exit
   test_only: false                     # Skip rebuild; run tests only
+
+# Optional Windows Performance Monitor collectors (BLG under result_dir; relog → CSV post-test).
+# until_iteration early-stop is most useful with database.iterations (separate PR).
+# perfmon:
+#   enabled: true
+#   sample_interval: 5
+#   counters_file: perfmon-counters-default.txt
+#   until_iteration: 1
+#   export_csv: true
+#   collector_name: mssqlwin-perfmon
 
 # Timeouts (seconds). Uncomment/adjust as needed.
 timeouts:
