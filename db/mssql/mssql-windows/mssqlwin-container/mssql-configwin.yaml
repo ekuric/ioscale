@@ -1,9 +1,10 @@
-# Minimal MSSQL HammerDB Windows Configuration (mssqlwin.py)
+# Minimal MSSQL HammerDB Windows Configuration (mssqlwin_tests / mssqlwin.py)
 
 description: ""
 
 database:
   # Choose ONE of: hosts, host_pattern, host_labels, host_file
+  # Or omit hosts and use provision.create_vms / --create-vms
   hosts: "vm1 vm2"        # Space-separated list of hosts
   # host_pattern: "winvm-{1..3}"          # Expands to winvm-1 winvm-2 winvm-3
   # host_labels: "app=mssql,role=primary" # OpenShift VM labels (virtctl)
@@ -15,7 +16,11 @@ database:
   test_duration: 15              # Test duration in minutes
   # rampup_time: 2               # Ramp-up time in minutes (defaults to template)
   user_count: "1 10 20 50 100"   # Space-separated list of user counts to test, eg "1 2 4 8"
+  # iterations: 1                    # Repeat full user_count sweep N times (*_run1 … *_runN)
+  # iteration_sleep_sec: 60          # Sleep between sweep iterations (0=off)
+  # vu_sleep_sec: 30                 # Sleep between VU levels within an iteration (0=off)
   # mssql_pass: "Password123"       # MSSQL server password
+# max_parallel_workers: 0            # Unset/0 = all hosts; positive N caps concurrency
 
 windows:
   hammerdb_path: "C:\\tools\\Hammerdb-4.12"
@@ -35,6 +40,16 @@ windows:
   rebuild_only: false
   test_only: false
 
+# Optional Windows Performance Monitor collectors (BLG under result_dir; relog → CSV post-test).
+# Enable via YAML, --perfmon, or PERFMON=true in the container.
+# perfmon:
+#   enabled: true
+#   sample_interval: 5
+#   counters_file: /work/perfmon-counters-default.txt
+#   until_iteration: 1
+#   export_csv: true
+#   collector_name: mssqlwin-perfmon
+
 # Timeout configuration (all values in seconds)
 # Uncomment to override defaults
 timeouts:
@@ -45,3 +60,22 @@ timeouts:
   vm_lookup: 10           # VM lookup timeout (oc get vm/vmi)
   label_query: 30         # Label-based VM query timeout
   oc_command: 15          # OpenShift/virsh command timeout (vm-dump, pod list)
+# On-demand Windows VMs (optional). Prefer CLI/env: --create-vms / CREATE_VMS=true
+# Flow: source image or existing snap → VolumeSnapshot → clone root DV per VM
+# (same pattern as fio-windows / winCdisk --golden-snapshot).
+# provision:
+#   create_vms: true
+#   vms: 3
+#   vm_prefix: mssql-win
+#   vm_cpu: "8"
+#   vm_memory: 16Gi
+#   storage_class: ocs-storagecluster-ceph-rbd-virtualization
+#   access_mode: ReadWriteMany
+#   # ONE of:
+#   win_vm_image: "https://example.com/win2k25-mssql.qcow2"
+#   # golden_snapshot: windv-snap
+#   # orig_vm: gold-win-mssql
+#   # snapshot_class: ocs-storagecluster-rbd  # optional auto-detect
+#   win_root_volume_size: 100Gi
+#   win_data_disk_size: 40Gi
+#   cleanup: false

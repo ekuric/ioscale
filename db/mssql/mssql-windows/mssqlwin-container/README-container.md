@@ -1,8 +1,19 @@
-# mssqlwin.py Container
+# mssqlwin-container (modular `mssqlwin_tests`)
 
 Run HammerDB TPCC tests against Windows MSSQL VMs from a container.
 Template files are baked in. Configuration can be provided three ways:
 mount a config file, use environment variables, or both.
+
+Code layout matches MariaDB/PostgreSQL containers:
+
+```text
+mssqlwin.py                 # thin shim → python3 -m mssqlwin_tests
+mssqlwin_tests/
+  cli.py, config.py, executor.py, provision.py, storage.py,
+  service.py, build.py, workload.py, results.py, migration.py,
+  perfmon.py, …
+perfmon-counters-default.txt   # default logman counter list
+```
 
 ## Building
 
@@ -99,12 +110,60 @@ No merging or patching -- it is one or the other.
 - Mount `/work/results` to a host directory (e.g. `/root/mssqlwin-results`) to keep
   results after the container exits. Without this mount and with `--rm`, results are lost.
 - Mount the full SSH directory (`-v /root/.ssh:/root/.ssh:ro`) so `virtctl ssh` can
-  authenticate to Windows VMs.
+  authenticate to Windows VMs (pre-created hosts). With `CREATE_VMS=true`, an ephemeral
+  key is injected via Cloudbase-Init; optionally mirror it with
+  `-v /tmp/mssqlwin-ssh:/host-tmp:Z`.
 - Set `DISK_ID` to the Windows data disk number (`Get-Disk` on the guest). Often `1`
   (OS is disk `0`); some images with an extra device use `2`.
 - For TPCC on the OS disk instead of D:, set `USE_OSDISK=true` or pass `--osdisk`
   (uses `create_dbC.sql` → `C:\mssql\data`; skips data-disk format). Ensure C: has
   enough free space for warehouse-scaled MDF/LDF sizes.
+
+## On-demand Windows VMs (`--create-vms` / `CREATE_VMS=true`)
+
+Same idea as fio-windows / `winCdisk --golden-snapshot`: **VolumeSnapshot → clone root DV**.
+
+1. Wipe prior managed resources labeled `mssqlwin-container.ioscale/*`
+2. Build a golden OS VolumeSnapshot via **one of**:
+   - `WIN_VM_IMAGE` — import source DataVolume from HTTP qcow2, then snapshot its PVC
+   - `GOLDEN_SNAPSHOT` — use an existing ready VolumeSnapshot
+   - `ORIG_VM` — snapshot the root PVC of an existing Windows VM
+3. Create `VMS` VirtualMachines; each root disk is a DataVolume **cloned from that snapshot**
+4. Optional blank data disk (unless `USE_OSDISK=true`)
+5. Inject SSH via Cloudbase-Init Secret (`#ps1_sysnative`), wait Ready + SSH
+6. Run prepare → HammerDB as usual (`db_hosts` filled automatically)
+
+Example (import image → snapshot → 3 clones):
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -e CREATE_VMS=true \
+  -e VMS=3 \
+  -e NAMESPACE=default \
+  -e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization \
+  -e WIN_VM_IMAGE="https://example.com/win2k25-mssql.qcow2" \
+  -e WIN_ROOT_SIZE=100Gi \
+  -e WIN_DATA_SIZE=40Gi \
+  -e VM_CPU=8 \
+  -e VM_MEMORY=16Gi \
+  -e WAREHOUSE_COUNT=100 \
+  -e USER_COUNT="1 10" \
+  -e MSSQL_PASS="YourSaPassword" \
+  -e DESCRIPTION="mssqlwin-create-vms" \
+  -v /root/mssqlwin-results:/work/results \
+  -v /tmp/mssqlwin-ssh:/host-tmp:Z \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+```
+
+Example (clone from existing snapshot):
+
+```bash
+-e CREATE_VMS=true -e VMS=5 \
+-e GOLDEN_SNAPSHOT=windv-snap \
+-e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization
+```
 
 ## Environment Variables
 
@@ -121,7 +180,11 @@ No merging or patching -- it is one or the other.
 | `USER_COUNT` | `1 10 20 50 100` | Space-separated user counts (e.g. `"1 10"`, not comma-separated) |
 | `TEST_DURATION` | `15` | Test duration in minutes |
 | `RAMPUP_TIME` | -- | Ramp-up time in minutes |
-| `MSSQL_TOTAL_ITERATIONS` | `10000000` | Iteration limit |
+| `MSSQL_TOTAL_ITERATIONS` | `10000000` | HammerDB per-VU transaction cap (not sweep count) |
+| `ITERATIONS` | `1` | Repeat full `user_count` sweep N times (`*_run1`…`*_runN` via `HAMMERDB_RUN`) |
+| `ITERATION_SLEEP` | `60` | Seconds between sweep iterations (`0` = off) |
+| `VU_SLEEP` | `30` | Seconds between VU levels within an iteration (`0` = off) |
+| `MAX_PARALLEL` | `0` | Max concurrent hosts (`0`/unset = all hosts; positive N = cap) |
 | `MSSQL_PASS` | -- | MSSQL server password |
 | `MAX_SERVER_MEMORY_MB` | -- | Optional SQL Server `max server memory` cap in MB (e.g. `38000` on a ~50GB VM). Omit/empty = unlimited. Minimum `2048`. Set via `sp_configure` (no restart). |
 | `HAMMERDB_PATH` | `C:\tools\Hammerdb-4.12` | HammerDB install path on Windows |
@@ -130,11 +193,28 @@ No merging or patching -- it is one or the other.
 | `SSH_USER` | `Administrator` | SSH user on Windows VMs |
 | `REBUILDDB` | `true` | Rebuild database before test |
 | `REBUILD_ONLY` | `false` | Only rebuild, skip test |
-| `TEST_ONLY` | `false` | Only test, skip rebuild |
+| `TEST_ONLY` | `false` | Skip prepare/format and rebuild; run tests only (reuse existing TPCC DB) |
 | `REBUILD_ALWAYS` | `false` | Rebuild before every user-count iteration |
+| `PERFMON` | `false` | Enable Windows PerfMon collectors during the test (`--perfmon`) |
+| `PERFMON_COUNTERS_FILE` | image default | Override counter `.txt` / logman `.xml` path |
+| `PERFMON_SAMPLE_INTERVAL` | `5` | Sample interval seconds |
+| `PERFMON_UNTIL_ITERATION` | -- | Stop collectors after sweep iteration N (empty = all) |
+| `PERFMON_NO_EXPORT_CSV` | `false` | Skip post-test `relog` BLG→CSV |
 | `DESCRIPTION` | -- | Test run description |
 | `KUBEADMIN_PASSWORD` | -- | If set, runs `oc login` before the test |
 | `API_URL` | `https://api.ocp.example.com:6443` | Cluster API URL for `oc login` |
+| `CREATE_VMS` | `false` | Provision Windows VMs (snapshot → clone) before the test |
+| `CLEANUP` | `false` | Delete managed VMs after the test |
+| `VMS` | `1` | Number of Windows VMs when `CREATE_VMS=true` |
+| `VM_PREFIX` | `mssql-win` | VM name prefix (`mssql-win-1` …) |
+| `VM_CPU` / `VM_MEMORY` | `8` / `16Gi` | Guest size |
+| `STORAGE_CLASS` | -- | Required with `CREATE_VMS` |
+| `ACCESS_MODE` | `ReadWriteMany` | PVC access mode |
+| `WIN_VM_IMAGE` | -- | HTTP qcow2 URL → source DV → snapshot |
+| `GOLDEN_SNAPSHOT` | -- | Existing VolumeSnapshot name (skip import) |
+| `ORIG_VM` | -- | Snapshot this VM’s root PVC, then clone |
+| `SNAPSHOT_CLASS` | auto | VolumeSnapshotClass override |
+| `WIN_ROOT_SIZE` / `WIN_DATA_SIZE` | `100Gi` / `40Gi` | Disk sizes |
 
 ### Optional SQL Server max memory
 
@@ -167,8 +247,13 @@ database:
   test_duration: 15
   rampup_time: 1
   mssql_total_iterations: 10000000
+  iterations: 1                  # full user_count sweeps (*_runN)
+  iteration_sleep_sec: 60        # between sweeps (0=off)
+  vu_sleep_sec: 30               # between VU levels (0=off)
   mssql_pass: "YourSaPassword"
   # max_server_memory_mb: 38000  # optional; omit = unlimited
+
+# max_parallel_workers: 0        # 0/omit = all hosts; positive N = cap
 
 windows:
   hammerdb_path: "C:\\tools\\Hammerdb-4.12"
@@ -177,7 +262,14 @@ windows:
   rebuilddb: true
   rebuild_always: false
   rebuild_only: false
-  test_only: false
+  test_only: false               # true: skip prepare/format + rebuild
+
+# perfmon:
+#   enabled: true
+#   sample_interval: 5
+#   counters_file: /work/perfmon-counters-default.txt
+#   until_iteration: 1           # stop after sweep N (needs iterations > 1)
+#   export_csv: true
 ```
 
 See the full example for all available fields including timeouts and
@@ -219,7 +311,7 @@ podman run --rm --pids-limit=-1 \
 
 ### `--copy-results`
 
-Only copy results from hosts (skip rebuild and tests).
+Only copy results from hosts (skip prepare/format, rebuild, and tests).
 
 ```bash
 podman run --rm --pids-limit=-1 \
@@ -246,7 +338,7 @@ podman run --rm --pids-limit=-1 \
 
 ### `--generate-only`
 
-Only generate per-user config files locally and exit (no SSH, no tests).
+Only generate per-user config files locally and exit (no prepare/format, no SSH, no tests).
 
 ```bash
 podman run --rm --pids-limit=-1 \
@@ -275,6 +367,7 @@ podman run --rm --pids-limit=-1 \
 
 Prepare Windows machines by formatting the data disk and exit (no tests).
 Note: a normal full run already prepares disks before rebuild/test.
+`--copy-results`, `--generate-only`, and `windows.test_only` / `TEST_ONLY=true` never call prepare/format.
 
 ```bash
 podman run --rm --pids-limit=-1 \
@@ -285,6 +378,35 @@ podman run --rm --pids-limit=-1 \
   quay.io/ekuric/mssqlwin-benchmark:latest \
   --prepare-machine
 ```
+
+### `--iterations` / `--vu-sleep` / `--iteration-sleep`
+
+Repeat the full `user_count` list N times. Result files use `HAMMERDB_RUN`
+(`mssqls_tprocc_010vu_run1.*`, `*_run2.*`, …). Sleeps default to 30s between VU
+levels and 60s between sweeps; pass `0` to disable.
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -e HOST_PATTERN="winm-1" \
+  -e USER_COUNT="1 10" \
+  -e ITERATIONS=2 \
+  -e VU_SLEEP=0 \
+  -e ITERATION_SLEEP=0 \
+  ...
+  quay.io/ekuric/mssqlwin-benchmark:latest
+# or:  ... latest --iterations 2 --vu-sleep 0 --iteration-sleep 0
+```
+
+### `--max-parallel`
+
+Cap concurrent host workers for rebuild/test/collect. Default / `0` = all hosts
+(no hard 50 ceiling). Example: `--max-parallel 2` or `-e MAX_PARALLEL=2`.
+
+### `--perfmon`
+
+Start Windows PerfMon (`logman`) collectors during the test; BLG under
+`windows.result_dir`, optional `relog` → `perfmon.csv` after stop.
+Also: `PERFMON=true`, YAML `perfmon.enabled`, `--perfmon-until-iteration N`.
 
 ## Usage Examples
 
@@ -393,12 +515,14 @@ If your key is at a non-standard path, mount it to the expected location:
 ```
 /work/
   mssqlwin.py
+  mssqlwin_tests/                (modular package)
   entrypoint.sh
+  perfmon-counters-default.txt   (default logman counter list)
   examples/
     mssql-configwin.yaml         (baked-in reference config)
   mssql-configwin.yaml           (mounted by user, or generated from env)
   templates/
-    hammerdb-sa-test.ps1
+    hammerdb-sa-test.ps1         (uses $env:HAMMERDB_RUN for *_runN names)
     mssqls_tprocc_run.tcl
     mssqls_tprocc_buildschema.tcl
     rebuild-db.ps1
@@ -410,14 +534,18 @@ If your key is at a non-standard path, mount it to the expected location:
 ## Notes
 
 - If a config file is mounted, it is used as-is. If not, env vars generate one. No merging.
+  CLI/env flags such as `--iterations` / `ITERATIONS` and `--perfmon` / `PERFMON` still apply on top.
 - `--privileged` is needed for the virtctl SSH proxy to work.
 - `/root/.kube/config` mount gives the container access to the OCP cluster.
 - Mount `/root/.ssh` (or at least `id_rsa`) so `virtctl ssh` can authenticate.
 - Default prepare formats the Windows data disk via `C:\tools\setup\provision-data-disk.ps1`
   using `DISK_ID`, then copies HammerDB tools to `D:` when present.
+- `--copy-results`, `--generate-only`, and `TEST_ONLY` / `windows.test_only` never format disks.
 - `USE_OSDISK=true` / `--osdisk` / YAML `windows.use_osdisk: true`: skip that prepare path;
   create `C:\mssql\data` and use `create_dbC.sql` (HammerDB stays under `HAMMERDB_PATH` on C:).
 - Template files baked into `/work/templates/` at build time are silently overridden when you mount a file to the same path.
 - `user_count` is space-separated (e.g. `"1 10 50 100"`), not comma-separated.
+- `MSSQL_TOTAL_ITERATIONS` is the HammerDB transaction cap; `ITERATIONS` / `database.iterations` is how many times the VU list is repeated.
 - The entrypoint always prints the config before running, so you can see exactly what values are used.
 - Optional `MAX_SERVER_MEMORY_MB` / YAML `database.max_server_memory_mb` sets SQL Server `max server memory` (MB) on all hosts before rebuild/tests via `sp_configure` (no restart). Omit for unlimited. Minimum `2048`. Prefer leaving OS headroom on Windows (e.g. `38000` on a ~50GB VM).
+- Jenkinsfile parameters map to the same env vars (`ITERATIONS`, `VU_SLEEP`, `ITERATION_SLEEP`, `MAX_PARALLEL`, `PERFMON`, …).
