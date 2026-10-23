@@ -22,17 +22,13 @@ cd mssqlwin-container
 podman build -t quay.io/ekuric/mssqlwin-benchmark:latest .
 ```
 
-Override the virtctl version at build time:
-
-```bash
-podman build --build-arg VIRTCTL_VERSION=v1.8.0 -t quay.io/ekuric/mssqlwin-benchmark:latest .
-```
-
 ## Two Usage Modes
 
 ### Mode 1: Config file (recommended)
 
-Mount your `mssql-configwin.yaml`. Everything comes from the file.
+Mount your `mssql-configwin.yaml` (set `database.iterations`, sleeps, and
+`perfmon:` there). Optional CLI/env flags such as `--perfmon` / `PERFMON=true`
+still apply on top.
 
 ```bash
 podman run --rm --pids-limit=-1 \
@@ -61,6 +57,10 @@ podman run --rm --pids-limit=-1 \
   -e USER_COUNT="1" \
   -e TEST_DURATION=1 \
   -e MSSQL_TOTAL_ITERATIONS=10000000 \
+  -e ITERATIONS=1 \
+  -e ITERATION_SLEEP=0 \
+  -e VU_SLEEP=0 \
+  -e MAX_PARALLEL=0 \
   -e RAMPUP_TIME="1" \
   -e MSSQL_PASS="YourSaPassword" \
   -e MAX_SERVER_MEMORY_MB=38000 \
@@ -68,6 +68,7 @@ podman run --rm --pids-limit=-1 \
   -e REBUILDDB=true \
   -e REBUILD_ALWAYS=false \
   -e TEST_ONLY=false \
+  -e PERFMON=true \
   -e DESCRIPTION="jenkins-mssql-test-new-db-test" \
   -v /root/mssqlwin-results:/work/results \
   -v /root/.ssh:/root/.ssh:ro \
@@ -76,7 +77,7 @@ podman run --rm --pids-limit=-1 \
   quay.io/ekuric/mssqlwin-benchmark:latest
 ```
 
-Multi-VM pattern example:
+Multi-VM pattern example (two VU sweeps, PerfMon on first sweep only):
 
 ```bash
 podman run --rm --pids-limit=-1 \
@@ -86,6 +87,11 @@ podman run --rm --pids-limit=-1 \
   -e BUILD_USERS=10 \
   -e USER_COUNT="1 10" \
   -e TEST_DURATION=15 \
+  -e MSSQL_TOTAL_ITERATIONS=10000000 \
+  -e ITERATIONS=2 \
+  -e ITERATION_SLEEP=60 \
+  -e VU_SLEEP=30 \
+  -e MAX_PARALLEL=0 \
   -e RAMPUP_TIME="1" \
   -e MSSQL_PASS="YourSaPassword" \
   -e MAX_SERVER_MEMORY_MB=38000 \
@@ -93,6 +99,8 @@ podman run --rm --pids-limit=-1 \
   -e REBUILDDB=true \
   -e REBUILD_ALWAYS=false \
   -e TEST_ONLY=false \
+  -e PERFMON=true \
+  -e PERFMON_UNTIL_ITERATION=1 \
   -e DESCRIPTION="mssqlwin-scale-test" \
   -v /root/mssqlwin-results:/work/results \
   -v /root/.ssh:/root/.ssh:ro \
@@ -103,7 +111,8 @@ podman run --rm --pids-limit=-1 \
 
 **How it works:** If a config file exists at the `CONFIG` path, it is used
 as-is. If no file is found, the entrypoint generates one from env vars.
-No merging or patching -- it is one or the other.
+No merging or patching of the YAML body — but entrypoint still forwards
+`ITERATIONS` / `PERFMON` / related env vars as CLI flags.
 
 **Important:**
 - Use `--pids-limit=-1` (HammerDB / nested tools can exceed the default PID limit).
@@ -147,8 +156,16 @@ podman run --rm --pids-limit=-1 \
   -e VM_CPU=8 \
   -e VM_MEMORY=16Gi \
   -e WAREHOUSE_COUNT=100 \
+  -e BUILD_USERS=10 \
   -e USER_COUNT="1 10" \
+  -e TEST_DURATION=15 \
+  -e MSSQL_TOTAL_ITERATIONS=10000000 \
+  -e ITERATIONS=1 \
+  -e ITERATION_SLEEP=0 \
+  -e VU_SLEEP=0 \
+  -e MAX_PARALLEL=0 \
   -e MSSQL_PASS="YourSaPassword" \
+  -e PERFMON=true \
   -e DESCRIPTION="mssqlwin-create-vms" \
   -v /root/mssqlwin-results:/work/results \
   -v /tmp/mssqlwin-ssh:/host-tmp:Z \
@@ -157,12 +174,26 @@ podman run --rm --pids-limit=-1 \
   quay.io/ekuric/mssqlwin-benchmark:latest
 ```
 
-Example (clone from existing snapshot):
+Example (clone from existing snapshot — add workload env vars as above):
 
 ```bash
--e CREATE_VMS=true -e VMS=5 \
--e GOLDEN_SNAPSHOT=windv-snap \
--e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization
+podman run --rm --pids-limit=-1 \
+  -e CREATE_VMS=true \
+  -e VMS=5 \
+  -e NAMESPACE=default \
+  -e GOLDEN_SNAPSHOT=windv-snap \
+  -e STORAGE_CLASS=ocs-storagecluster-ceph-rbd-virtualization \
+  -e USER_COUNT="1 10" \
+  -e ITERATIONS=2 \
+  -e VU_SLEEP=0 \
+  -e ITERATION_SLEEP=0 \
+  -e PERFMON=true \
+  -e MSSQL_PASS="YourSaPassword" \
+  -v /root/mssqlwin-results:/work/results \
+  -v /tmp/mssqlwin-ssh:/host-tmp:Z \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
 ```
 
 ## Environment Variables
@@ -247,16 +278,17 @@ database:
   test_duration: 15
   rampup_time: 1
   mssql_total_iterations: 10000000
-  iterations: 1                  # full user_count sweeps (*_runN)
+  iterations: 2                  # full user_count sweeps (*_run1, *_run2)
   iteration_sleep_sec: 60        # between sweeps (0=off)
   vu_sleep_sec: 30               # between VU levels (0=off)
   mssql_pass: "YourSaPassword"
   # max_server_memory_mb: 38000  # optional; omit = unlimited
 
-# max_parallel_workers: 0        # 0/omit = all hosts; positive N = cap
+max_parallel_workers: 0          # 0/omit = all hosts; positive N = cap
 
 windows:
   hammerdb_path: "C:\\tools\\Hammerdb-4.12"
+  result_dir: "C:\\tools\\Hammerdb-4.12\\results"  # HammerDB + perfmon BLG/CSV
   disk_id: "1"
   ssh_user: "Administrator"
   rebuilddb: true
@@ -264,12 +296,12 @@ windows:
   rebuild_only: false
   test_only: false               # true: skip prepare/format + rebuild
 
-# perfmon:
-#   enabled: true
-#   sample_interval: 5
-#   counters_file: /work/perfmon-counters-default.txt
-#   until_iteration: 1           # stop after sweep N (needs iterations > 1)
-#   export_csv: true
+perfmon:
+  enabled: true
+  sample_interval: 5
+  counters_file: /work/perfmon-counters-default.txt
+  until_iteration: 1             # stop after sweep N (optional; omit = all)
+  export_csv: true
 ```
 
 See the full example for all available fields including timeouts and
@@ -388,25 +420,85 @@ levels and 60s between sweeps; pass `0` to disable.
 ```bash
 podman run --rm --pids-limit=-1 \
   -e HOST_PATTERN="winm-1" \
+  -e NAMESPACE="default" \
+  -e WAREHOUSE_COUNT=100 \
+  -e BUILD_USERS=10 \
   -e USER_COUNT="1 10" \
+  -e TEST_DURATION=15 \
+  -e MSSQL_TOTAL_ITERATIONS=10000000 \
   -e ITERATIONS=2 \
   -e VU_SLEEP=0 \
   -e ITERATION_SLEEP=0 \
-  ...
+  -e MSSQL_PASS="YourSaPassword" \
+  -e DISK_ID="1" \
+  -e REBUILDDB=true \
+  -e DESCRIPTION="mssqlwin-two-sweeps" \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
   quay.io/ekuric/mssqlwin-benchmark:latest
-# or:  ... latest --iterations 2 --vu-sleep 0 --iteration-sleep 0
+```
+
+Same via CLI flags (with a mounted config):
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -v ./mssql-configwin.yaml:/work/mssql-configwin.yaml \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest \
+  --iterations 2 --vu-sleep 0 --iteration-sleep 0
 ```
 
 ### `--max-parallel`
 
 Cap concurrent host workers for rebuild/test/collect. Default / `0` = all hosts
-(no hard 50 ceiling). Example: `--max-parallel 2` or `-e MAX_PARALLEL=2`.
+(no hard 50 ceiling).
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -e HOST_PATTERN="winm-{1..10}" \
+  -e NAMESPACE="default" \
+  -e USER_COUNT="1 10" \
+  -e MAX_PARALLEL=2 \
+  -e MSSQL_PASS="YourSaPassword" \
+  -e DISK_ID="1" \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+# or:  ... latest --max-parallel 2
+```
 
 ### `--perfmon`
 
-Start Windows PerfMon (`logman`) collectors during the test; BLG under
-`windows.result_dir`, optional `relog` → `perfmon.csv` after stop.
-Also: `PERFMON=true`, YAML `perfmon.enabled`, `--perfmon-until-iteration N`.
+Start Windows PerfMon (`logman`) collectors during the test. On each guest,
+files land under `windows.result_dir` (default HammerDB `results\`):
+`perfmon*.blg`, then `perfmon.csv` after stop (unless `PERFMON_NO_EXPORT_CSV=true`).
+Collected with other results into `/work/results`.
+
+```bash
+podman run --rm --pids-limit=-1 \
+  -e HOST_PATTERN="winm-1" \
+  -e NAMESPACE="default" \
+  -e USER_COUNT="1 10" \
+  -e ITERATIONS=2 \
+  -e PERFMON=true \
+  -e PERFMON_SAMPLE_INTERVAL=5 \
+  -e PERFMON_UNTIL_ITERATION=1 \
+  -e MSSQL_PASS="YourSaPassword" \
+  -e DISK_ID="1" \
+  -v /root/mssqlwin-results:/work/results \
+  -v /root/.ssh:/root/.ssh:ro \
+  -v /root/.kube/config:/root/.kube/config \
+  --privileged \
+  quay.io/ekuric/mssqlwin-benchmark:latest
+# or:  ... latest --perfmon --perfmon-until-iteration 1
+```
 
 ## Usage Examples
 
@@ -433,12 +525,17 @@ podman run --rm --pids-limit=-1 \
   -e USER_COUNT="1" \
   -e TEST_DURATION=1 \
   -e MSSQL_TOTAL_ITERATIONS=10000000 \
+  -e ITERATIONS=1 \
+  -e ITERATION_SLEEP=0 \
+  -e VU_SLEEP=0 \
+  -e MAX_PARALLEL=0 \
   -e RAMPUP_TIME="1" \
   -e MSSQL_PASS="YourSaPassword" \
   -e DISK_ID="1" \
   -e REBUILDDB=true \
   -e REBUILD_ALWAYS=false \
   -e TEST_ONLY=false \
+  -e PERFMON=true \
   -e DESCRIPTION="jenkins-mssql-test-new-db-test" \
   -v /root/mssqlwin-results:/work/results \
   -v /root/.ssh:/root/.ssh:ro \
@@ -483,6 +580,11 @@ podman run --rm --pids-limit=-1 \
   -e API_URL="https://api.mycluster.example.com:6443" \
   -e HOST_PATTERN="winm-1" \
   -e NAMESPACE="default" \
+  -e USER_COUNT="1 10" \
+  -e ITERATIONS=1 \
+  -e PERFMON=true \
+  -e MSSQL_PASS="YourSaPassword" \
+  -e DISK_ID="1" \
   -v /root/mssqlwin-results:/work/results \
   -v /root/.ssh:/root/.ssh:ro \
   --privileged \
