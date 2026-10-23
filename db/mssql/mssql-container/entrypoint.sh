@@ -13,13 +13,44 @@ if [[ -n "${KUBEADMIN_PASSWORD:-}" ]]; then
         --insecure-skip-tls-verify=true
 fi
 
+# --- Normalize CREATE_VMS / CLEANUP (env or CLI flags) ---
+_createvms_raw="${CREATE_VMS:-false}"
+case "${_createvms_raw,,}" in
+    true|1|yes|on) CREATE_VMS=true ;;
+    *) CREATE_VMS=false ;;
+esac
+_cleanup_raw="${CLEANUP:-false}"
+case "${_cleanup_raw,,}" in
+    true|1|yes|on) CLEANUP=true ;;
+    *) CLEANUP=false ;;
+esac
+for _arg in "$@"; do
+    if [[ "${_arg}" == "--create-vms" ]]; then
+        CREATE_VMS=true
+    fi
+    if [[ "${_arg}" == "--cleanup" ]]; then
+        CLEANUP=true
+    fi
+done
+export CREATE_VMS
+export CLEANUP
+
+VMS="${VMS:-0}"
+NAMESPACE="${NAMESPACE:-default}"
+
 # --- Mode detection ---
 if [[ -f "${CONFIG}" ]]; then
     echo "Using config: ${CONFIG}"
+    if [[ "${CREATE_VMS}" == "true" ]]; then
+        echo "CREATE_VMS=true with mounted config — YAML hosts ignored; provision first, then test"
+        if [[ -z "${STORAGE_CLASS:-}" ]]; then
+            echo "ERROR: STORAGE_CLASS is required when CREATE_VMS=true" >&2
+            exit 1
+        fi
+    fi
 else
     echo "No config file at ${CONFIG}, generating from env vars..."
 
-    NAMESPACE="${NAMESPACE:-default}"
     DESCRIPTION="${DESCRIPTION:-}"
     DISK_LIST="${DISK_LIST:-/dev/vdc}"
     MOUNT_POINT="${MOUNT_POINT:-}"
@@ -43,9 +74,34 @@ else
     MAX_RETRIES="${MAX_RETRIES:-10}"
     MONITOR_INTERVAL="${MONITOR_INTERVAL:-60}"
 
+    if [[ "${CREATE_VMS}" == "true" ]]; then
+        echo "CREATE_VMS active — phase order: provision VMs → wait Ready/SSH → packages/MSSQL/HammerDB"
+        echo "  CLEANUP after test: ${CLEANUP}"
+        for _hp_var in HOSTS HOST_PATTERN HOST_LABELS; do
+            if [[ -n "${!_hp_var:-}" ]]; then
+                echo "WARNING: CREATE_VMS=true — ignoring ${_hp_var}='${!_hp_var}' (hosts come from provision)"
+                unset "${_hp_var}"
+            fi
+        done
+        # Placeholder until provision discovers the real device (serial=datadisk / size).
+        DISK_LIST="/dev/vdb"
+        MOUNT_POINT=""
+    fi
+
     # Host selection
     HOST_BLOCK=""
-    if [[ -n "${HOSTS:-}" ]]; then
+    if [[ "${CREATE_VMS}" == "true" ]]; then
+        if ! [[ "${VMS}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "ERROR: CREATE_VMS=true requires VMS>=1 (got VMS='${VMS}')" >&2
+            exit 1
+        fi
+        if [[ -z "${STORAGE_CLASS:-}" ]]; then
+            echo "ERROR: STORAGE_CLASS is required when CREATE_VMS=true" >&2
+            exit 1
+        fi
+        # Placeholder hosts — Python ignores them when --create-vms is set
+        HOST_BLOCK="  hosts: []"
+    elif [[ -n "${HOSTS:-}" ]]; then
         HOST_BLOCK="  hosts: \"${HOSTS}\""
     elif [[ -n "${HOST_PATTERN:-}" ]]; then
         HOST_BLOCK="  host_pattern: \"${HOST_PATTERN}\""
@@ -53,9 +109,16 @@ else
         HOST_BLOCK="  host_labels: \"${HOST_LABELS}\""
     else
         echo "ERROR: No config file and no host selection." >&2
+        echo "CREATE_VMS=${CREATE_VMS}  HOST_PATTERN='${HOST_PATTERN:-}'  VMS=${VMS}" >&2
+        if [[ "${CREATE_VMS}" != "true" ]] && [[ "${VMS}" =~ ^[1-9][0-9]*$ ]]; then
+            echo >&2
+            echo "HINT: VMS is set but CREATE_VMS=false — provision params are ignored." >&2
+            echo "      Set CREATE_VMS=true to create VMs, or set HOST_PATTERN to existing VMs." >&2
+        fi
         echo "Either mount a config file:" >&2
         echo "  -v ./mssql-config.yaml:/work/mssql-config.yaml" >&2
         echo "Or set one of: -e HOSTS=... / -e HOST_PATTERN=... / -e HOST_LABELS=..." >&2
+        echo "Or provision: -e CREATE_VMS=true -e VMS=N -e STORAGE_CLASS=..." >&2
         exit 1
     fi
 
@@ -90,6 +153,19 @@ else
         HAMMERDB_REPO_LINE="  repo: \"${HAMMERDB_REPO}\""
     fi
 
+    ITERATIONS_LINE=""
+    if [[ -n "${ITERATIONS:-}" ]]; then
+        ITERATIONS_LINE=$'\n'"  iterations: ${ITERATIONS}"
+    fi
+    ITERATION_SLEEP_LINE=""
+    if [[ -n "${ITERATION_SLEEP:-}" ]]; then
+        ITERATION_SLEEP_LINE=$'\n'"  iteration_sleep_sec: ${ITERATION_SLEEP}"
+    fi
+    VU_SLEEP_LINE=""
+    if [[ -n "${VU_SLEEP:-}" ]]; then
+        VU_SLEEP_LINE=$'\n'"  vu_sleep_sec: ${VU_SLEEP}"
+    fi
+
     cat > "${CONFIG}" <<EOF
 description: "${DESCRIPTION}"
 
@@ -104,7 +180,7 @@ ${HOST_BLOCK}
   warehouse_count: ${WAREHOUSE_COUNT}
   build_users: ${BUILD_USERS}
   test_duration: ${TEST_DURATION}${RAMPUP_LINE}
-  mssql_pass: "${MSSQL_PASS}"${MAX_SERVER_MEMORY_LINE}
+  mssql_pass: "${MSSQL_PASS}"${MAX_SERVER_MEMORY_LINE}${ITERATIONS_LINE}${ITERATION_SLEEP_LINE}${VU_SLEEP_LINE}
   rebuilddb: ${REBUILDDB}
   rebuild_only: ${REBUILD_ONLY}
   test_only: ${TEST_ONLY}
@@ -137,10 +213,70 @@ fi
 cat "${CONFIG}"
 echo "---"
 
+# --- Extra CLI args for create-vms ---
+EXTRA_ARGS=""
+if [[ "${CREATE_VMS:-}" == "true" ]]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --create-vms"
+    EXTRA_ARGS="${EXTRA_ARGS} --vms ${VMS:-0}"
+    if [[ -n "${VM_CPU:-}" ]]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --vm-cpu ${VM_CPU}"
+    fi
+    if [[ -n "${VM_MEMORY:-}" ]]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --vm-memory ${VM_MEMORY}"
+    fi
+    if [[ -n "${VM_IMAGE:-}" ]]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --vm-image ${VM_IMAGE}"
+    fi
+    if [[ -n "${STORAGE_CLASS:-}" ]]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --storage-class ${STORAGE_CLASS}"
+    fi
+    if [[ -n "${ACCESS_MODE:-}" ]]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --access-mode ${ACCESS_MODE}"
+    fi
+    if [[ -n "${ROOT_VOLUME_SIZE:-}" ]]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --root-volume-size ${ROOT_VOLUME_SIZE}"
+    fi
+    if [[ -n "${DATA_DISK_SIZE:-}" ]]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --data-disk-size ${DATA_DISK_SIZE}"
+    fi
+    if [[ -n "${VM_PREFIX:-}" ]]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --vm-prefix ${VM_PREFIX}"
+    fi
+    if [[ -n "${NAMESPACE:-}" ]]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --namespace ${NAMESPACE}"
+    fi
+fi
+# SSH key path: create-vms (generate) or re-run against kept VMs (reuse)
+if [[ -n "${SSH_KEY_PATH:-}" ]]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --ssh-key-path ${SSH_KEY_PATH}"
+fi
+if [[ "${CLEANUP:-}" == "true" ]]; then
+    EXTRA_ARGS="${EXTRA_ARGS} --cleanup"
+fi
+
+_monitor_vm_raw="${MONITOR_VM:-false}"
+case "${_monitor_vm_raw,,}" in
+    true|1|yes|on)
+        EXTRA_ARGS="${EXTRA_ARGS} --monitor-vm --monitor-vm-interval ${MONITOR_VM_INTERVAL:-10}"
+        ;;
+esac
+
+# Sweep iterations / sleeps (optional; CLI overrides YAML)
+SWEEP_ARGS=()
+[[ -n "${ITERATIONS:-}" ]] && SWEEP_ARGS+=(--iterations "${ITERATIONS}")
+[[ -n "${ITERATION_SLEEP:-}" ]] && SWEEP_ARGS+=(--iteration-sleep "${ITERATION_SLEEP}")
+[[ -n "${VU_SLEEP:-}" ]] && SWEEP_ARGS+=(--vu-sleep "${VU_SLEEP}")
+if [[ ${#SWEEP_ARGS[@]} -gt 0 ]]; then
+    echo "Sweep: ${SWEEP_ARGS[*]}"
+    EXTRA_ARGS="${EXTRA_ARGS} ${SWEEP_ARGS[*]}"
+fi
+
 # --- Run mssqldb.py from /work/results so output lands there ---
 cd /work/results
 
+# shellcheck disable=SC2086
 exec python3 /work/mssqldb.py \
     -c "${CONFIG}" \
     --virtctl-only \
+    ${EXTRA_ARGS} \
     "$@"

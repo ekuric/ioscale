@@ -1,0 +1,43 @@
+# Linux VirtualMachine template (clone from source DV + blank data disk for MSSQL datadir).
+# Placeholders filled by mssql_tests.provision. Data-disk blocks are injected
+# when attach_data_disk=true (default for MSSQL Linux).
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: ${vm_name}
+  namespace: ${namespace}
+  labels:
+    mssql-container.ioscale/managed: "true"
+    mssql-container.ioscale/os: linux
+    mssql-container.ioscale/run: "${run_id}"
+    mssql-container.ioscale/role: vm
+spec:
+  runStrategy: RerunOnFailure
+  dataVolumeTemplates: []  # filled programmatically
+  template:
+    metadata:
+      labels:
+        mssql-container.ioscale/managed: "true"
+        mssql-container.ioscale/os: linux
+        mssql-container.ioscale/run: "${run_id}"
+        mssql-container.ioscale/role: vm
+    spec:
+      architecture: amd64
+      domain:
+        cpu:
+          cores: ${vm_cpu}
+        resources:
+          requests:
+            memory: ${vm_memory}
+        devices:
+          disks: []  # filled programmatically
+          interfaces:
+          - name: default
+            masquerade: {}
+            bootOrder: 2
+        machine:
+          type: pc-q35-rhel9.4.0
+      networks:
+      - name: default
+        pod: {}
+      volumes: []  # filled programmatically

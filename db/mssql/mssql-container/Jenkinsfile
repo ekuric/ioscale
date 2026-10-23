@@ -11,9 +11,32 @@ pipeline {
         string(name: 'SSH_CREDENTIAL_ID', defaultValue: 'bastion-ssh-key',     description: 'Jenkins credential ID for this bastion SSH key. Each bastion needs its own key registered in Jenkins (Manage Credentials > Add > SSH Username with private key). Use a unique ID per bastion, e.g. team-a-bastion, lab2-bastion.')
         string(name: 'CONTAINER_IMAGE',   defaultValue: 'quay.io/ekuric/mssqllin-benchmark:latest', description: 'Container image to run')
 
-        string(name: 'HOST_PATTERN',      defaultValue: 'mssql-{1..10}',      description: 'Linux VM host pattern')
+        choice(
+            name: 'CREATE_VMS',
+            choices: ['false', 'true'],
+            description: '[Create VMs] Provision Linux guests before HammerDB (leave HOST_PATTERN empty; needs STORAGE_CLASS)'
+        )
+        choice(
+            name: 'CLEANUP',
+            choices: ['false', 'true'],
+            description: '[Create VMs] Delete managed VMs after test (default keep; next create still wipes leftovers)'
+        )
+        string(name: 'VMS',               defaultValue: '3',                  description: '[Create VMs] Number of Linux VMs')
+        string(name: 'VM_PREFIX',         defaultValue: 'mssql',              description: '[Create VMs] Name prefix → mssql-1..N')
+        string(name: 'VM_CPU',            defaultValue: '2',                  description: '[Create VMs] vCPU cores')
+        string(name: 'VM_MEMORY',         defaultValue: '4Gi',                description: '[Create VMs] Memory')
+        string(
+            name: 'VM_IMAGE',
+            defaultValue: 'quay.io/containerdisks/fedora:41',
+            description: '[Create VMs] Guest OS containerdisk (registry)'
+        )
+        string(name: 'STORAGE_CLASS',     defaultValue: '',                   description: '[Create VMs] StorageClass (required if CREATE_VMS=true)')
+        string(name: 'ROOT_VOLUME_SIZE',  defaultValue: '20Gi',               description: '[Create VMs] Root PVC size')
+        string(name: 'DATA_DISK_SIZE',    defaultValue: '40Gi',               description: '[Create VMs] Blank data disk for MSSQL datadir')
+
+        string(name: 'HOST_PATTERN',      defaultValue: 'mssql-{1..10}',      description: '[Existing hosts] Linux VM host pattern (empty when CREATE_VMS=true)')
         string(name: 'NAMESPACE',         defaultValue: 'default',             description: 'OpenShift namespace')
-        string(name: 'DISK_LIST',         defaultValue: '/dev/vdc',            description: 'Block device for MSSQL data')
+        string(name: 'DISK_LIST',         defaultValue: '/dev/vdc',            description: 'Block device for MSSQL data (auto vdb when CREATE_VMS)')
         string(name: 'MOUNT_POINT',       defaultValue: '',                    description: 'Mount point (if set, DISK_LIST is ignored)')
 
         string(name: 'WAREHOUSE_COUNT',   defaultValue: '50',                  description: 'TPCC warehouse count')
@@ -32,6 +55,9 @@ pipeline {
         string(name: 'HAMMERDB_REPO',     defaultValue: 'https://github.com/ekuric/ioscale.git', description: 'Only used when HAMMERDB_SOURCE=remote_git')
 
         string(name: 'RAMPUP_TIME',        defaultValue: '',                    description: 'Ramp-up time in minutes (empty = default 2 min)')
+        string(name: 'ITERATIONS',        defaultValue: '1',                   description: 'Repeat full user_count sweep N times (results *_runN)')
+        string(name: 'ITERATION_SLEEP',   defaultValue: '60',                  description: 'Seconds between sweep iterations (0=off)')
+        string(name: 'VU_SLEEP',          defaultValue: '30',                  description: 'Seconds between VU levels within an iteration (0=off)')
         string(name: 'MIGRATE_USER_COUNTS', defaultValue: '',                  description: 'User counts triggering VM migration (space-separated, empty = no migration)')
         string(name: 'MIGRATE_INTERVAL',  defaultValue: '0',                  description: 'Seconds between migrations (0 = parallel)')
         string(name: 'DESCRIPTION',       defaultValue: 'jenkins-mssqldb-test', description: 'Test run description')
@@ -48,7 +74,7 @@ pipeline {
                 sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
-                            mkdir -p ${RESULTS_DIR}
+                            mkdir -p ${RESULTS_DIR} /tmp/mssql-ssh
                             podman pull ${params.CONTAINER_IMAGE} || true
                         '
                     """
@@ -61,9 +87,20 @@ pipeline {
                 sshagent(credentials: [params.SSH_CREDENTIAL_ID]) {
                     sh """
                         ssh -o StrictHostKeyChecking=no ${BASTION_CONN} '
+                            mkdir -p /tmp/mssql-ssh
                             podman run --rm --init --pids-limit=-1 \
                               -e HOST_PATTERN="${params.HOST_PATTERN}" \
                               -e NAMESPACE="${params.NAMESPACE}" \
+                              -e CREATE_VMS="${params.CREATE_VMS}" \
+                              -e CLEANUP="${params.CLEANUP}" \
+                              -e VMS="${params.VMS}" \
+                              -e VM_PREFIX="${params.VM_PREFIX}" \
+                              -e VM_CPU="${params.VM_CPU}" \
+                              -e VM_MEMORY="${params.VM_MEMORY}" \
+                              -e VM_IMAGE="${params.VM_IMAGE}" \
+                              -e STORAGE_CLASS="${params.STORAGE_CLASS}" \
+                              -e ROOT_VOLUME_SIZE="${params.ROOT_VOLUME_SIZE}" \
+                              -e DATA_DISK_SIZE="${params.DATA_DISK_SIZE}" \
                               -e DISK_LIST="${params.DISK_LIST}" \
                               -e MOUNT_POINT="${params.MOUNT_POINT}" \
                               -e WAREHOUSE_COUNT=${params.WAREHOUSE_COUNT} \
@@ -79,12 +116,16 @@ pipeline {
                               -e HAMMERDB_PATH="${params.HAMMERDB_PATH}" \
                               -e HAMMERDB_REPO="${params.HAMMERDB_REPO}" \
                               -e RAMPUP_TIME="${params.RAMPUP_TIME}" \
+                              -e ITERATIONS="${params.ITERATIONS}" \
+                              -e ITERATION_SLEEP="${params.ITERATION_SLEEP}" \
+                              -e VU_SLEEP="${params.VU_SLEEP}" \
                               -e MIGRATE_USER_COUNTS="${params.MIGRATE_USER_COUNTS}" \
                               -e MIGRATE_INTERVAL=${params.MIGRATE_INTERVAL} \
                               -e DESCRIPTION="${params.DESCRIPTION}" \
-                              -v ${RESULTS_DIR}:/work/results \
-                              -v /root/.ssh:/root/.ssh:ro \
-                              -v /root/.kube/config:/root/.kube/config \
+                              -v ${RESULTS_DIR}:/work/results:Z \
+                              -v /root/.ssh/id_rsa:/root/.ssh/id_rsa:ro,Z \
+                              -v /root/.kube:/root/.kube:ro,Z \
+                              -v /tmp/mssql-ssh:/host-tmp:Z \
                               --privileged \
                               ${params.CONTAINER_IMAGE}
                         '
@@ -121,9 +162,12 @@ pipeline {
         }
         always {
             echo "Test description: ${params.DESCRIPTION}"
+            echo "Create VMs: ${params.CREATE_VMS} count=${params.VMS} prefix=${params.VM_PREFIX} cleanup=${params.CLEANUP}"
             echo "Hosts: ${params.HOST_PATTERN}"
+            echo "StorageClass: ${params.STORAGE_CLASS}"
             echo "Warehouses: ${params.WAREHOUSE_COUNT}, Build users: ${params.BUILD_USERS}"
             echo "User counts: ${params.USER_COUNT}, Duration: ${params.TEST_DURATION}m"
+            echo "Sweep iterations: ${params.ITERATIONS} (vu_sleep=${params.VU_SLEEP}s, iteration_sleep=${params.ITERATION_SLEEP}s)"
         }
     }
 }

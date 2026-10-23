@@ -42,6 +42,10 @@ database:
   # Leave omitted/empty for SQL Server default (effectively unlimited / OS-managed).
   # Example: 38000 on a ~50GB VM leaves headroom for HammerDB and the OS.
   # max_server_memory_mb: 38000
+  # Sweep iterations (repeat full user_count list; same as mssqlwin)
+  # iterations: 1                    # Repeat full user_count sweep N times (*_run1 … *_runN)
+  # iteration_sleep_sec: 60          # Sleep between sweep iterations (0=off)
+  # vu_sleep_sec: 30                 # Sleep between VU levels within an iteration (0=off)
   rebuilddb: true                # Build database before tests
   rebuild_only: false            # Only rebuild database, skip tests/results
   test_only: false               # Only run tests on existing database
@@ -84,6 +88,22 @@ monitoring:
   build_poll_interval: 30       # Seconds between build status polls
   build_check_timeout: 60       # Per-poll SSH/virtctl timeout during build monitoring
   build_check_max_retries: 1    # Retries per poll (keep low to avoid virtctl storms)
+
+# On-demand Linux VMs (optional). Prefer CLI/env: --create-vms / CREATE_VMS=true
+# Flow: registry containerdisk → source DV → clone root + blank data disk per VM.
+# Hosts and disk_list are filled after Ready+SSH (YAML hosts ignored when create_vms).
+# provision:
+#   create_vms: true
+#   vms: 3
+#   vm_prefix: mssql
+#   vm_cpu: "2"
+#   vm_memory: 4Gi
+#   vm_image: quay.io/containerdisks/fedora:41
+#   storage_class: ocs-storagecluster-ceph-rbd-virtualization
+#   access_mode: ReadWriteMany
+#   root_volume_size: 20Gi
+#   data_disk_size: 40Gi
+#   cleanup: false
 
 # VM Migration Configuration (optional - virtctl mode only)
 # This allows VMs to be migrated during test execution to test migration resilience

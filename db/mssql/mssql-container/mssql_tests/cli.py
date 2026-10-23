@@ -1,0 +1,483 @@
+"""CLI entrypoint and phase orchestration for MSSQL Linux HammerDB tests."""
+from __future__ import annotations
+
+import argparse
+import glob
+import logging
+import os
+import re
+import sys
+from datetime import datetime
+
+from mssql_tests.build import build_database
+from mssql_tests.config import (
+    ConfigLoader,
+    MSSQLConfigError,
+    MSSQLTestConfig,
+    check_dependencies,
+    display_config,
+    validate_inputs,
+)
+from mssql_tests.deploy import deploy_scripts
+from mssql_tests.executor import CommandExecutor
+from mssql_tests.migration import VMMigrationMonitor
+from mssql_tests.packages import install_dependencies
+from mssql_tests.provision import cleanup_provisioned, provision_vms, remove_ssh_key_dir
+from mssql_tests.results import collect_results
+from mssql_tests.service import configure_mssql_memory, stop_mssql
+from mssql_tests.storage import install_mssql
+from mssql_tests.workload import run_tests
+
+logger = logging.getLogger("mssql_tests")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+def prepare_hosts(config: MSSQLTestConfig, executor: CommandExecutor) -> None:
+    """Preparation-only function"""
+    logger.info("=== HOST PREPARATION MODE ===")
+    logger.info("Starting host preparation phase")
+    logger.info("This will install packages, clone repositories, and setup MSSQL Server")
+    logger.info("Performance tests will NOT be executed")
+    
+    if config.dry_run:
+        logger.info("DRY RUN MODE: Host preparation configuration validated successfully")
+        logger.info("Would execute the following preparation steps:")
+        logger.info("  1. Install dependencies on VMs")
+        logger.info("  2. Deploy HammerDB scripts")
+        logger.info("  3. Install MSSQL Server")
+        if config.max_server_memory_mb is not None:
+            logger.info(f"  4. Set max server memory to {config.max_server_memory_mb} MB")
+        logger.info("Use without --dry-run to execute the actual preparation")
+        return
+    
+    logger.info("Running host preparation steps...")
+    install_dependencies(config, executor)
+    deploy_scripts(config, executor)
+    install_mssql(config, executor)
+    configure_mssql_memory(config, executor)
+    
+    logger.info("=== HOST PREPARATION COMPLETED ===")
+    logger.info("Host preparation completed successfully")
+    logger.info("All hosts are now ready for performance testing")
+    logger.info("")
+    logger.info("Next steps:")
+    logger.info("  1. Run the script without --prepare-hosts to execute performance tests")
+    logger.info("  2. Or run with --dry-run to validate the test configuration")
+    logger.info("")
+    logger.info(f"Example: python3 mssqldb.py -c {config.config_file}  # Run full performance test")
+
+
+def main():
+    """Main function"""
+    parser = argparse.ArgumentParser(
+        description="MSSQL Server HammerDB TPCC Testing Script (YAML Configuration Version)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EXAMPLES:
+    python3 mssqldb.py                          # Use default mssql-config.yaml
+    python3 mssqldb.py -c test-config.yaml      # Use custom configuration file
+    python3 mssqldb.py -c mssql-config.yaml -v        # Use default config with verbose output
+    python3 mssqldb.py --prepare-hosts          # Only prepare hosts (install packages, MSSQL Server)
+    python3 mssqldb.py --prepare-hosts -v       # Prepare hosts with verbose output
+    python3 mssqldb.py --copy-results           # Only copy results from hosts (skip all other steps)
+    python3 mssqldb.py --create-vms --vms 3 --storage-class ocs-storagecluster-ceph-rbd
+
+YAML CONFIGURATION:
+    See config.yaml for configuration file format and examples.
+
+NOTES:
+    - Requires PyYAML for YAML parsing
+    - Script supports both virtctl (OpenShift VMs) and SSH (baremetal/KVM) access
+    - Use --ssh-only for baremetal/KVM hosts, --virtctl-only for OpenShift VMs
+    - All operations are performed as root on target hosts
+
+WORKFLOW:
+    For large deployments, you can split the process into phases:
+    1. Preparation: python3 mssqldb.py --prepare-hosts    # Install packages, MSSQL Server
+    2. Testing:     python3 mssqldb.py                   # Run performance tests
+    3. Copy Results: python3 mssqldb.py --copy-results   # Re-copy results without re-running tests
+    
+    This allows you to prepare all hosts first, then run tests when ready, and copy results later if needed.
+        """
+    )
+    parser.add_argument('-c', '--config', default='mssql-config.yaml',
+                       help='Path to YAML configuration file (default: mssql-config.yaml)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                       help='Verbose output')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Validate configuration and show what would be done without executing')
+    parser.add_argument('--prepare-hosts', action='store_true',
+                       help='Only run preparation steps (install packages, deploy scripts, MSSQL Server setup)')
+    parser.add_argument('--copy-results', action='store_true',
+                       help='Only copy results from hosts (skip installation, building, and testing)')
+    parser.add_argument('--ssh-only', action='store_true',
+                       help='Force SSH for all hosts (baremetal/KVM, no virtctl)')
+    parser.add_argument('--virtctl-only', action='store_true',
+                       help='Force virtctl for all hosts (OpenShift VMs)')
+    parser.add_argument('--monitor-vm', action='store_true',
+                       help='Monitor VM node placement during tests and log migrations')
+    parser.add_argument('--monitor-vm-interval', type=int, default=10,
+                       help='VM monitor polling interval in seconds (default: 10)')
+    parser.add_argument(
+        '--create-vms',
+        action='store_true',
+        help='Provision managed Linux VMs before the test. Requires --storage-class and --vms.',
+    )
+    parser.add_argument(
+        '--cleanup',
+        action='store_true',
+        help='Delete managed VMs/DataVolumes after the test (default: keep)',
+    )
+    parser.add_argument('--vms', type=int, default=None, help='Number of Linux VMs to create')
+    parser.add_argument('--vm-cpu', default=None, help='vCPU cores per VM')
+    parser.add_argument('--vm-memory', default=None, help='Memory per VM (e.g. 4Gi)')
+    parser.add_argument('--vm-image', default=None, help='Guest OS containerdisk (registry)')
+    parser.add_argument('--storage-class', default=None, help='StorageClass for DV/PVC')
+    parser.add_argument('--access-mode', default=None, help='PVC access mode (default ReadWriteMany)')
+    parser.add_argument('--root-volume-size', default=None, help='Root PVC size')
+    parser.add_argument('--data-disk-size', default=None, help='Blank data disk size')
+    parser.add_argument('--vm-prefix', default=None, help='VM name prefix (→ prefix-1..N)')
+    parser.add_argument(
+        '--ssh-key-path',
+        default=None,
+        help='Directory for ephemeral SSH keypair (default: /tmp/mssql-ssh-<runid>)',
+    )
+    parser.add_argument('--namespace', default=None, help='Override OpenShift namespace')
+    parser.add_argument(
+        '--iterations',
+        type=int,
+        default=None,
+        dest='iterations',
+        help='Repeat full user_count sweep N times (database.iterations)',
+    )
+    parser.add_argument(
+        '--iteration-sleep',
+        type=int,
+        default=None,
+        dest='iteration_sleep',
+        help='Seconds to sleep between sweep iterations (0=off). Alias: --sweep-sleep',
+    )
+    parser.add_argument(
+        '--sweep-sleep',
+        type=int,
+        default=None,
+        dest='sweep_sleep',
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        '--vu-sleep',
+        type=int,
+        default=None,
+        dest='vu_sleep',
+        help='Seconds to sleep between VU levels within an iteration (0=off)',
+    )
+
+    args = parser.parse_args()
+    
+    # Set up logging
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    if args.prepare_hosts:
+        logger.info("Starting MSSQL Server HammerDB TPCC testing script (PREPARATION MODE)")
+    else:
+        logger.info("Starting MSSQL Server HammerDB TPCC testing script (FULL TEST MODE)")
+    
+    # Initialize configuration
+    config = MSSQLTestConfig()
+    config.config_file = args.config
+    config.dry_run = args.dry_run
+    config.verbose = args.verbose
+    config.use_virtctl = None if not (args.ssh_only or args.virtctl_only) else (not args.ssh_only)
+    config.prepare_hosts = args.prepare_hosts
+    config.copy_results = args.copy_results
+    config.monitor_vm = args.monitor_vm
+    config.monitor_vm_interval = args.monitor_vm_interval
+    config.create_vms = args.create_vms
+    config.cleanup_vms = args.cleanup
+    if args.vms is not None:
+        config.vms_count = args.vms
+    if args.vm_cpu is not None:
+        config.vm_cpu = args.vm_cpu
+    if args.vm_memory is not None:
+        config.vm_memory = args.vm_memory
+    if args.vm_image is not None:
+        config.vm_image = args.vm_image
+    if args.storage_class is not None:
+        config.storage_class = args.storage_class
+    if args.access_mode is not None:
+        config.access_mode = args.access_mode
+    if args.root_volume_size is not None:
+        config.root_volume_size = args.root_volume_size
+    if args.data_disk_size is not None:
+        config.data_disk_size = args.data_disk_size
+    if args.vm_prefix is not None:
+        config.vm_prefix = args.vm_prefix
+    if args.ssh_key_path is not None:
+        config.ssh_key_path = args.ssh_key_path
+    if args.iterations is not None:
+        if args.iterations < 1:
+            logger.error("--iterations must be >= 1")
+            return 1
+        config.test_iterations = args.iterations
+    cli_iter_sleep = args.iteration_sleep
+    if cli_iter_sleep is None and args.sweep_sleep is not None:
+        cli_iter_sleep = args.sweep_sleep
+    if cli_iter_sleep is not None:
+        if cli_iter_sleep < 0:
+            logger.error("--iteration-sleep must be >= 0")
+            return 1
+        config.iteration_sleep_sec = cli_iter_sleep
+    if args.vu_sleep is not None:
+        if args.vu_sleep < 0:
+            logger.error("--vu-sleep must be >= 0")
+            return 1
+        config.vu_sleep_sec = args.vu_sleep
+
+    log_file = None
+    try:
+        config_loader = ConfigLoader(config)
+        config_loader.load_config()
+        # CLI sweep flags win over YAML (re-apply after load)
+        if args.iterations is not None:
+            config.test_iterations = args.iterations
+        if cli_iter_sleep is not None:
+            config.iteration_sleep_sec = cli_iter_sleep
+        if args.vu_sleep is not None:
+            config.vu_sleep_sec = args.vu_sleep
+        if args.namespace:
+            config.namespace = args.namespace
+        # Re-use ephemeral key dir for re-runs against kept create-vms guests
+        if config.ssh_key_path:
+            key_file = os.path.join(config.ssh_key_path, "id_ed25519")
+            if os.path.isfile(key_file):
+                config.ssh_identity_file = key_file
+                logger.info(f"Using SSH identity from --ssh-key-path: {key_file}")
+
+        log_date = datetime.now().strftime('%Y%m%d')
+        sanitized_desc = re.sub(r'[^a-z0-9]', '_', config.description.lower()) if config.description else ""
+        sanitized_desc = re.sub(r'_+', '_', sanitized_desc).strip('_')
+        log_file = (
+            f"mssql-{log_date}-{sanitized_desc}.txt"
+            if sanitized_desc
+            else f"mssql-{log_date}.txt"
+        )
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(
+            logging.Formatter(
+                '[%(asctime)s] %(levelname)s: %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S',
+            )
+        )
+        logging.getLogger().addHandler(file_handler)
+        logger.info(f"Logging all output to: {log_file}")
+        if config.description:
+            logger.info("=" * 80)
+            logger.info(f"TEST DESCRIPTION: {config.description}")
+            logger.info("=" * 80)
+
+        check_dependencies(config)
+
+        if config.create_vms and not config.copy_results:
+            if config.use_virtctl is False:
+                logger.error("CRITICAL: --create-vms requires virtctl mode (not --ssh-only)")
+                return 1
+            logger.info("=" * 80)
+            logger.info(
+                f"PHASE 1: Provision VMs (linux={config.vms_count}) "
+                "— wait until Ready and SSH before continuing"
+            )
+            logger.info("=" * 80)
+            provision_vms(config)
+            logger.info(f"PHASE 1 complete: hosts ready: {' '.join(config.db_hosts)}")
+
+        if not config.db_hosts and not config.dry_run and not config.copy_results:
+            raise MSSQLConfigError("CRITICAL: No hosts configured after load/provision")
+
+        display_config(config)
+        validate_inputs(config)
+    except MSSQLConfigError as e:
+        logger.error(str(e))
+        remove_ssh_key_dir(getattr(config, "ssh_key_path", None), also_bastion_mirror=False)
+        return 1
+    except SystemExit:
+        remove_ssh_key_dir(getattr(config, "ssh_key_path", None), also_bastion_mirror=False)
+        raise
+    except Exception:
+        remove_ssh_key_dir(getattr(config, "ssh_key_path", None), also_bastion_mirror=False)
+        raise
+
+    executor = CommandExecutor(config)
+
+    def _maybe_cleanup():
+        try:
+            if config.create_vms and config.cleanup_vms:
+                cleanup_provisioned(config)
+            if config.create_vms:
+                remove_ssh_key_dir(
+                    getattr(config, "ssh_key_path", None),
+                    also_bastion_mirror=bool(config.cleanup_vms),
+                )
+        except Exception as cleanup_err:
+            logger.warning(f"Cleanup warning: {cleanup_err}")
+
+    if config.dry_run:
+        logger.info("DRY RUN MODE: Configuration validated successfully")
+        if config.create_vms:
+            logger.info(
+                f"Would provision VMs: linux={config.vms_count}, "
+                f"storage_class={config.storage_class}, cleanup_after={config.cleanup_vms}"
+            )
+        if config.copy_results:
+            logger.info("Would execute the following steps:")
+            logger.info("  1. Collect test results from all VMs")
+            logger.info("  2. Copy log file to results directory (if found)")
+        elif config.prepare_hosts:
+            logger.info("Would execute the following preparation steps:")
+            step = 1
+            if config.create_vms:
+                logger.info(f"  {step}. Provision managed Linux VMs (--create-vms)")
+                step += 1
+            logger.info(f"  {step}. Install dependencies on VMs")
+            step += 1
+            logger.info(f"  {step}. Deploy HammerDB scripts")
+            step += 1
+            logger.info(f"  {step}. Install MSSQL Server")
+            if config.max_server_memory_mb is not None:
+                step += 1
+                logger.info(f"  {step}. Set max server memory to {config.max_server_memory_mb} MB")
+        else:
+            logger.info("Would execute the following steps:")
+            steps = []
+            if config.create_vms:
+                steps.append("Provision managed Linux VMs (--create-vms)")
+            steps.extend([
+                "Install dependencies on VMs",
+                "Deploy HammerDB scripts",
+                "Install MSSQL Server",
+            ])
+            if config.max_server_memory_mb is not None:
+                steps.append(f"Set max server memory to {config.max_server_memory_mb} MB")
+            steps.extend([
+                "Build TPCC database",
+                "Run performance tests",
+                "Collect test results from all VMs",
+                "Stop MSSQL Server instances and cleanup storage",
+            ])
+            if config.create_vms and config.cleanup_vms:
+                steps.append("Delete managed VMs/DataVolumes (--cleanup)")
+            for index, step in enumerate(steps, start=1):
+                logger.info(f"  {index}. {step}")
+        logger.info("Use without --dry-run to execute the actual tests")
+        return 0
+
+    try:
+        if config.prepare_hosts:
+            prepare_hosts(config, executor)
+            return 0
+
+        if config.copy_results:
+            logger.info("=== COPY RESULTS MODE ===")
+            logger.info("Only copying results from hosts (skipping all other steps)")
+
+            results_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+            sanitized_desc = re.sub(r'[^a-z0-9]', '_', config.description.lower()) if config.description else ""
+            sanitized_desc = re.sub(r'_+', '_', sanitized_desc).strip('_')
+
+            if sanitized_desc:
+                final_results_dir = f"./mssql-results-{results_timestamp}-{sanitized_desc}"
+            else:
+                final_results_dir = f"./mssql-results-{results_timestamp}"
+
+            log_file_to_copy = None
+            if sanitized_desc:
+                pattern = f"mssql-*-{sanitized_desc}.txt"
+            else:
+                pattern = f"mssql-*.txt"
+
+            matching_logs = glob.glob(pattern)
+            if matching_logs:
+                matching_logs.sort(key=os.path.getmtime, reverse=True)
+                log_file_to_copy = matching_logs[0]
+                logger.info(f"Found existing log file: {log_file_to_copy}")
+            else:
+                logger.info("No existing log file found matching pattern")
+
+            collect_results(config, executor, final_results_dir, log_file_to_copy)
+
+            logger.info("=== COPY RESULTS COMPLETED ===")
+            logger.info(f"Results have been copied to localhost: {final_results_dir}")
+            logger.info("Each VM's results are in separate subdirectories with extracted files")
+            return 0
+
+        if config.rebuild_only and config.test_only:
+            logger.error("rebuild_only and test_only cannot both be enabled")
+            return 1
+
+        # Full test execution (guest work only after VMs exist when create_vms)
+        install_dependencies(config, executor)
+        deploy_scripts(config, executor)
+        install_mssql(config, executor)
+        configure_mssql_memory(config, executor)
+
+        if config.rebuild_only:
+            if not config.rebuilddb:
+                logger.error("rebuild_only requires rebuilddb to be enabled")
+                return 1
+            build_database(config, executor)
+            logger.info("Rebuild-only mode complete; skipping tests and result collection")
+            return 0
+
+        if config.rebuilddb:
+            build_database(config, executor)
+        else:
+            logger.info("Rebuilddb disabled: skipping database build step")
+
+        migration_monitor = None
+        if config.monitor_vm:
+            migration_monitor = VMMigrationMonitor(
+                namespace=config.namespace,
+                interval=config.monitor_vm_interval,
+                vm_hosts=config.db_hosts
+            )
+            migration_monitor.start()
+
+        run_tests(config, executor, migration_monitor=migration_monitor)
+
+        if migration_monitor:
+            migration_monitor.stop()
+
+        results_timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        sanitized_desc = re.sub(r'[^a-z0-9]', '_', config.description.lower()) if config.description else ""
+        sanitized_desc = re.sub(r'_+', '_', sanitized_desc).strip('_')
+
+        if sanitized_desc:
+            final_results_dir = f"./mssql-results-{results_timestamp}-{sanitized_desc}"
+        else:
+            final_results_dir = f"./mssql-results-{results_timestamp}"
+
+        collect_results(config, executor, final_results_dir, log_file)
+
+        if migration_monitor:
+            migration_log_path = os.path.join(final_results_dir, "migration-events.log")
+            migration_monitor.write_report(migration_log_path)
+
+        stop_mssql(config, executor)
+
+        logger.info("MSSQL Server performance testing completed successfully")
+        logger.info(f"Results have been copied to localhost: {final_results_dir}")
+        logger.info("Each VM's results are in separate subdirectories with extracted files")
+        return 0
+    finally:
+        _maybe_cleanup()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+
+

@@ -15,6 +15,8 @@ RUN dnf install -y git \
  && dnf clean all
 
 COPY mssqldb.py .
+COPY mssql_tests/ mssql_tests/
+COPY templates/ templates/
 COPY mssql-config.yaml examples/
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
