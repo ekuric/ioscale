@@ -14,6 +14,103 @@ from postgresql_tests.util import _extract_postgresql_tpm
 
 logger = logging.getLogger("postgresql_tests")
 
+def _collect_vm_dumps(config: PostgreSQLTestConfig, results_dir: str) -> None:
+    """Collect virt-launcher / virsh / VMI artifacts per host (same as mssql-linux)."""
+    if config.use_virtctl is False or not config.namespace or config.namespace == "N/A":
+        return
+    if config.dry_run:
+        logger.info("DRY-RUN: Would collect VM dump artifacts under results/vm-dump/")
+        return
+
+    logger.info("Collecting VM dump artifacts (virsh / VMI) into results/vm-dump/...")
+    for host in config.db_hosts:
+        try:
+            host_dump_dir = os.path.join(results_dir, "vm-dump", host)
+            os.makedirs(host_dump_dir, exist_ok=True)
+            pod_cmd = [
+                "oc", "get", "pod", "-n", config.namespace,
+                "-l", f"kubevirt.io/domain={host}",
+                "-o", "jsonpath={.items[0].metadata.name}",
+            ]
+            pod_result = subprocess.run(pod_cmd, capture_output=True, text=True, timeout=15)
+            pod_name = pod_result.stdout.strip()
+            if pod_result.returncode != 0 or not pod_name:
+                prefix = f"virt-launcher-{host}"
+                list_cmd = [
+                    "oc", "get", "pod", "-n", config.namespace,
+                    "-o", "jsonpath={.items[*].metadata.name}",
+                ]
+                list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=15)
+                if list_result.returncode == 0 and list_result.stdout.strip():
+                    for candidate in list_result.stdout.split():
+                        if candidate.startswith(prefix):
+                            pod_name = candidate
+                            break
+            if not pod_name:
+                logger.warning(f"VM dump skipped for {host}: virt-launcher pod not found")
+                continue
+
+            list_cmd = [
+                "oc", "exec", "-n", config.namespace, pod_name, "--",
+                "virsh", "list", "--state-running", "--name",
+            ]
+            list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=15)
+            domain_name = ""
+            if list_result.returncode == 0:
+                for line in list_result.stdout.splitlines():
+                    if line.strip():
+                        domain_name = line.strip()
+                        break
+            if not domain_name:
+                logger.warning(f"VM dump skipped for {host}: running domain not found in {pod_name}")
+                continue
+
+            def _save(cmd, filename, label, timeout=30):
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                if result.returncode != 0 or not result.stdout.strip():
+                    logger.warning(f"VM {label} failed for {host}: {result.stderr.strip()}")
+                    return
+                path = os.path.join(host_dump_dir, filename)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(result.stdout)
+                logger.info(f"Saved VM {label} for {host} to {path}")
+
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dumpxml", domain_name],
+                "dumpxml.xml", "dumpxml",
+            )
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dominfo", domain_name],
+                "dominfo.txt", "dominfo", timeout=15,
+            )
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domstats", domain_name],
+                "domstats.txt", "domstats", timeout=15,
+            )
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domblklist", domain_name],
+                "domblklist.txt", "domblklist", timeout=15,
+            )
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domiflist", domain_name],
+                "domiflist.txt", "domiflist", timeout=15,
+            )
+            _save(
+                ["oc", "get", "vmi", host, "-n", config.namespace, "-o", "yaml"],
+                "vmi.yaml", "VMI yaml", timeout=15,
+            )
+            _save(
+                ["oc", "get", "pod", pod_name, "-n", config.namespace, "-o", "yaml"],
+                "virt-launcher-pod.yaml", "virt-launcher pod yaml", timeout=15,
+            )
+            _save(
+                ["oc", "describe", "vmi", host, "-n", config.namespace],
+                "vmi-describe.txt", "VMI describe", timeout=15,
+            )
+        except Exception as exc:
+            logger.warning(f"VM dump collection failed for {host}: {exc}")
+
+
 def _safe_extract_tar(tar_path: str, extract_dir: str) -> bool:
     """Safely extract a tar.gz file, preventing path traversal (CVE-2007-4559)."""
     try:
@@ -144,7 +241,9 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
     logger.info(f"Results collected: {len(succeeded)} succeeded, {len(failed)} failed")
     if failed:
         logger.warning(f"Failed hosts: {', '.join(sorted(failed))}")
-    
+
+    _collect_vm_dumps(config, results_dir)
+
     # Copy log file to results directory
     if log_file and os.path.exists(log_file):
         try:
@@ -171,6 +270,8 @@ def collect_results(config: PostgreSQLTestConfig, executor: CommandExecutor, res
         # Display summary
         logger.info("PostgreSQL Test Results Summary:")
         for host_dir in os.listdir(results_dir):
+            if host_dir == "vm-dump":
+                continue
             host_path = os.path.join(results_dir, host_dir)
             if os.path.isdir(host_path):
                 build_files = len([f for f in os.listdir(host_path) if f.startswith("build_pg") and f.endswith(".out")])
