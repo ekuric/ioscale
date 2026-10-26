@@ -60,6 +60,10 @@ class MariaDBTestConfig:
         self.build_check_max_retries = 1  # Avoid retry storms during build polling
         self.monitor_vm = False
         self.monitor_vm_interval = 10
+        # Sweep iterations (repeat full user_count list). Same knobs as mssql-container.
+        self.test_iterations = 1
+        self.iteration_sleep_sec = 60
+        self.vu_sleep_sec = 30
         # On-demand VM provision (--create-vms)
         self.create_vms = False
         self.cleanup_vms = False
@@ -150,7 +154,45 @@ class ConfigLoader:
         self.config.warehouse_count = database.get('warehouse_count')
         self.config.test_duration = database.get('test_duration')
         self.config.rampup_time = database.get('rampup_time')
-        
+        # Sweep iterations (repeat full user_count list)
+        raw_iters = database.get("iterations", database.get("test_iterations"))
+        if raw_iters is not None and raw_iters != "null":
+            try:
+                self.config.test_iterations = max(1, int(raw_iters))
+            except (TypeError, ValueError):
+                logger.warning(f"Invalid database.iterations={raw_iters!r}; using 1")
+                self.config.test_iterations = 1
+        raw_sleep = database.get(
+            "iteration_sleep_sec",
+            database.get(
+                "iteration_sleep",
+                database.get(
+                    "sweep_sleep_sec",
+                    database.get("sweep_sleep", database.get("inter_sweep_sleep")),
+                ),
+            ),
+        )
+        if raw_sleep is not None and raw_sleep != "null":
+            try:
+                self.config.iteration_sleep_sec = max(0, int(raw_sleep))
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Invalid database.iteration_sleep_sec={raw_sleep!r}; using "
+                    f"{self.config.iteration_sleep_sec}"
+                )
+        raw_vu_sleep = database.get(
+            "vu_sleep_sec",
+            database.get("vu_sleep", database.get("user_count_sleep_sec")),
+        )
+        if raw_vu_sleep is not None and raw_vu_sleep != "null":
+            try:
+                self.config.vu_sleep_sec = max(0, int(raw_vu_sleep))
+            except (TypeError, ValueError):
+                logger.warning(
+                    f"Invalid database.vu_sleep_sec={raw_vu_sleep!r}; using "
+                    f"{self.config.vu_sleep_sec}"
+                )
+
         # Load test configuration
         test = yaml_data.get('test', {})
         user_count = test.get('user_count')
@@ -479,6 +521,11 @@ def display_config(config: MariaDBTestConfig) -> None:
     logger.info(f"Warehouse count: {config.warehouse_count}")
     logger.info(f"User counts: {' '.join(config.user_count)}")
     logger.info(f"Test duration: {config.test_duration} minutes")
+    logger.info(f"Sweep iterations: {config.test_iterations}")
+    logger.info(
+        f"Sleeps: vu_sleep={config.vu_sleep_sec}s between VU levels, "
+        f"iteration_sleep={config.iteration_sleep_sec}s between iterations"
+    )
     if config.rampup_time:
         logger.info(f"Rampup time: {config.rampup_time} minutes")
     else:

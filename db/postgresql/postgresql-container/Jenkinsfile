@@ -86,6 +86,9 @@ pipeline {
         string(name: 'WAREHOUSE_COUNT',     defaultValue: '50',               description: '[6. Workload] TPCC warehouse count')
         string(name: 'TEST_DURATION',       defaultValue: '15',               description: '[6. Workload] Test duration in minutes')
         string(name: 'USER_COUNT',          defaultValue: '1 10 20 50',       description: '[6. Workload] Space-separated user counts')
+        string(name: 'ITERATIONS',          defaultValue: '1',                description: '[6. Workload] Repeat full user_count sweep N times (results *_runN)')
+        string(name: 'ITERATION_SLEEP',     defaultValue: '60',               description: '[6. Workload] Seconds between sweep iterations (0=off)')
+        string(name: 'VU_SLEEP',            defaultValue: '30',               description: '[6. Workload] Seconds between VU levels within an iteration (0=off)')
         string(name: 'RAMPUP_TIME',         defaultValue: '',                 description: '[6. Workload] Ramp-up minutes (empty = default 2)')
         string(name: 'HAMMERDB_SOURCE',     defaultValue: 'bundled',          description: '[6. Workload] bundled (image) or remote_git')
         string(name: 'HAMMERDB_PATH',       defaultValue: '/root/hammerdb-tpcc-wrapper-scripts', description: '[6. Workload] Deploy path on guests')
@@ -187,6 +190,9 @@ pipeline {
                               -e WAREHOUSE_COUNT=${params.WAREHOUSE_COUNT} \
                               -e TEST_DURATION=${params.TEST_DURATION} \
                               -e USER_COUNT="${params.USER_COUNT}" \
+                              -e ITERATIONS="${params.ITERATIONS}" \
+                              -e ITERATION_SLEEP="${params.ITERATION_SLEEP}" \
+                              -e VU_SLEEP="${params.VU_SLEEP}" \
                               -e RAMPUP_TIME="${params.RAMPUP_TIME}" \
                               -e HAMMERDB_SOURCE="${params.HAMMERDB_SOURCE}" \
                               -e HAMMERDB_PATH="${params.HAMMERDB_PATH}" \
@@ -247,6 +253,7 @@ pipeline {
             echo "StorageClass: ${params.STORAGE_CLASS}"
             echo "Warehouses: ${params.WAREHOUSE_COUNT}, Duration: ${params.TEST_DURATION}m"
             echo "User counts: ${params.USER_COUNT}"
+            echo "Sweep iterations: ${params.ITERATIONS} (vu_sleep=${params.VU_SLEEP}s, iteration_sleep=${params.ITERATION_SLEEP}s)"
         }
     }
 }

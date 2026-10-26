@@ -35,6 +35,10 @@ database:
   warehouse_count: 50            # Number of warehouses for TPCC test
   test_duration: 15              # Test duration in minutes
   # rampup_time: 2               # Ramp-up time in minutes (defaults to 2 if not set)
+  # Sweep iterations (repeat full user_count list; same as mssql-container)
+  # iterations: 1                    # Repeat full user_count sweep N times (*_run1 … *_runN)
+  # iteration_sleep_sec: 60          # Sleep between sweep iterations (0=off)
+  # vu_sleep_sec: 30                 # Sleep between VU levels within an iteration (0=off)
 
 # Test Configuration
 test:

@@ -147,6 +147,34 @@ WORKFLOW:
         help='Directory for ephemeral SSH keypair (default: /tmp/postgresql-ssh-<runid>)',
     )
     parser.add_argument('--namespace', default=None, help='Override OpenShift namespace')
+    parser.add_argument(
+        '--iterations',
+        type=int,
+        default=None,
+        dest='iterations',
+        help='Repeat full user_count sweep N times (database.iterations)',
+    )
+    parser.add_argument(
+        '--iteration-sleep',
+        type=int,
+        default=None,
+        dest='iteration_sleep',
+        help='Seconds to sleep between sweep iterations (0=off). Alias: --sweep-sleep',
+    )
+    parser.add_argument(
+        '--sweep-sleep',
+        type=int,
+        default=None,
+        dest='sweep_sleep',
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        '--vu-sleep',
+        type=int,
+        default=None,
+        dest='vu_sleep',
+        help='Seconds to sleep between VU levels within an iteration (0=off)',
+    )
 
     args = parser.parse_args()
 
@@ -189,11 +217,36 @@ WORKFLOW:
         config.vm_prefix = args.vm_prefix
     if args.ssh_key_path is not None:
         config.ssh_key_path = args.ssh_key_path
+    if args.iterations is not None:
+        if args.iterations < 1:
+            logger.error("--iterations must be >= 1")
+            return 1
+        config.test_iterations = args.iterations
+    cli_iter_sleep = args.iteration_sleep
+    if cli_iter_sleep is None and args.sweep_sleep is not None:
+        cli_iter_sleep = args.sweep_sleep
+    if cli_iter_sleep is not None:
+        if cli_iter_sleep < 0:
+            logger.error("--iteration-sleep must be >= 0")
+            return 1
+        config.iteration_sleep_sec = cli_iter_sleep
+    if args.vu_sleep is not None:
+        if args.vu_sleep < 0:
+            logger.error("--vu-sleep must be >= 0")
+            return 1
+        config.vu_sleep_sec = args.vu_sleep
 
     log_file = None
     try:
         config_loader = ConfigLoader(config)
         config_loader.load_config()
+        # CLI sweep flags win over YAML (re-apply after load)
+        if args.iterations is not None:
+            config.test_iterations = args.iterations
+        if cli_iter_sleep is not None:
+            config.iteration_sleep_sec = cli_iter_sleep
+        if args.vu_sleep is not None:
+            config.vu_sleep_sec = args.vu_sleep
         if args.namespace:
             config.namespace = args.namespace
 

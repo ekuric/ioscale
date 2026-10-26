@@ -16,10 +16,12 @@ A comprehensive Python tool for extracting and visualizing database benchmark re
 
 ### PostgreSQL
 - Files containing `test_postgresql_pg` and `PostgreSQL TPM` results
+- Sweep-tagged names `…_{vu}_run{N}.out` (MariaDB / PostgreSQL / MSSQL Linux); VU is taken from `{vu}`, not the run index
 - Extracts TPM values from "System achieved" lines
 
 ### MariaDB
 - Files containing `test_mariadb` and `MySQL TPM` results
+- Sweep-tagged names `…_{vu}_run{N}.out` supported (same VU parsing as PostgreSQL/MSSQL Linux)
 - Extracts TPM values from "System achieved" lines
 
 ## Installation
@@ -193,17 +195,17 @@ The script expects input directories with the following structure:
 ```
 input_directory/
 ├── vm-1/
-│   ├── test_postgresql_pg_1.out
-│   ├── test_postgresql_pg_10.out
-│   └── test_postgresql_pg_20.out
+│   ├── test_postgresql_pg_…_1_run1.out
+│   ├── test_postgresql_pg_…_10_run1.out
+│   └── test_postgresql_pg_…_20_run1.out
 ├── vm-2/
-│   ├── test_postgresql_pg_1.out
-│   ├── test_postgresql_pg_10.out
-│   └── test_postgresql_pg_20.out
+│   ├── test_postgresql_pg_…_1_run1.out
+│   ├── test_postgresql_pg_…_10_run1.out
+│   └── test_postgresql_pg_…_20_run1.out
 └── vm-3/
-    ├── test_mariadb_1.out
-    ├── test_mariadb_10.out
-    └── test_mariadb_20.out
+    ├── test_mariadb_…_1_run1.out
+    ├── test_mariadb_…_10_run1.out
+    └── test_mariadb_…_20_run1.out
 ```
 
 ## Graph Features

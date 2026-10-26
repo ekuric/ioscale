@@ -143,6 +143,19 @@ else
         HAMMERDB_REPO_LINE="  repo: \"${HAMMERDB_REPO}\""
     fi
 
+    ITERATIONS_LINE=""
+    if [[ -n "${ITERATIONS:-}" ]]; then
+        ITERATIONS_LINE=$'\n'"  iterations: ${ITERATIONS}"
+    fi
+    ITERATION_SLEEP_LINE=""
+    if [[ -n "${ITERATION_SLEEP:-}" ]]; then
+        ITERATION_SLEEP_LINE=$'\n'"  iteration_sleep_sec: ${ITERATION_SLEEP}"
+    fi
+    VU_SLEEP_LINE=""
+    if [[ -n "${VU_SLEEP:-}" ]]; then
+        VU_SLEEP_LINE=$'\n'"  vu_sleep_sec: ${VU_SLEEP}"
+    fi
+
     cat > "${CONFIG}" <<EOF
 description: "${DESCRIPTION}"
 
@@ -155,7 +168,7 @@ database:
 ${HOST_BLOCK}
   namespace: "${NAMESPACE}"
   warehouse_count: ${WAREHOUSE_COUNT}
-  test_duration: ${TEST_DURATION}${RAMPUP_LINE}
+  test_duration: ${TEST_DURATION}${RAMPUP_LINE}${ITERATIONS_LINE}${ITERATION_SLEEP_LINE}${VU_SLEEP_LINE}
 
 test:
   user_count: "${USER_COUNT}"
@@ -232,6 +245,16 @@ case "${_monitor_vm_raw,,}" in
         EXTRA_ARGS="${EXTRA_ARGS} --monitor-vm --monitor-vm-interval ${MONITOR_VM_INTERVAL:-10}"
         ;;
 esac
+
+# Sweep iterations / sleeps (optional; CLI overrides YAML)
+SWEEP_ARGS=()
+[[ -n "${ITERATIONS:-}" ]] && SWEEP_ARGS+=(--iterations "${ITERATIONS}")
+[[ -n "${ITERATION_SLEEP:-}" ]] && SWEEP_ARGS+=(--iteration-sleep "${ITERATION_SLEEP}")
+[[ -n "${VU_SLEEP:-}" ]] && SWEEP_ARGS+=(--vu-sleep "${VU_SLEEP}")
+if [[ ${#SWEEP_ARGS[@]} -gt 0 ]]; then
+    echo "Sweep: ${SWEEP_ARGS[*]}"
+    EXTRA_ARGS="${EXTRA_ARGS} ${SWEEP_ARGS[*]}"
+fi
 
 # --- Run mariadb.py from /work/results so output lands there ---
 cd /work/results

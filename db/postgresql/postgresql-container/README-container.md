@@ -154,6 +154,9 @@ Env vars are used when no config file is mounted (Mode 2).
 | `WAREHOUSE_COUNT` | `50` | TPCC warehouse count |
 | `TEST_DURATION` | `15` | Test duration in minutes |
 | `USER_COUNT` | `1` | Space-separated user counts (e.g. `"1 10 20 50"`) |
+| `ITERATIONS` | `1` | Repeat full `user_count` sweep N times (`*_run1`…`*_runN`) |
+| `ITERATION_SLEEP` | `60` | Seconds between sweep iterations (`0` = off) |
+| `VU_SLEEP` | `30` | Seconds between VU levels within an iteration (`0` = off) |
 | `HAMMERDB_SOURCE` | `bundled` | Script source: `bundled` (from image) or `remote_git` (clone on each VM) |
 | `HAMMERDB_BUNDLED_PATH` | `/work/hammerdb-bundled` | Path to bundled scripts inside the container |
 | `HAMMERDB_PATH` | `/root/hammerdb-tpcc-wrapper-scripts` | Deploy path on remote hosts |
@@ -216,6 +219,24 @@ podman run --rm --init --pids-limit=-1 \
   --privileged \
   quay.io/ekuric/postgresql-benchmark:latest \
   --copy-results
+```
+
+### `--iterations` / `--vu-sleep` / `--iteration-sleep`
+
+Repeat the full `user_count` list N times (same as mssql-container). Result files use
+`*_runN.out` (e.g. `test_postgresql_pg_…_10_run2.out`). Defaults: 60s between sweeps,
+30s between VU levels; pass `0` to disable.
+
+```bash
+podman run --rm --init --pids-limit=-1 \
+  -e HOST_PATTERN="vm-{1..3}" \
+  -e USER_COUNT="1 10" \
+  -e ITERATIONS=2 \
+  -e VU_SLEEP=0 \
+  -e ITERATION_SLEEP=0 \
+  ...
+  quay.io/ekuric/postgresql-benchmark:latest
+# or:  ... latest --iterations 2 --vu-sleep 0 --iteration-sleep 0
 ```
 
 ### `--ssh-only`
