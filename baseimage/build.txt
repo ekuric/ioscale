@@ -1,0 +1,3 @@
+podman build --no-cache -t quay.io/ekuric/benchmark-base:latest .
+podman push quay.io/ekuric/benchmark-base:latest
+

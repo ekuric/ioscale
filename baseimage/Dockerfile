@@ -13,7 +13,7 @@ RUN curl -sL https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/op
     && chmod +x /usr/local/bin/oc /usr/local/bin/kubectl
 
 # Install virtctl
-ARG VIRTCTL_VERSION=v1.6.4
+ARG VIRTCTL_VERSION=v1.8.4
 RUN curl -sL -o /usr/local/bin/virtctl \
         "https://github.com/kubevirt/kubevirt/releases/download/${VIRTCTL_VERSION}/virtctl-${VIRTCTL_VERSION}-linux-amd64" \
     && chmod +x /usr/local/bin/virtctl
