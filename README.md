@@ -26,7 +26,7 @@ For database testing, the [HammerDB](https://www.hammerdb.com) tool is used. Sma
 It is assumed we already have a test virtual machine up and running with SSH `root` access.
 Virtual machines for testing can be created using various tools. An example script is [here](https://github.com/ekuric/ioscale/blob/main/templates/multivm.sh)
 
-Once the virtual machine is up and running, it is possible to test MariaDB /  PostgreSQL / MSSQL with HammerDB workloads. More details in [db](https://github.com/ekuric/ioscale/tree/main/db) section and regarding specific test [db-README](https://github.com/ekuric/ioscale/blob/main/db/db-README.md) is first thing to read. We recommend to read it before starting testing. 
+Once the virtual machine is up and running, it is possible to test MariaDB /  PostgreSQL / MSSQL with HammerDB workloads. More details in linked README files below and we recommend to read it before starting testing. 
 
 Recommended reading for Database testing
 
