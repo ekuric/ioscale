@@ -32,9 +32,10 @@ Recommended reading for Database testing
 
 MariaDB/Postgresql/MSSQL general [readme](https://github.com/ekuric/ioscale/blob/main/db/db-README.md)
 
-- MariaDB [containerized](https://github.com/ekuric/ioscale/blob/main/db/mariadb/mariadb-container/README-container.md)
-- Postgresql [containerized](https://github.com/ekuric/ioscale/blob/main/db/postgresql/postgresql-container/README-container.md)
-- MSSQL linux [containerized](https://github.com/ekuric/ioscale/blob/main/db/mssql/mssql-container/README-container.md)
+- MariaDB [containerized](https://github.com/ekuric/ioscale/blob/main/db/mariadb/mariadb-container/mariadb_README-container.md)
+- Postgresql [containerized](https://github.com/ekuric/ioscale/blob/main/db/postgresql/postgresql-container/postgresql_README-container.md)
+- MSSQL linux [containerized](https://github.com/ekuric/ioscale/blob/main/db/mssql/mssql-container/mssql-README-container.md)
+- MSSQL Windows [containerized](https://github.com/ekuric/ioscale/blob/main/db/mssql/mssql-windows/mssqlwin-container/mssqlwin_README-container.md) 
 
 Readme files contain detailed guide how to run database workloads at scale on Linux test machines. 
 
