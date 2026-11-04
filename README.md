@@ -30,7 +30,7 @@ Once the virtual machine is up and running, it is possible to test MariaDB /  Po
 
 Recommended reading for Database testing
 
-MariaDB/Postgresql/MSSQL general [readme](https://github.com/ekuric/ioscale/blob/main/db/db-README.md)
+MariaDB/Postgresql/MSSQL general README files are below 
 
 - MariaDB [containerized](https://github.com/ekuric/ioscale/blob/main/db/mariadb/mariadb-container/mariadb_README-container.md)
 - Postgresql [containerized](https://github.com/ekuric/ioscale/blob/main/db/postgresql/postgresql-container/postgresql_README-container.md)
@@ -44,8 +44,7 @@ Readme files contain detailed guide how to run database workloads at scale on Li
 
 For I/O generic testing, the virtual machine can be identical to the one used for database tests. However, for the generic I/O FIO workload it is not necessary to have a virtual machine with large CPU/memory allocation. An example script is [here](https://github.com/ekuric/ioscale/blob/main/templates/multivm.sh) and can be used to create test virtual machines. 
 
-After the test virtual machine is up and running, we can start the test as described in the [io-generic](https://github.com/ekuric/ioscale/blob/main/io-generic/fio-test-README.md)
-For containerized version of test as start point [containerized](https://github.com/ekuric/ioscale/blob/main/io-generic/fio-container/README-container.md) version of test can be used. 
+For containerized version of test as start point [containerized](https://github.com/ekuric/ioscale/blob/main/io-generic/fio-container/fio_README-container.md) version of test can be used. 
 
 Image used for virtual machines is Centos 9. It is possible to use different image. However tools in this repository at this time only support `dnf/yum` install managers so be aware of that. Fedora 43 will give you access to all packages without need for subscription. In case you use image which does not have in base channel db packages, then you have to ensure that you have proper subscriptions assigned to test machines.
 
