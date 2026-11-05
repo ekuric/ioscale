@@ -465,11 +465,19 @@ def main():
             f"fsync (Linux): {config.fsync} (--fsync={config.fsync})"
             if config.fsync else "fsync (Linux): disabled (no --fsync)"
         )
+        if config.fio_extra_opts:
+            logger.info(f"FIO extra opts (Linux): {config.fio_extra_opts}")
+        else:
+            logger.info("FIO extra opts (Linux): none")
     if windows_hosts:
         logger.info(
             f"fsync (Windows): {config.windows_fsync} (--fsync={config.windows_fsync})"
             if config.windows_fsync else "fsync (Windows): disabled (no --fsync)"
         )
+        if config.windows_fio_extra_opts:
+            logger.info(f"FIO extra opts (Windows): {config.windows_fio_extra_opts}")
+        else:
+            logger.info("FIO extra opts (Windows): none")
     
     if config.migrate_workloads:
         if config.migrate_interval > 0:

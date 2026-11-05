@@ -297,6 +297,13 @@ ${LINUX_DEVICES_SECTION}
             echo "Linux FSYNC=${FSYNC} — FIO will use --fsync=${FSYNC}"
         fi
 
+        EXTRA_OPTS_LINE=""
+        if [[ -n "${FIO_EXTRA_OPTS:-}" && "${FIO_EXTRA_OPTS}" != "null" ]]; then
+            _fio_extra_esc="${FIO_EXTRA_OPTS//\"/\\\"}"
+            EXTRA_OPTS_LINE=$'\n'"  extra_opts: \"${_fio_extra_esc}\""
+            echo "Linux FIO_EXTRA_OPTS=${FIO_EXTRA_OPTS}"
+        fi
+
         RUNTIME_LINE=""
         if [[ -n "${RUNTIME}" && "${RUNTIME}" != "null" && "${RUNTIME}" != "0" ]]; then
             RUNTIME_LINE=$'\n'"  runtime: \"${RUNTIME}\""
@@ -316,7 +323,7 @@ fio:
   numjobs: \"${NUMJOBS}\"
   iodepth: \"${IODEPTH}\"
   ioengine: \"${IOENGINE}\"
-  direct_io: \"${DIRECT_IO}\"${FSYNC_LINE}
+  direct_io: \"${DIRECT_IO}\"${FSYNC_LINE}${EXTRA_OPTS_LINE}
   fio_installed: ${FIO_INSTALLED_VALUE}${RATE_IOPS_LINE}
 
 output:
@@ -408,6 +415,13 @@ ${WIN_DEVICES_SECTION}
             echo "Windows WIN_FSYNC=${WIN_FSYNC} — FIO will use --fsync=${WIN_FSYNC}"
         fi
 
+        WIN_EXTRA_OPTS_LINE=""
+        if [[ -n "${WIN_FIO_EXTRA_OPTS:-}" && "${WIN_FIO_EXTRA_OPTS}" != "null" ]]; then
+            _win_fio_extra_esc="${WIN_FIO_EXTRA_OPTS//\"/\\\"}"
+            WIN_EXTRA_OPTS_LINE=$'\n'"    extra_opts: \"${_win_fio_extra_esc}\""
+            echo "Windows WIN_FIO_EXTRA_OPTS=${WIN_FIO_EXTRA_OPTS}"
+        fi
+
         WIN_RUNTIME_LINE=""
         if [[ -n "${WIN_RUNTIME}" && "${WIN_RUNTIME}" != "null" && "${WIN_RUNTIME}" != "0" ]]; then
             WIN_RUNTIME_LINE=$'\n'"    runtime: ${WIN_RUNTIME}"
@@ -427,7 +441,7 @@ ${WIN_STORAGE_YAML}
     io_patterns: '${WIN_IO_PATTERNS}'
     numjobs: ${WIN_NUMJOBS}
     iodepth: ${WIN_IODEPTH}
-    direct_io: ${WIN_DIRECT_IO}${WIN_FSYNC_LINE}${WIN_RATE_IOPS_LINE}
+    direct_io: ${WIN_DIRECT_IO}${WIN_FSYNC_LINE}${WIN_EXTRA_OPTS_LINE}${WIN_RATE_IOPS_LINE}
 
   output_win:
     directory: '${WIN_OUTPUT_DIR}'

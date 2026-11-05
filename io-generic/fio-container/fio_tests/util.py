@@ -140,6 +140,55 @@ def build_fio_fsync_option(fsync: Optional[str]) -> str:
     return f"--fsync={fsync} "
 
 
+# Reject tokens that could break remote shell / PowerShell command construction.
+_FIO_EXTRA_OPTS_BAD = re.compile(r"[;`$|&<>(){}\[\]\\\"'\n\r]")
+
+
+def normalize_fio_extra_opts(raw) -> Optional[str]:
+    """
+    Parse optional free-form FIO flags for performance jobs.
+
+    Accepts a space-separated string or a YAML list of strings. Each token may be
+    ``key=value``, ``--key=value``, or a bare ``--key`` / ``key``. Returns a single
+    space-joined string of ``--…`` flags (no trailing space), or None when unset.
+
+    Raises:
+        ValueError: On empty/invalid tokens or shell metacharacters.
+    """
+    if raw is None or raw is False:
+        return None
+    if isinstance(raw, list):
+        parts = [str(x).strip() for x in raw if x is not None and str(x).strip()]
+        text = " ".join(parts)
+    else:
+        text = str(raw).strip()
+    if not text or text.lower() in ("null", "none", "false", "off", "no"):
+        return None
+
+    out = []
+    for tok in text.split():
+        if _FIO_EXTRA_OPTS_BAD.search(tok):
+            raise ValueError(
+                f"CRITICAL: fio extra_opts token has forbidden characters: {tok!r}"
+            )
+        if tok.startswith("--"):
+            flag = tok
+        elif tok.startswith("-") and len(tok) > 1:
+            flag = "--" + tok.lstrip("-")
+        else:
+            flag = f"--{tok}"
+        if not re.match(r"^--[A-Za-z0-9_]+(=.+)?$", flag):
+            raise ValueError(
+                f"CRITICAL: fio extra_opts token must be key[=value] or --key[=value] "
+                f"(got {tok!r})"
+            )
+        out.append(flag)
+
+    if not out:
+        return None
+    return " ".join(out)
+
+
 def build_linux_fio_thread_option(ioengine: str) -> str:
     """Return '--thread ' for async Linux engines, else empty string."""
     return "--thread " if linux_fio_uses_threads(ioengine) else ""

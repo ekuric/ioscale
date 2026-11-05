@@ -137,6 +137,7 @@ Env vars are used when no config file is mounted (Modes 2 and 3).
 | `IODEPTH` | `16` | I/O depth |
 | `DIRECT_IO` | `1` | Direct I/O (1=bypass page cache) |
 | `FSYNC` | -- | Optional FIO `--fsync=N` (empty/unset = disabled; e.g. `1` or `32`) |
+| `FIO_EXTRA_OPTS` | -- | Extra FIO flags for **performance** jobs only (space-separated; e.g. `--iodepth_batch=16 --iodepth_batch_complete_min=1`). See [Extra FIO options](#extra-fio-options-fio_extra_opts). |
 | `FIO_INSTALLED` | `false` | Golden Linux image with FIO baked in (`true` = skip package check/install; `false` = install if missing) |
 | `RATE_IOPS` | -- | Optional IOPS rate limit |
 | `OUTPUT_DIR` | `/root/fio-results` | Ignored for remote JSON — always forced to `/root/fio-results` on the OS disk |
@@ -188,6 +189,7 @@ Set `WIN_HOSTS` or `WIN_HOST_PATTERN` to activate the Windows section.
 | `WIN_IODEPTH` | `16` | I/O depth |
 | `WIN_DIRECT_IO` | `1` | Direct I/O (1=yes) |
 | `WIN_FSYNC` | -- | Optional FIO `--fsync=N` (empty/unset = disabled; e.g. `1` or `32`) |
+| `WIN_FIO_EXTRA_OPTS` | -- | Extra FIO flags for Windows **performance** jobs (same form as `FIO_EXTRA_OPTS`) |
 | `WIN_RATE_IOPS` | -- | Optional IOPS rate limit |
 | `WIN_OUTPUT_DIR` | `c:/fio-results` | Ignored for remote JSON — always forced to `c:/fio-results` on the OS disk |
 | `WIN_OUTPUT_FORMAT` | `json+` | FIO output format |
@@ -1175,6 +1177,40 @@ When using env vars (no config file), set:
 - Optional `FSYNC` / `WIN_FSYNC` (or YAML `fio.fsync` / `windows.fio_win.fsync`) adds FIO `--fsync=N`. Empty/unset disables it (default). Values like `1` or `32` call `fsync` after every N writes — this measures durable-write cost and typically lowers write IOPS/BW sharply. Applied to dataset pre-write and performance jobs when set.
 - The entrypoint always prints the config before running, so you can see exactly what values are used.
 - Example configs are available inside the container at `/work/examples/`.
+
+## Extra FIO options (`FIO_EXTRA_OPTS`)
+
+Pass arbitrary FIO flags on **performance** jobs (not dataset pre-write) without
+adding a first-class harness knob for each flag. One env/YAML field holds any
+number of space-separated options:
+
+```bash
+-e FIO_EXTRA_OPTS="--iodepth_batch=16 --iodepth_batch_complete_min=1 --iodepth_batch_complete_max=16" \
+-e WIN_FIO_EXTRA_OPTS="--iodepth_batch=16 --iodepth_batch_complete_min=1 --iodepth_batch_complete_max=16" \
+```
+
+YAML:
+
+```yaml
+fio:
+  extra_opts: "--iodepth_batch=16 --iodepth_batch_complete_min=1 --iodepth_batch_complete_max=16"
+  # or as a list:
+  # extra_opts:
+  #   - "--iodepth_batch=16"
+  #   - "--iodepth_batch_complete_min=1"
+
+windows:
+  fio_win:
+    extra_opts: "--iodepth_batch=16 --iodepth_batch_complete_min=1 --iodepth_batch_complete_max=16"
+```
+
+Tokens may be `key=value` or `--key=value`; they are normalized to `--…`. Shell
+metacharacters are rejected. Do not re-set harness-owned flags already set
+(`--rw`, `--bs`, `--iodepth`, `--numjobs`, …). Invalid FIO flags fail at FIO
+runtime and appear in host logs.
+
+**Jenkins:** `Jenkinsfile-linux` → `FIO_EXTRA_OPTS`; `Jenkinsfile-windows` →
+`WIN_FIO_EXTRA_OPTS`; mixed `Jenkinsfile` → both (leave empty to disable).
 
 ## Optional FIO fsync
 

@@ -155,6 +155,8 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
                 
                 if config.rate_iops:
                     fio_cmd += f" --rate_iops={config.rate_iops}"
+                if config.fio_extra_opts:
+                    fio_cmd += f" {config.fio_extra_opts}"
                 
                 fio_cmd += f" --output={test_name}.json"
                 fio_desc = f"FIO test: {pattern}, block size: {bs}"
@@ -211,6 +213,8 @@ def run_fio_tests(config: FioTestConfig, executor: CommandExecutor, migration_mo
                 # Add rate_iops only if it's set (matches bash script logic)
                 if config.windows_rate_iops:
                     fio_cmd += f" --rate_iops={config.windows_rate_iops}"
+                if config.windows_fio_extra_opts:
+                    fio_cmd += f" {config.windows_fio_extra_opts}"
                 
                 fio_cmd += f" --output={output_dir_win}/{test_name}.json"
                 fio_desc = f"FIO test: {pattern}, block size: {bs}"

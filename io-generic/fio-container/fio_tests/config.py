@@ -42,6 +42,7 @@ from fio_tests.constants import (
 from fio_tests.util import (
     is_forbidden_linux_raw_device,
     is_forbidden_windows_raw_disk,
+    normalize_fio_extra_opts,
     normalize_optional_fsync,
     normalize_windows_path,
     parse_bool,
@@ -225,6 +226,7 @@ class FioTestConfig:
         self.ioengine = DEFAULT_LINUX_IOENGINE
         self.direct_io = "1"
         self.fsync = None  # Optional: FIO --fsync=N (None = omit)
+        self.fio_extra_opts = None  # Optional free-form FIO flags (performance jobs)
         self.rate_iops = None
         self.fio_installed = False
         self.output_dir = None
@@ -273,6 +275,7 @@ class FioTestConfig:
         self.windows_iodepth = 1
         self.windows_direct_io = "1"
         self.windows_fsync = None  # Optional: FIO --fsync=N (None = omit)
+        self.windows_fio_extra_opts = None  # Optional free-form FIO flags (Windows perf)
         self.windows_rate_iops = None
         self.windows_output_dir = None
         self.windows_output_format = None
@@ -488,6 +491,10 @@ class ConfigLoader:
                 self.config.fsync = normalize_optional_fsync(fio.get('fsync'))
             except ValueError as e:
                 raise FioConfigError(str(e)) from e
+            try:
+                self.config.fio_extra_opts = normalize_fio_extra_opts(fio.get('extra_opts'))
+            except ValueError as e:
+                raise FioConfigError(str(e)) from e
             self.config.rate_iops = fio.get('rate_iops')
             if self.config.rate_iops == "null" or not self.config.rate_iops:
                 self.config.rate_iops = None
@@ -679,6 +686,12 @@ class ConfigLoader:
                     self.config.windows_direct_io = str(fio_win.get('direct_io', 1))
                     try:
                         self.config.windows_fsync = normalize_optional_fsync(fio_win.get('fsync'))
+                    except ValueError as e:
+                        raise FioConfigError(str(e)) from e
+                    try:
+                        self.config.windows_fio_extra_opts = normalize_fio_extra_opts(
+                            fio_win.get('extra_opts')
+                        )
                     except ValueError as e:
                         raise FioConfigError(str(e)) from e
                     self.config.windows_rate_iops = fio_win.get('rate_iops')
