@@ -495,6 +495,30 @@ so test-disk failures cannot lose results. Collection/scp uses the same paths:
 YAML `output.directory` / `windows.output_win.directory` and env `OUTPUT_DIR` /
 `WIN_OUTPUT_DIR` are ignored for remote JSON (forced to the paths above).
 
+### VM dump artifacts (`vm-dump/`)
+
+After FIO JSON collection, **virtctl mode** (default in the container) also
+gathers OpenShift/KubeVirt VM diagnostics next to the per-host results — same
+pattern as the MSSQL/MariaDB harnesses. Failures are logged as warnings and do
+not fail the run. Skipped for `--ssh-only` / `SSH_ONLY=true` (no cluster).
+
+```text
+<results_dir>/
+  <host>/                 # FIO JSON
+  vm-dump/<host>/
+    dumpxml.xml
+    dominfo.txt
+    domstats.txt
+    domblklist.txt
+    domiflist.txt
+    vmi.yaml
+    virt-launcher-pod.yaml
+    vmi-describe.txt
+```
+
+Collection runs inside `collect_results` (including `--copy-results`), **before**
+optional `--cleanup` of managed VMs.
+
 ## OS-disk load (`--testdir`)
 
 By default, FIO uses a **separate data disk** from YAML/env (`DEVICES`, `WIN_DEVICES` /

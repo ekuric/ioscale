@@ -19,13 +19,118 @@ from fio_tests.util import normalize_windows_path
 
 logger = logging.getLogger("fio_tests")
 
+
+def _collect_vm_dumps(config: FioTestConfig, results_dir: str) -> None:
+    """Collect virt-launcher / virsh / VMI artifacts per host (same as mssql/mariadb)."""
+    if config.use_virtctl is False or not config.namespace or config.namespace == "N/A":
+        return
+    if config.dry_run:
+        logger.info("DRY-RUN: Would collect VM dump artifacts under results/vm-dump/")
+        return
+    if not config.vm_hosts:
+        return
+
+    # Prefer FIO timeout knobs; fall back to MariaDB-style defaults.
+    oc_timeout = int(getattr(config, "timeout_quick", 15) or 15)
+    dump_timeout = int(getattr(config, "timeout_default", 30) or 30)
+
+    logger.info("Collecting VM dump artifacts (virsh / VMI) into results/vm-dump/...")
+    for host in config.vm_hosts:
+        try:
+            host_dump_dir = os.path.join(results_dir, "vm-dump", host)
+            os.makedirs(host_dump_dir, exist_ok=True)
+            pod_cmd = [
+                "oc", "get", "pod", "-n", config.namespace,
+                "-l", f"kubevirt.io/domain={host}",
+                "-o", "jsonpath={.items[0].metadata.name}",
+            ]
+            pod_result = subprocess.run(pod_cmd, capture_output=True, text=True, timeout=oc_timeout)
+            pod_name = pod_result.stdout.strip()
+            if pod_result.returncode != 0 or not pod_name:
+                prefix = f"virt-launcher-{host}"
+                list_cmd = [
+                    "oc", "get", "pod", "-n", config.namespace,
+                    "-o", "jsonpath={.items[*].metadata.name}",
+                ]
+                list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=oc_timeout)
+                if list_result.returncode == 0 and list_result.stdout.strip():
+                    for candidate in list_result.stdout.split():
+                        if candidate.startswith(prefix):
+                            pod_name = candidate
+                            break
+            if not pod_name:
+                logger.warning(f"VM dump skipped for {host}: virt-launcher pod not found")
+                continue
+
+            list_cmd = [
+                "oc", "exec", "-n", config.namespace, pod_name, "--",
+                "virsh", "list", "--state-running", "--name",
+            ]
+            list_result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=oc_timeout)
+            domain_name = ""
+            if list_result.returncode == 0:
+                for line in list_result.stdout.splitlines():
+                    if line.strip():
+                        domain_name = line.strip()
+                        break
+            if not domain_name:
+                logger.warning(f"VM dump skipped for {host}: running domain not found in {pod_name}")
+                continue
+
+            def _save(cmd, filename, label, timeout=dump_timeout):
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                if result.returncode != 0 or not result.stdout.strip():
+                    logger.warning(f"VM {label} failed for {host}: {result.stderr.strip()}")
+                    return
+                path = os.path.join(host_dump_dir, filename)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(result.stdout)
+                logger.info(f"Saved VM {label} for {host} to {path}")
+
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dumpxml", domain_name],
+                "dumpxml.xml", "dumpxml",
+            )
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "dominfo", domain_name],
+                "dominfo.txt", "dominfo", timeout=oc_timeout,
+            )
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domstats", domain_name],
+                "domstats.txt", "domstats", timeout=oc_timeout,
+            )
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domblklist", domain_name],
+                "domblklist.txt", "domblklist", timeout=oc_timeout,
+            )
+            _save(
+                ["oc", "exec", "-n", config.namespace, pod_name, "--", "virsh", "domiflist", domain_name],
+                "domiflist.txt", "domiflist", timeout=oc_timeout,
+            )
+            _save(
+                ["oc", "get", "vmi", host, "-n", config.namespace, "-o", "yaml"],
+                "vmi.yaml", "VMI yaml", timeout=oc_timeout,
+            )
+            _save(
+                ["oc", "get", "pod", pod_name, "-n", config.namespace, "-o", "yaml"],
+                "virt-launcher-pod.yaml", "virt-launcher pod yaml", timeout=oc_timeout,
+            )
+            _save(
+                ["oc", "describe", "vmi", host, "-n", config.namespace],
+                "vmi-describe.txt", "VMI describe", timeout=oc_timeout,
+            )
+        except Exception as exc:
+            logger.warning(f"VM dump collection failed for {host}: {exc}")
+
+
 def collect_results(config: FioTestConfig, executor: CommandExecutor, results_dir: str) -> None:
     """
     Collect test results from all hosts.
 
     Creates tar archives of JSON result files on each host, then copies
     them to the local results directory. Archives are extracted and
-    organized into per-host subdirectories.
+    organized into per-host subdirectories. After JSON collection, in
+    virtctl mode, also gathers VM dump artifacts under ``vm-dump/<host>/``.
 
     If a host becomes unreachable during collection, attempts to restart
     the VM via virtctl before retrying.
@@ -188,6 +293,7 @@ def collect_results(config: FioTestConfig, executor: CommandExecutor, results_di
             future.result()
     
     logger.info(f"All results collected in: {results_dir}")
+    _collect_vm_dumps(config, results_dir)
 
 
 def generate_combined_results(results_dir: str, config: FioTestConfig) -> None:
@@ -209,7 +315,7 @@ def generate_combined_results(results_dir: str, config: FioTestConfig) -> None:
 
     with open(ndjson_path, "w", encoding="utf-8") as out:
         for host_dir in sorted(Path(results_dir).iterdir()):
-            if not host_dir.is_dir():
+            if not host_dir.is_dir() or host_dir.name == "vm-dump":
                 continue
             hostname = host_dir.name
             is_windows = hostname in (config.windows_hosts or set())
