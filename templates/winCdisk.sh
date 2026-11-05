@@ -48,7 +48,7 @@ STORAGECLASS="ocs-storagecluster-ceph-rbd-virtualization"
 STORAGECLASS_SET=0
 # lvms-nvme-vg
 ROOTDISK_SIZE="75Gi"
-IMAGEURL="http://perfscale.perf.eng.bos2.dc.redhat.com/pub/daschmidt/rhocpv-images/win2k25-rootdisk-qemu-guest-agent.qcow2"
+IMAGEURL="windows image ulr"
 GOLDEN_DV=""
 GOLDEN_SNAPSHOT=""
 ORIGVM=""
